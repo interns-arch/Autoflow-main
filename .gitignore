@@ -1,0 +1,37 @@
+node_modules/
+data/
+
+# EVERY env file, not just .env. Two backups I made while debugging the portal
+# login (.env.backup, .env.bak2) sat here untracked with live tokens in them —
+# one "git add -A" and they were public. The example file is the exception.
+.env
+.env.backup
+.env.bak2
+.env.*
+!.env.example
+
+# Local scratch / API dumps — these contain REAL Dealer Portal tokens and
+# login responses. Never commit them.
+dp_token.txt
+dp_login.json
+ep_out.json
+dash.json
+part.json
+openapi.json
+
+# WhatsApp linked-device leftovers (not used by the Cloud API transport)
+.wwebjs_cache/
+.wwebjs_auth/
+
+*.log
+
+# Live API response dumps captured while debugging. No credentials, but they
+# carry real user/dealer ids and customer data.
+analyze_sample.json
+*_sample.json
+*.dump.json
+
+# Chat exports and anything replayed from them — real customer conversations.
+chats/
+exports/
+*.zip

@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cartrends AutoFlow Console</title>
+<style>
+  :root { --bg:#0f1420; --card:#1a2233; --line:#2a3550; --txt:#e8edf7; --dim:#93a1bd; --acc:#4f9cf9; --ok:#3ecf8e; --warn:#f5b544; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 system-ui,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--txt); }
+  header { padding:14px 22px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:14px; }
+  header h1 { font-size:17px; margin:0; }
+  header .tag { color:var(--dim); font-size:12px; }
+  main { padding:18px 22px; display:grid; grid-template-columns: 1fr 1fr; gap:16px; max-width:1400px; }
+  section { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
+  section h2 { margin:0 0 10px; font-size:14px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); }
+  .wide { grid-column: 1 / -1; }
+  .bots { display:flex; flex-wrap:wrap; gap:10px; }
+  .bot { border:1px solid var(--line); border-radius:8px; padding:8px 12px; min-width:170px; }
+  .bot b { display:block; }
+  .mode-SIMULATION { color:var(--warn); } .mode-LIVE { color:var(--ok); }
+  .qr img { width:180px; margin-top:6px; background:#fff; padding:6px; border-radius:6px; }
+  label { display:block; margin:8px 0 2px; color:var(--dim); font-size:12px; }
+  input, textarea, select { width:100%; background:#0d1320; color:var(--txt); border:1px solid var(--line); border-radius:6px; padding:7px 9px; font:inherit; }
+  textarea { min-height:64px; }
+  button { margin-top:8px; background:var(--acc); color:#fff; border:0; border-radius:6px; padding:8px 14px; font:inherit; cursor:pointer; }
+  button.ghost { background:transparent; border:1px solid var(--line); color:var(--txt); }
+  .row { display:flex; gap:10px; } .row > * { flex:1; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:5px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--dim); font-weight:600; }
+  .log { font-family:Consolas,monospace; font-size:12px; max-height:260px; overflow:auto; white-space:pre-wrap; }
+  .outbox { max-height:220px; overflow:auto; font-size:13px; }
+  .outbox div { border-bottom:1px solid var(--line); padding:5px 0; }
+  .outbox .to { color:var(--acc); }
+  .pill { display:inline-block; padding:1px 8px; border-radius:99px; font-size:11px; border:1px solid var(--line); color:var(--dim); }
+  .actions { display:flex; flex-wrap:wrap; gap:8px; }
+  .actions button { margin:0; }
+  /* Inbox: every number that writes to the line, and what the bot answered */
+  .inbox { display:grid; grid-template-columns:300px 1fr; gap:12px; height:540px; }
+  .chatlist { overflow:auto; border:1px solid var(--line); border-radius:8px; }
+  .chatlist .c { padding:8px 10px; border-bottom:1px solid var(--line); cursor:pointer; border-left:3px solid transparent; }
+  .chatlist .c:hover { background:#131c2e; }
+  .chatlist .c.on { background:#111a2b; border-left-color:var(--acc); }
+  .chatlist .who { display:flex; justify-content:space-between; gap:8px; align-items:baseline; }
+  .chatlist .who b { font-size:13px; }
+  .chatlist .prev { color:var(--dim); font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .role { font-size:11px; color:var(--acc); }
+  .thread { overflow:auto; border:1px solid var(--line); border-radius:8px; padding:10px; }
+  .msg { max-width:78%; margin:6px 0; padding:7px 10px; border-radius:10px; white-space:pre-wrap; font-size:13px; }
+  .msg.in { background:#16203a; }
+  .msg.out { background:#123a2c; margin-left:auto; }
+  .msg .when { display:block; color:var(--dim); font-size:11px; margin-top:3px; }
+  .msg .shot { display:block; max-width:260px; border-radius:8px; margin-bottom:5px; cursor:zoom-in; }
+  .msg audio { width:240px; margin-bottom:4px; }
+  /* why the bot did what it did — e.g. why a photo gave nothing */
+  .note { text-align:center; color:var(--warn); font-size:11px; margin:8px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Cartrends AutoFlow</h1>
+  <span class="tag" id="portalTag"></span>
+</header>
+<main>
+  <section class="wide">
+    <h2>Chats — who is writing to the line, and what the bot answered</h2>
+    <div class="row" style="align-items:center">
+      <input id="chatSearch" placeholder="search a number, a name, a word" oninput="drawChats()">
+      <label style="margin:0;display:flex;align-items:center;gap:6px;white-space:nowrap;flex:0 0 auto">
+        <input type="checkbox" id="chatAuto" checked style="width:auto"> live
+      </label>
+    </div>
+    <div class="inbox" style="margin-top:10px">
+      <div class="chatlist" id="chatList"></div>
+      <div class="thread" id="thread"><span class="pill">pick a chat on the left</span></div>
+    </div>
+  </section>
+
+  <section class="wide">
+    <h2>Bots</h2>
+    <div class="bots" id="bots"></div>
+    <div class="actions" style="margin-top:12px">
+      <button class="ghost" onclick="act('broadcast')">Send stock broadcast now</button>
+      <button class="ghost" onclick="act('ivr-followup')">Run IVR follow-up now</button>
+      <button class="ghost" onclick="act('invoice-chase')">Run invoice chase now</button>
+      <button class="ghost" onclick="doConfirm()">Trigger DO-Confirmed (picklist)</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>Simulator — send a message to a bot</h2>
+    <label>Bot</label>
+    <select id="simBot">
+      <option value="purchase">Purchase Bot (as a vendor)</option>
+      <option value="customer">Customer Bot (as a customer)</option>
+      <option value="warehouse">Warehouse Bot</option>
+      <option value="finance">Finance Bot</option>
+      <option value="helpdesk">Helpdesk Bot</option>
+    </select>
+    <div class="row">
+      <div><label>From number</label><input id="simFrom" value="919810000001"></div>
+      <div><label>Group name (customer bot only, blank = DM)</label><input id="simGroup" placeholder=""></div>
+    </div>
+    <label>Message <span class="pill">tip: "Brake Pad - 5" per line</span></label>
+    <textarea id="simBody"></textarea>
+    <label><input type="checkbox" id="simMedia" style="width:auto"> message carries an attachment (invoice/bill)</label>
+    <label>Or attach an order photo (customer bot, needs AI key)</label>
+    <input type="file" id="simImage" accept="image/*">
+    <button onclick="simSend()">Send to bot</button>
+    <h2 style="margin-top:14px">Bot outbox (what it replied / sent)</h2>
+    <div class="outbox" id="outbox"></div>
+  </section>
+
+  <section>
+    <h2>Vendors & stock</h2>
+    <div class="row">
+      <div><label>Vendor name</label><input id="vName" placeholder="Northend"></div>
+      <div><label>Phone</label><input id="vPhone" placeholder="919810000001"></div>
+    </div>
+    <button onclick="addVendor()">Add / update vendor</button>
+    <div id="vendors" style="margin-top:10px"></div>
+    <h2 style="margin-top:14px">Internal stock (<span id="whName"></span>)</h2>
+    <label>One per line: item, qty, shelf</label>
+    <textarea id="intStock" placeholder="Brake Pad, 40, A-1&#10;Oil Filter, 25, B-3"></textarea>
+    <button onclick="saveInternal()">Save internal stock</button>
+  </section>
+
+  <section class="wide">
+    <h2>Customer engagement — offers, credit notes, cross-selling</h2>
+    <div class="row">
+      <div>
+        <label>Add customer (for broadcasts)</label>
+        <div class="row">
+          <input id="cName" placeholder="name (optional)">
+          <input id="cPhone" placeholder="919899...">
+        </div>
+        <button onclick="addCustomer()">Add customer</button>
+        <div id="custCount" style="margin-top:6px" class="pill"></div>
+      </div>
+      <div>
+        <label>Offer message ("Sir, Maruti mein ye discount hai…")</label>
+        <textarea id="offerText" placeholder="🎉 Special offer: 10% off on all Maruti Genuine Parts this week!"></textarea>
+        <button onclick="sendOffer()">Broadcast offer to all customers</button>
+        <button class="ghost" onclick="act('stock-highlights')">Broadcast stock highlights</button>
+      </div>
+      <div>
+        <label>Issue & share Credit Note</label>
+        <input id="cnPhone" placeholder="customer phone">
+        <div class="row">
+          <input id="cnNumber" placeholder="CN number (optional)">
+          <input id="cnAmount" placeholder="amount Rs.">
+        </div>
+        <input id="cnReason" placeholder="reason (e.g. rate difference)">
+        <button onclick="issueCN()">Issue CN & send on WhatsApp</button>
+      </div>
+    </div>
+    <label style="margin-top:10px">Cross-sell map (one per line: Item: Related A, Related B)</label>
+    <textarea id="crossSell"></textarea>
+    <button class="ghost" onclick="saveCrossSell()">Save cross-sell map</button>
+  </section>
+
+  <section class="wide">
+    <h2>Sales orders</h2>
+    <table id="orders"></table>
+  </section>
+  <section class="wide">
+    <h2>Purchase orders</h2>
+    <table id="pos"></table>
+  </section>
+  <section class="wide">
+    <h2>Activity log</h2>
+    <div class="log" id="log"></div>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const api = (p, opts) => fetch(p, opts).then(r => r.json());
+const post = (p, body) => api(p, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body||{}) });
+
+async function refresh() {
+  const st = await api('/api/status');
+  $('portalTag').textContent = (st.portalMock ? 'Dealer Portal: MOCK (set DEALER_PORTAL_BASE_URL to go real)' : 'Dealer Portal: LIVE') + ' · TZ ' + st.tz;
+  $('bots').innerHTML = Object.entries(st.bots).map(([k,b]) =>
+    `<div class="bot"><b>${b.label}</b>
+     <span class="mode-${b.mode}">${b.mode}</span> · ${b.state}${b.number ? ' · ' + b.number : ''}
+     ${b.roles && b.roles.length > 1 ? `<br><span class="pill">shared line: ${b.roles.join(' + ')}</span>` : ''}
+     ${b.qrDataUrl ? `<div class="qr"><div class="pill">scan with the bot phone</div><br><img src="${b.qrDataUrl}"></div>` : ''}</div>`).join('');
+
+  // The parked bots (purchase/warehouse/...) register no endpoints, so these
+  // 404 when ENABLE_EXTRA_BOTS is false. Unguarded, the rejection stopped the
+  // whole refresh: orders and the log never updated again.
+  const v = await api('/api/vendors').catch(() => ({ vendors: [] }));
+  $('vendors').innerHTML = v.vendors.length ? '<table><tr><th>Vendor</th><th>Phone</th><th>Stock items</th><th>Last stock</th></tr>' +
+    v.vendors.map(x => `<tr><td>${x.name}</td><td>${x.phone}</td><td>${x.stock.map(s=>s.item+' x '+s.qty).join(', ')||'—'}</td><td>${x.lastStockAt? x.lastStockAt.slice(0,16).replace('T',' '):'—'}</td></tr>`).join('') + '</table>'
+    : '<span class="pill">no vendors yet — add your vendors above</span>';
+
+  const o = await api('/api/orders').catch(() => ({ orders: [] }));
+  $('orders').innerHTML = '<tr><th>Order</th><th>SO#</th><th>Status</th><th>Customer</th><th>Lines</th></tr>' +
+    o.orders.map(x => `<tr><td>${x.id}</td><td>${x.soNumber||'—'}</td><td>${x.status}</td><td>${x.customer}</td><td>${x.lines.map(l=>l.item+' x '+l.qty+' ('+l.source+')').join('<br>')}</td></tr>`).join('');
+
+  const p = await api('/api/pos').catch(() => ({ pos: [] }));
+  $('pos').innerHTML = '<tr><th>Req</th><th>PO#</th><th>Vendor</th><th>Status</th><th>Lines</th><th>Invoice</th><th>Vehicle</th></tr>' +
+    p.pos.map(x => `<tr><td>${x.id}</td><td>${x.poNumber||'—'}</td><td>${x.vendorName}</td><td>${x.status}</td><td>${x.lines.map(l=>l.item+' x '+l.qty).join('<br>')}</td><td>${x.invoice? (x.invoice.validationIssues&&x.invoice.validationIssues.length?'⚠ issues':'✓'):'—'}</td><td>${x.transit&&x.transit.vehicle||'—'}</td></tr>`).join('');
+
+  const lg = await api('/api/logs').catch(() => ({ logs: [] }));
+  $('log').textContent = lg.logs.map(l => `${l.ts.slice(11,19)} [${l.tag}] ${l.msg}`).join('\n');
+
+  const bot = $('simBot').value;
+  const ob = await api('/api/sim/' + bot + '/outbox').catch(()=>({outbox:[]}));
+  $('outbox').innerHTML = (ob.outbox||[]).slice(-30).reverse().map(m =>
+    `<div><span class="to">→ ${m.to}</span> <span class="pill">${m.ts.slice(11,19)}</span><br>${(m.text||'').replace(/</g,'&lt;').replace(/\n/g,'<br>')}</div>`).join('') || '<span class="pill">nothing sent yet</span>';
+}
+
+async function simSend() {
+  const bot = $('simBot').value;
+  const group = $('simGroup').value.trim();
+  const payload = {
+    from: $('simFrom').value, body: $('simBody').value,
+    isGroup: Boolean(group), chatName: group, hasMedia: $('simMedia').checked,
+  };
+  const file = $('simImage').files[0];
+  if (file) {
+    const dataUrl = await new Promise((ok, err) => {
+      const rd = new FileReader(); rd.onload = () => ok(rd.result); rd.onerror = err; rd.readAsDataURL(file);
+    });
+    payload.mediaBase64 = dataUrl.split(',')[1];
+    payload.mediaMime = (dataUrl.match(/^data:([^;]+);/) || [])[1] || 'image/jpeg';
+  }
+  const r = await post('/api/sim/' + bot + '/message', payload);
+  if (r.error) alert(r.error);
+  $('simBody').value = ''; $('simMedia').checked = false; $('simImage').value = '';
+  setTimeout(refresh, 400);
+}
+async function addCustomer() {
+  const r = await post('/api/customers', { name: $('cName').value.trim(), phone: $('cPhone').value.trim() });
+  if (r.error) alert(r.error); else { $('cName').value=''; $('cPhone').value=''; }
+  refresh();
+}
+async function sendOffer() {
+  const text = $('offerText').value.trim();
+  if (!text) return alert('write the offer message first');
+  const r = await post('/api/actions/broadcast-offer', { text });
+  if (r.error) alert(r.error); else alert('Offer sent to ' + r.sentTo + ' customer(s)');
+  refresh();
+}
+async function issueCN() {
+  const r = await post('/api/credit-notes', {
+    customerPhone: $('cnPhone').value.trim(), cnNumber: $('cnNumber').value.trim(),
+    amount: parseFloat($('cnAmount').value) || 0, reason: $('cnReason').value.trim(),
+  });
+  if (r.error) alert(r.error);
+  else { alert('CN ' + r.creditNote.cnNumber + ' shared on WhatsApp'); ['cnPhone','cnNumber','cnAmount','cnReason'].forEach(id=>$(id).value=''); }
+  refresh();
+}
+async function saveCrossSell() {
+  const map = {};
+  for (const line of $('crossSell').value.split('\n')) {
+    const [item, rel] = line.split(':');
+    if (item && rel) map[item.trim()] = rel.split(',').map(s=>s.trim()).filter(Boolean);
+  }
+  await post('/api/cross-sell', { crossSell: map });
+  refresh();
+}
+async function addVendor() {
+  const r = await post('/api/vendors', { name: $('vName').value.trim(), phone: $('vPhone').value.trim() });
+  if (r.error) alert(r.error); else { $('vName').value=''; $('vPhone').value=''; }
+  refresh();
+}
+async function saveInternal() {
+  const lines = $('intStock').value.split('\n').map(l => {
+    const [item, qty, shelf] = l.split(',').map(s => (s||'').trim());
+    return item && qty ? { item, qty: parseInt(qty,10)||0, shelf: shelf||'' } : null;
+  }).filter(Boolean);
+  await post('/api/internal-stock', { lines });
+  refresh();
+}
+async function act(name) { const r = await post('/api/actions/' + name); if (r.error) alert(r.error); setTimeout(refresh, 400); }
+async function doConfirm() {
+  const so = prompt('SO number (e.g. SO-20001):'); if (!so) return;
+  const r = await post('/api/actions/do-confirmed', { soNumber: so }); if (r.error) alert(r.error);
+  setTimeout(refresh, 400);
+}
+(async () => {
+  const s = await api('/api/internal-stock');
+  $('intStock').value = s.stock.map(r => [r.item, r.qty, r.shelf].filter(x=>x!==''&&x!==undefined).join(', ')).join('\n');
+  $('whName').textContent = 'internal warehouse';
+  const cs = await api('/api/cross-sell');
+  $('crossSell').value = Object.entries(cs.crossSell || {}).map(([k,v]) => k + ': ' + v.join(', ')).join('\n');
+  const cu = await api('/api/customers');
+  $('custCount').textContent = cu.customers.length + ' customer(s) registered';
+})();
+refresh();
+// ---- Inbox ----------------------------------------------------------------
+// Every message in and out, grouped by number, newest conversation first. The
+// role (customer / sales team / admin / parts helper / data entry) comes from
+// the server, so a number reads as who it is.
+let CHATS = [];
+let OPEN = null;
+const esc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+const when = (iso) => String(iso || '').slice(5, 16).replace('T', ' ');
+
+async function loadChats() {
+  const r = await api('/api/chats').catch(() => ({ chats: [] }));
+  CHATS = r.chats || [];
+  drawChats();
+  if (OPEN) openChat(OPEN, true);
+}
+
+function drawChats() {
+  const q = ($('chatSearch').value || '').toLowerCase();
+  const rows = CHATS.filter((c) => !q || `${c.phone} ${c.name || ''} ${c.last || ''} ${c.role || ''}`.toLowerCase().includes(q));
+  $('chatList').innerHTML =
+    rows
+      .map(
+        (c) => `<div class="c ${OPEN === c.key ? 'on' : ''}" onclick="openChat('${c.key}')">
+        <div class="who"><b>${esc(c.name || c.phone || c.chatId)}</b><span class="pill">${when(c.at)}</span></div>
+        <div class="role">${esc(c.role || '')}${c.group ? ' · group' : ''} · ${c.count} msg</div>
+        <div class="prev">${c.lastDir === 'out' ? '↩ ' : ''}${esc((c.last || '').slice(0, 70))}</div>
+      </div>`,
+      )
+      .join('') || '<div class="c"><span class="pill">no messages yet</span></div>';
+}
+
+// `keep` = a background refresh: do not yank the view if the reader has
+// scrolled up to read something older.
+async function openChat(id, keep) {
+  OPEN = id;
+  const r = await api('/api/chats/' + encodeURIComponent(id)).catch(() => ({ messages: [] }));
+  const box = $('thread');
+  const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 40;
+  box.innerHTML =
+    `<div class="pill">${esc(r.name || id)}${r.role ? ' · ' + esc(r.role) : ''}</div>` +
+    (r.messages || [])
+      .map((m) => {
+        // A note is not a message: it is the bot saying why, e.g. why a photo
+        // gave nothing. It sits between the bubbles, in the middle.
+        if (m.dir === 'note') return `<div class="note">${esc(m.text || '')} · ${when(m.at)}</div>`;
+        const src = m.media ? '/api/media/' + encodeURIComponent(m.media) : '';
+        const shown = !src
+          ? ''
+          : m.kind === 'photo'
+            ? `<img class="shot" src="${src}" onclick="window.open('${src}')">`
+            : m.kind === 'voice'
+              ? `<audio controls src="${src}"></audio>`
+              : `<a href="${src}" target="_blank">open the file</a><br>`;
+        return `<div class="msg ${m.dir}">${shown}${esc(m.text || '')}
+        <span class="when">${m.dir === 'in' ? 'they' : 'bot'} · ${when(m.at)}${m.kind && m.kind !== 'text' ? ' · ' + m.kind : ''}</span></div>`;
+      })
+      .join('');
+  if (!keep || atBottom) box.scrollTop = box.scrollHeight;
+  drawChats();
+}
+
+loadChats();
+setInterval(() => {
+  if ($('chatAuto').checked) loadChats();
+}, 3000);
+setInterval(refresh, 4000);
+</script>
+</body>
+</html>

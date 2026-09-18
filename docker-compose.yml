@@ -1,0 +1,86 @@
+# Cartrends AutoFlow — sales bot, alongside ProcureHub on the same host.
+#
+# The host runs sixteen containers on 2 vCPU / 7.8 GB and is already swapping,
+# so everything here is about NOT being the container that takes the box down:
+#
+#   * a hard memory limit, so the kernel's OOM killer never has to choose
+#     between this bot and ProcureHub
+#   * a CPU cap, because the load average is already above the core count
+#   * no published ports — the bot polls the Render relay outbound and nothing
+#     on this host needs to reach it
+#   * log rotation, because the root disk is 88% full
+#
+# Data (orders, learned parts, sale-loss log) lives in a named volume so a
+# rebuild never wipes what the bot has learned from the sales desk.
+
+services:
+  autoflow:
+    build: .
+    image: cartrends-autoflow:latest
+    container_name: cartrends-autoflow
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATA_DIR: /data
+      # Shared with dataentry: the open "naam ye rakhun?" questions and the
+      # part names the desk confirmed. The bot receives the answers.
+      SHARED_DIR: /shared
+      TZ: Asia/Kolkata
+    # The console binds to 127.0.0.1 on the HOST only: nothing on the
+    # internet can reach it, and it is opened over an SSH tunnel
+    #   ssh -i <key> -L 3010:127.0.0.1:3010 ubuntu@<host>  -> localhost:3010
+    ports:
+      - '127.0.0.1:3010:3010'
+    volumes:
+      - autoflow-data:/data
+      - autoflow-shared:/shared
+    # Plain compose keys, not deploy.resources — those are only fully honoured
+    # under swarm, and this host runs plain `docker compose`.
+    # Measured: ~41 MB idle, and a PDF read is a short-lived Python process.
+    # 512m leaves plenty of headroom on a box that is already tight.
+    mem_limit: 512m
+    mem_reservation: 128m
+    cpus: 0.50
+    # The root disk has ~13 GB left and this container logs every message.
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+
+  # Watches the IT mailbox and creates approved Data Entry requests (customers,
+  # vendors, parts) in the portal. Separate container because it is a different
+  # job with a different identity: it runs as the ADMIN portal account, while
+  # the sales bot runs as a dealer account that cannot create anything.
+  dataentry:
+    build: .
+    image: cartrends-autoflow:latest
+    container_name: cartrends-dataentry
+    restart: unless-stopped
+    env_file: .env
+    command: ['node', 'scripts/watch-data-entry.js', '--create', '--every', '120']
+    environment:
+      # ITS OWN data directory. store.js rewrites the whole state file on every
+      # save, so two containers sharing one volume would silently overwrite
+      # each other — the watcher's "already done" list would wipe the bot's
+      # orders and learned parts, and neither would notice.
+      DATA_DIR: /data
+      # The one directory it shares with the bot — never /data (see above).
+      SHARED_DIR: /shared
+      TZ: Asia/Kolkata
+    volumes:
+      - dataentry-data:/data
+      - autoflow-shared:/shared
+    mem_limit: 256m
+    mem_reservation: 64m
+    cpus: 0.25
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+
+volumes:
+  autoflow-data:
+  dataentry-data:
+  autoflow-shared:
