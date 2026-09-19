@@ -81,8 +81,15 @@ function pointsBack(text) {
 // A "part name" that is really just a pointer or filler — "iska", "Eski
 // saleing", "ye wala". Looking these up as parts is how "iska" reached the
 // portal as a part name.
+//
+// "item"/"part" (and their plurals) belong here too: "this item" is a pointer
+// PLUS a generic noun, naming nothing on its own. Without them, "What is the
+// price of this item" (13 Sep, live) left "this item" as the named part — it
+// beat the actual part just discussed (still remembered here, in `last`) to
+// the answer, and the customer got "Rate for item — our team will send it to
+// you shortly" instead of the price of the part their photo was about.
 const FILLER =
-  /^(?:is|iss|es|ess|isk[aie]|iske|isak[aie]|esk[aie]|esak[aie]|isko|esko|isme|isi|ye|yeh|yahi|yehi|wahi|wohi|same|this|it|that|wala|wali|wale|one|saleing|selling|saling|sale|sell|mrp|price|rate|stock|h|he|hai|hain|kya|kitna|kitne|kitni|ka|ki|ke|batao|bata|do|please|pls|plz|sir|ji|bhai|ink[aie]|inko|inhe|unk[aie]|unko|unhe|these|them|those|batana|btao|bta|bataiye|bhejna|of)$/i;
+  /^(?:is|iss|es|ess|isk[aie]|iske|isak[aie]|esk[aie]|esak[aie]|isko|esko|isme|isi|ye|yeh|yahi|yehi|wahi|wohi|same|this|it|that|wala|wali|wale|one|saleing|selling|saling|sale|sell|mrp|price|rate|stock|h|he|hai|hain|kya|kitna|kitne|kitni|ka|ki|ke|batao|bata|do|please|pls|plz|sir|ji|bhai|ink[aie]|inko|inhe|unk[aie]|unko|unhe|these|them|those|batana|btao|bta|bataiye|bhejna|of|item|items|part|parts)$/i;
 
 function isOnlyPointer(phrase) {
   const words = String(phrase || '')

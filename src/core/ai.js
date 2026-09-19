@@ -466,6 +466,20 @@ function matchCatalog(name, catalogNames) {
   return catalogNames.find((c) => c.toLowerCase() === n || c.toLowerCase().includes(n) || n.includes(c.toLowerCase())) || null;
 }
 
+// Does the customer's own message actually support this item, or did it only
+// come from the catalog list handed to the model as a naming aid? A real
+// match either sits in the text verbatim, or shares one real word (3+
+// letters) with it — enough for "brake pad" to survive matching catalog entry
+// "Brake Pad Front", but not enough for a catalog name with zero overlap.
+function textGrounded(item, text) {
+  const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  const hay = norm(text);
+  const needle = norm(item);
+  if (!hay || !needle) return false;
+  if (hay.includes(needle)) return true;
+  return needle.split(' ').some((w) => w.length >= 3 && hay.includes(w));
+}
+
 // ---------------- Claude-backed parsing ----------------
 
 // Tests put a stand-in here, so the suite can reproduce what the live model
@@ -614,6 +628,15 @@ async function parseCustomerMessage(text, catalogNames) {
         // customer, who was shown a line reading " x5 - checking".
         if (Array.isArray(r.lines)) r.lines = r.lines.filter((l) => l && String(l.item || '').trim().length >= 2);
         if (Array.isArray(r.items)) r.items = r.items.filter((i) => String(i || '').trim().length >= 2);
+        // "Known catalog items" in the prompt is there so Claude can match a
+        // name the customer typed to its real spelling — never a menu to pick
+        // from. A vague quantity with no named item ("I need one piece of each
+        // item", 13 Sep live) made it invent lines from that list, and the cart
+        // silently gained three parts nobody asked for, doubling every time the
+        // customer repeated the phrase (addLines adds typed lines, it does not
+        // replace them). A line the customer's own words do not support in any
+        // way is dropped rather than trusted.
+        if (Array.isArray(r.lines)) r.lines = r.lines.filter((l) => textGrounded(l.item, text));
         if (r.intent === 'order' && !r.lines.length) return { intent: 'other' };
         // The same guard the basic parser applies. A model reads "pakka?" as
         // agreement because the WORD agrees; the question mark is the whole

@@ -42,11 +42,30 @@ function forget(chatId) {
 }
 
 // items: the customer's own requested lines, minus the quantity.
+//
+// A new ask() USED to overwrite the whole pending record. Two photos sent as
+// separate messages seconds apart (13 Sep, live) each asked "how many do you
+// need?" and the second call silently dropped the first photo's part from
+// what we were waiting on — it never got answered, and its "how many?" just
+// sat there unresolved while the customer answered the newer one. So an item
+// still unanswered from a moment ago is kept, not replaced.
 function ask(chatId, items) {
   sweep();
   if (!chatId || !items || !items.length) return;
-  pending.set(chatId, { items: items.map((i) => ({ ...i })), at: Date.now() });
-  store.log('askqty', `${chatId}: waiting on qty for ${items.length} item(s)`);
+  const merged = items.map((i) => ({ ...i }));
+  const prior = pending.get(chatId);
+  if (prior && prior.items && prior.items.length) {
+    const seen = new Set(merged.map((i) => String(i.key || i.ref || i.item || '').toUpperCase()).filter(Boolean));
+    for (const old of prior.items) {
+      const k = String(old.key || old.ref || old.item || '').toUpperCase();
+      if (k && !seen.has(k)) {
+        seen.add(k);
+        merged.push(old);
+      }
+    }
+  }
+  pending.set(chatId, { items: merged, at: Date.now() });
+  store.log('askqty', `${chatId}: waiting on qty for ${merged.length} item(s)`);
 }
 
 function get(chatId) {
@@ -70,7 +89,11 @@ const UNIT = '(?:pcs?|pc|pise|peices?|pieces?|nos?|no|set|sets|box|boxes|pkts?|p
 // The words wrapped around the number in a real chat. Stripped before the
 // shapes below are tried, so "Add 2pc", "??need 15pc", "6pc needed" and
 // "Add 2pc if available" all reduce to the same thing.
-const LEAD = /^[?\s]*(?:add|send|sent|bhejo|bhej\s*do|bhej|de\s*do|dedo|dena|chahiye|need(?:ed)?|want|order|qty|give|please|pls)?\s*/i;
+// "I need ...", "We want ...", "Mujhe ... chahiye" — a subject in front of the
+// verb that LEAD used to require to be the very first word, so "I need one
+// piece of each item" (13 Sep, live) matched nothing and fell through to the
+// free-text parser instead of closing the pending ask.
+const LEAD = /^[?\s]*(?:i|we|hum|hume|humein|mujhe)?\s*(?:add|send|sent|bhejo|bhej\s*do|bhej|de\s*do|dedo|dena|chahiye|need(?:ed)?|want|order|qty|give|please|pls)?\s*/i;
 const TAIL = /\s*(?:needed|chahiye|required|reqd|if\s+available|if\s+avl|if\s+possible|avl|available|only|more|extra|bhi)?\s*[.!]*$/i;
 
 function readAnswer(text, count) {
@@ -78,11 +101,15 @@ function readAnswer(text, count) {
   if (!t || t.length > 40 || !count) return null;
   const stripped = t.replace(LEAD, '').replace(TAIL, '').trim();
   // Only accept the stripped form when something was actually stripped AND
-  // what is left still starts with a digit — so "add" alone, or "if available"
-  // alone, is never read as a quantity.
-  if (stripped && stripped !== t && /^\d/.test(stripped)) t = stripped;
+  // what is left still starts with a number — digit OR a spelled-out one, so
+  // "add" alone, or "if available" alone, is never read as a quantity.
+  if (stripped && stripped !== t && /^(?:\d|one|two|three)\b/i.test(stripped)) t = stripped;
 
-  const each = t.match(new RegExp(`^(?:all\\s+)?(\\d{1,4}|one|two|three)\\s*${UNIT}?\\s*(?:each|per\\s*item|ea)\\.?$`, 'i'));
+  // "one piece of each item", "2pc of each part", "1 each" - the ", of each"
+  // was previously required to be the FINAL word "each" with nothing after
+  // it, so "of each item"/"of each part" (how people actually type it) never
+  // matched and the bot re-asked instead of applying the answer.
+  const each = t.match(new RegExp(`^(?:all\\s+)?(\\d{1,4}|one|two|three)\\s*${UNIT}?\\s*(?:of\\s+)?(?:each|all)(?:\\s+(?:item|items|part|parts|one))?\\.?$`, 'i'));
   if (each) {
     const n = { one: 1, two: 2, three: 3 }[each[1].toLowerCase()] || parseInt(each[1], 10);
     if (n > 0 && n <= 9999) return new Array(count).fill(n);
