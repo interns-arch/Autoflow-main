@@ -3220,12 +3220,19 @@ async function main() {
     customer.transport.outbox.length = 0;
     await dm(customer, CUST, 'haan');
     const first38 = lastOut(customer);
-    await dm(customer, CUST, 'ok');
-    const second38 = lastOut(customer);
+    // Waiting for a call-back is how an order dies, so the account is opened
+    // here instead: the paper form, asked one question at a time.
     check('a number not on the portal is told why the order cannot go', /regist/i.test(first38));
-    check('...and the next yes gets a short line, not the same paragraph again', customer.transport.outbox.length === 2 && second38 !== first38 && second38.length < first38.length);
+    check('...and the form starts there and then', /naam/i.test(first38));
+    check('...with a form actually open for that chat', Boolean(require('../src/core/customerCreate').pending(C38)));
+
+    // Every message now belongs to the form, so there has to be a way out.
+    await dm(customer, CUST, 'rehne do');
+    check('...that the customer can back out of', require('../src/core/customerCreate').pending(C38) === null);
+    check('...and backing out does not touch their list', (orders.findDraft(C38) || { lines: [] }).lines.length > 0);
   } finally {
     cust38.resolve = resolveWas38;
+    require('../src/core/customerCreate').cancel(C38);
   }
 
   // A customer in a group: the same bot as in a DM.
@@ -4763,6 +4770,73 @@ async function main() {
   // and none of it belongs in state.json.
   check('no owner details are stored', Object.keys(vehicle63.get('sim-car63')).sort().join(',') === 'fuel,maker,model,plate,variant,year');
   vehicle63.clear('sim-car63');
+
+
+  // ---- 64. opening an account, one question at a time ----
+  // The paper form says "filled by the sales person, goes to Sales Head for
+  // approval". This is that form asked in chat — and the approval stays,
+  // because the fields it gates are credit and discount.
+  console.log('\n[64] a new customer, asked for one question at a time');
+  const cc64 = require('../src/core/customerCreate');
+  const cfg64 = require('../src/config').creation;
+  const hadAppr64 = cfg64.approvers;
+  cfg64.approvers = { 919999492550: 'Prateek Sir' };
+  const t64 = (en, hi) => hi || en;
+  const CH64 = 'sim-create64';
+
+  cc64.cancel(CH64);
+  const open64 = cc64.start(CH64, '917355374975', t64);
+  check('the form opens on the firm name', /naam/i.test(open64) && Boolean(cc64.pending(CH64)));
+
+  const say64 = (txt, extra) => cc64.answer(CH64, extra || {}, txt, t64);
+  check('a malformed GSTIN is refused, not stored', (() => {
+    say64('Sharma Auto Parts'); say64('retailer'); say64('Rakesh Sharma');
+    return /15 character/i.test(say64('12345').reply);
+  })());
+  check('...and a well-formed one is taken', /PAN/i.test(say64('07AABCU9603R1ZM').reply));
+  check('an optional field can be skipped', /email/i.test(say64('skip').reply));
+  check('...but a required one cannot', (() => {
+    say64('skip'); say64('12 MG Road'); say64('Delhi'); say64('Delhi');
+    return /6 digit/i.test(say64('99').reply);
+  })());
+
+  // Typed coordinates are how a shop ends up in the sea.
+  say64('110070');
+  check('typed coordinates are refused — the pin is asked for', /Location attach/i.test(say64('28.6139, 77.2090').reply));
+  check('...and a dropped pin is taken', /photo/i.test(say64('', { location: { lat: 28.61, lng: 77.2 } }).reply));
+  check('a photo is required, words will not do', /Photo bhejiye/i.test(say64('koi photo nahi hai').reply));
+
+  const done64 = say64('', { mediaBase64: 'QUJD', mediaMime: 'image/jpeg' });
+  const final64 = done64.done ? done64 : say64('skip');
+  check('the form completes', final64.done === true);
+
+  const a64 = final64.form.answers;
+  check('the commercial terms are NOT asked of the customer', a64.creditDays === cfg64.defaultCreditDays && a64.creditLimit === cfg64.defaultCreditLimit);
+  check('...and the mobile is the number they wrote from', a64.phone === '917355374975');
+  const sum64 = cc64.summary(final64.form, t64);
+  check('the approver sees the whole form', /Sharma Auto Parts/.test(sum64) && /07AABCU9603R1ZM/.test(sum64) && /28\.61/.test(sum64));
+  check('...and is told how to answer', /OK WA-/.test(sum64));
+
+  // Only a Sales Head may say yes.
+  check('an approver is recognised', cc64.isApprover('919999492550') === true);
+  check('...and anyone else is not', cc64.isApprover('919888888888') === false);
+  const dec64 = cc64.readDecision('OK ' + a64.requestId);
+  check('a decision is read', Boolean(dec64) && dec64.yes === true && dec64.requestId === a64.requestId);
+  check('...and a rejection too', cc64.readDecision('NO ' + a64.requestId).yes === false);
+  check('...while a bare part number is not a decision', cc64.readDecision('16510M65L10') === null);
+
+  cc64.park(final64.form);
+  check('a parked request can be found by its id', Boolean(cc64.parked(a64.requestId)));
+  check('...and is no longer an open form', cc64.pending(CH64) === null);
+
+  // The portal payload uses the SAME conventions as the email path, so an
+  // account opened from WhatsApp is indistinguishable from one opened from
+  // a form.
+  const acct64 = require('../src/core/dataEntryRequests').buildAccount({ ...a64, kind: 'customer' });
+  check('the username follows the house rule', acct64.username === 'sharma_auto_parts');
+  check('...and the password does too', acct64.password === 'rakesh@123');
+  cc64.unpark(a64.requestId);
+  cfg64.approvers = hadAppr64;
 
 
   console.log(

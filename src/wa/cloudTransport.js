@@ -345,6 +345,19 @@ class CloudTransport {
               hasMedia: Boolean(msg.image || msg.document),
               mediaType: msg.type,
               fileName: (msg.document && msg.document.filename) || '',
+              // A dropped pin. The customer-creation form needs the shop's
+              // latitude and longitude, and asking a garage owner to type
+              // "28.6139" is asking for a wrong number — WhatsApp's own
+              // location share is exact and is one tap.
+              location:
+                msg.location && msg.location.latitude !== undefined
+                  ? {
+                      lat: Number(msg.location.latitude),
+                      lng: Number(msg.location.longitude),
+                      name: msg.location.name || null,
+                      address: msg.location.address || null,
+                    }
+                  : null,
             };
             // Learn the real payload shape: log anything carrying a hint of a
             // group that we did not manage to parse into a group id.

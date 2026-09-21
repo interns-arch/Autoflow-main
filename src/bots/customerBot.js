@@ -20,6 +20,7 @@ const orders = require('../core/orders');
 const knowledge = require('../core/knowledge');
 const inquiries = require('../core/inquiries');
 const customers = require('../core/customers');
+const customerCreate = require('../core/customerCreate');
 const portal = require('../integrations/dealerPortal');
 const escalation = require('../core/escalation');
 const clarify = require('../core/clarify');
@@ -256,6 +257,18 @@ class CustomerBot {
       return true;
     };
 
+    // A CUSTOMER FORM IN PROGRESS owns every message until it is finished,
+    // and that has to be decided BEFORE anything else reads them. Two of its
+    // answers are not text at all: the shop photograph would otherwise be
+    // read as a photo of a part and sent to a person, and a dropped pin
+    // carries no text so it would fall out of the handler entirely.
+    if (customerCreate.pending(m.chatId)) {
+      const said = String((m.body || '')).trim();
+      const step = customerCreate.answer(m.chatId, m, said, t);
+      if (step && step.done) return this.finishNewCustomer(m, step.form, reply, t);
+      if (step) return reply(step.reply);
+    }
+
     // Voice, PDF, spreadsheet, photo (pipeline/media). A message that is none
     // of those comes back as NOT_MEDIA and carries on below as text.
     const media = await handleMedia(this, m, reply, t);
@@ -266,6 +279,20 @@ class CustomerBot {
     if (m.body) m.body = ai.normalizeOrderText(m.body);
     const text = (m.body || '').trim();
     if (!text) return false;
+
+    // AN APPROVER SAYING YES. "OK WA-ABC123" from a Sales Head is the only
+    // thing that creates an account — checked before everything else, since
+    // a request id is not a part number and must never be looked up as one.
+    {
+      const decision = customerCreate.readDecision(text);
+      if (decision && customerCreate.isApprover(m.from)) {
+        return this.decideNewCustomer(m, decision, reply, t);
+      }
+      if (decision) {
+        store.log(this.key, `${m.from} tried to approve ${decision.requestId} but is not an approver`);
+        return reply(t('Only the Sales Head can approve that.', 'Ye sirf Sales Head approve kar sakte hain.'));
+      }
+    }
 
     // A NUMBER PLATE. "DL7CW1692" is a car, not a part — and before this it
     // satisfied every test for a part number, went to the portal, found
@@ -1144,13 +1171,16 @@ class CustomerBot {
               ),
             );
           }
+          // Waiting for someone to ring them back is how an order dies. The
+          // form the sales desk fills in on paper is asked here instead, one
+          // question at a time — and it still ends at the Sales Head, who is
+          // the only one who may set credit and discount.
+          store.log(this.key, `unregistered ${m.from} confirmed an order — starting the customer form`);
           return reply(
             t(
-              'Your account is not registered in our system yet, so I cannot place the order. ' +
-                'Our team will contact you and set it up — your list is safe until then.',
-              'Aapka account abhi hamare system mein register nahi hai, isliye order punch nahi kar paunga. ' +
-                'Hamari team aapse sampark karke account bana degi — tab tak ye list safe hai.',
-            ),
+              'Your account is not registered yet, so I cannot place the order — but I can open it now.\n\n',
+              'Aapka account abhi register nahi hai, isliye order punch nahi kar paunga — par abhi bana dete hain.\n\n',
+            ) + customerCreate.start(m.chatId, m.from, t),
           );
         }
         if (buyer.found === null) {
@@ -1790,6 +1820,104 @@ class CustomerBot {
   // silence. Never claims more than is true - no order is mentioned unless
   // there is one. With one part number just discussed it asks how many, and
   // that becomes the open question, so "4" next is the quantity.
+  // The form is full. It goes to the Sales Head — with the shop photo,
+  // because that is the half of it a person actually checks — and nothing
+  // is created until they answer.
+  async finishNewCustomer(m, form, reply, t) {
+    const approvers = Object.keys(config.creation.approvers);
+    if (!approvers.length) {
+      // Deliberate: without someone to say yes, the credit terms on this
+      // account would be nobody's decision.
+      store.log(this.key, `form ${form.answers.requestId} complete but NO approver is configured`);
+      customerCreate.cancel(m.chatId);
+      return reply(
+        t(
+          'Thank you — I have everything. Our team will set the account up.',
+          'Shukriya — sab mil gaya. Hamari team account bana degi.',
+        ),
+      );
+    }
+
+    customerCreate.park(form);
+    const text = customerCreate.summary(form, t);
+    for (const phone of approvers) {
+      try {
+        if (form._photo && this.transport.sendImage) {
+          await this.transport.sendImage(phone, Buffer.from(form._photo, 'base64'), form.answers.shopPhoto.mime, text);
+        } else {
+          await this.transport.sendText(phone, text);
+        }
+      } catch (e) {
+        store.log(this.key, `could not reach approver ${phone}: ${String((e && e.message) || e).slice(0, 90)}`);
+      }
+    }
+    store.log(this.key, `${form.answers.requestId} sent to ${approvers.length} approver(s)`);
+    return reply(
+      t(
+        `Thank you — sent for approval (${form.answers.requestId}). You will hear as soon as it is open.`,
+        `Shukriya — approval ke liye bhej diya (${form.answers.requestId}). Account khulte hi bata dunga.`,
+      ),
+    );
+  }
+
+  // "OK WA-ABC123" from the Sales Head. The only path that creates an
+  // account on the portal.
+  async decideNewCustomer(m, decision, reply, t) {
+    const req = customerCreate.parked(decision.requestId);
+    if (!req) {
+      return reply(t(`${decision.requestId} not found — it may already be done.`, `${decision.requestId} nahi mila — shayad pehle hi ho chuka hai.`));
+    }
+    const who = customerCreate.approverName(m.from);
+
+    if (!decision.yes) {
+      customerCreate.unpark(decision.requestId);
+      store.log(this.key, `${decision.requestId} rejected by ${who}`);
+      await this.transport.sendText(
+        req.answers.phone,
+        t(
+          'Our team needs a little more information before opening the account — someone will call you.',
+          'Account ke liye thodi aur jaankari chahiye — team aapko call karegi.',
+        ),
+      );
+      return reply(t(`Rejected. ${req.answers.name} was told.`, `Reject kar diya. ${req.answers.name} ko bata diya.`));
+    }
+
+    // The account itself. buildAccount works out the username, password,
+    // branch and user type exactly as the email path does, so an account
+    // opened from WhatsApp is indistinguishable from one opened from a form.
+    const dataEntry = require('../core/dataEntryRequests');
+    const account = dataEntry.buildAccount({ ...req.answers, kind: 'customer' });
+    try {
+      await portal.createCustomer(account);
+      customerCreate.unpark(decision.requestId);
+      customers.forget(req.answers.phone); // so the next order resolves the NEW account
+      store.log(this.key, `${decision.requestId} approved by ${who} — created ${account.username}`);
+
+      await this.transport.sendText(
+        req.answers.phone,
+        t(
+          `Your account is open. Send the part number and quantity and I will place the order.`,
+          `Aapka account khul gaya hai. Part number aur quantity bhejiye, order laga deta hoon.`,
+        ),
+      );
+      for (const phone of Object.keys(config.creation.notify)) {
+        if (store.normPhone(phone) === store.normPhone(m.from)) continue;
+        try {
+          await this.transport.sendText(phone, `${req.answers.name} ka account ban gaya (${account.username}) — ${who} ne approve kiya.`);
+        } catch (e) {
+          /* a notification nobody received must not fail the creation */
+        }
+      }
+      return reply(t(`Done — ${req.answers.name} is open (${account.username}).`, `Ho gaya — ${req.answers.name} ka account khul gaya (${account.username}).`));
+    } catch (e) {
+      // The request STAYS parked: a failed create is worth another try, and
+      // losing the form would mean asking the customer everything again.
+      const why = String((e && e.message) || e).slice(0, 160);
+      store.log(this.key, `${decision.requestId} create FAILED: ${why}`);
+      return reply(t(`Could not create it: ${why}\nThe request is still here — try *OK ${decision.requestId}* again.`, `Nahi ban paya: ${why}\nRequest abhi bhi hai — dobara *OK ${decision.requestId}* bhejiye.`));
+    }
+  }
+
   whereWeAre(m, t, { unclear = false } = {}) {
     const sorry = unclear ? t("Sorry, didn't get that. ", 'Samajh nahi paya sir. ') : '';
     // A question we asked and are still waiting on comes first: "1." after

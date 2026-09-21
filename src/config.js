@@ -15,6 +15,20 @@ function times(v, fallback) {
   const out = list(v).filter((t) => /^\d{1,2}:\d{2}$/.test(t));
   return out.length ? out : fallback;
 }
+// "919810238966:NK Jain, 919999492550:Prateek Jain" -> { 919810238966: 'NK Jain', … }
+// A name against a number, so an approval reads "Prateek Sir ne approve kiya"
+// rather than a twelve-digit number nobody recognises.
+function nameMap(v) {
+  const out = {};
+  for (const pair of list(v)) {
+    const i = pair.indexOf(':');
+    const phone = digits(i < 0 ? pair : pair.slice(0, i));
+    if (!phone) continue;
+    out[phone] = (i < 0 ? '' : pair.slice(i + 1).trim()) || phone;
+  }
+  return out;
+}
+
 function bool(v, dflt = false) {
   const s = String(v == null ? '' : v).trim().toLowerCase();
   if (!s) return dflt;
@@ -252,6 +266,30 @@ const config = {
       : (process.env.AI_OCR || '').toLowerCase() === 'off'
         ? false
         : process.platform === 'win32',
+  },
+
+  // NEW CUSTOMER, asked for over WhatsApp.
+  //
+  // The paper form is "filled by the sales person, goes to Sales Head for
+  // approval, then to the data team". This is the same form asked one
+  // question at a time in chat — and the approval step is kept, because the
+  // fields it gates are credit and discount. Nothing reaches the portal
+  // until an approver says yes.
+  //
+  // The phone:name lists were already in .env and read by nothing; this is
+  // what finally uses them.
+  creation: {
+    // Who may be asked to fill one in, and what to call them.
+    team: nameMap(process.env.CREATION_TEAM_NUMBERS),
+    // Who says yes. Without one of these the flow still collects, but
+    // nothing can be created — deliberately.
+    approvers: nameMap(process.env.CREATION_APPROVER_NUMBERS),
+    // Told when an account is made, so the desk is not surprised by it.
+    notify: nameMap(process.env.CREATION_NOTIFY_NUMBERS),
+    // The commercial terms a CUSTOMER is never asked for. A person being
+    // onboarded does not set their own credit limit.
+    defaultCreditDays: parseInt(process.env.CREATION_DEFAULT_CREDIT_DAYS || '1', 10),
+    defaultCreditLimit: parseFloat(process.env.CREATION_DEFAULT_CREDIT_LIMIT || '100000'),
   },
 
   // Number plate -> what the car is (integrations/vahan). Cashfree's
