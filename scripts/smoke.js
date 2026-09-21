@@ -2480,28 +2480,47 @@ async function main() {
   check('"Baki bill kardo" is an instruction, not a balance question', lookup27.parseOwn('Baki bill kardo') === null);
   check('"Kalra ka ledger" still belongs to the salesman flow', lookup27.parseOwn('Kalra ka ledger') === null);
 
-  // A rate. MRP is Odoo's list price; the net rate is only quoted when this
-  // customer's own past order shows the discount for that same part. The
-  // portal's `price` is our PURCHASE price and is never quoted.
+  // A rate comes from the DEALER PORTAL and nowhere else. Odoo's list_price
+  // used to be the fallback and the two disagree (23820M79J20 is 3,599 on
+  // the portal, 3,489 in Odoo), so an Odoo figure is a price the customer
+  // will not be charged — the order is punched against the portal. The
+  // portal's `price` is our PURCHASE price and is never quoted either.
   const rates27 = require('../src/core/rates');
-  const odoo27 = require('../src/integrations/odoo');
-  const hadEnabled27 = odoo27.enabled;
-  const hadCall27 = odoo27._call;
-  odoo27.enabled = () => true;
-  odoo27._call = async () => [{ default_code: '16510M65L10', list_price: 130 }];
-  const noHistory27 = await rates27.quote(['16510M65L10'], null, (en) => en);
-  check('with no history, the rate is the MRP', /16510M65L10 - MRP ₹130/.test(noHistory27) && /GST/.test(noHistory27));
-  check('...and our purchase price is nowhere in it', !/105/.test(noHistory27));
-  portal._setMockOrderHistory([
-    { customer_name: 'Mock Customer', lines: [{ part_no: '16510M65L10', item_discount_per: 12 }] },
-  ]);
-  const withHistory27 = await rates27.quote(['16510M65L10'], 'Mock Customer', (en) => en);
-  check('with their own past discount, the net rate is quoted', /₹114.4/.test(withHistory27) && /12% off/.test(withHistory27));
-  odoo27._call = async () => [];
-  check('a part Odoo has no price for is not quoted at all', (await rates27.quote(['ZZZZ9999'], null, (en) => en)) === null);
-  odoo27.enabled = hadEnabled27;
-  odoo27._call = hadCall27;
-  portal._setMockOrderHistory(null);
+  const cfg27 = require('../src/config').dealerPortal;
+  const hadListAcct27 = cfg27.listPriceAccountId;
+  // Pinned here rather than inherited from whichever section ran last: the
+  // mock portal prices from this table, so the rate tests own it.
+  portal.setMockStock([{ part_no: '16510M65L10', name: 'Oil Filter', quantity: 12, price: 105, mrp: 130, vendor: 'Northend' }]);
+
+  // A customer the portal knows: their own account's MRP, discount and net.
+  const known27 = await rates27.quote(
+    ['16510M65L10'],
+    { name: 'Mock Customer', ctx: { accountId: 1, branchId: 23 }, lines: [] },
+    (en) => en,
+  );
+  check('a registered customer gets the portal MRP', /16510M65L10 - MRP ₹130/.test(known27) && /GST/.test(known27));
+  check('...with their own discount and net rate', /₹114.4/.test(known27) && /12% off/.test(known27));
+  check('...and our purchase price is nowhere in it', !/105/.test(known27));
+
+  // Nobody the portal knows, and no house account configured: no price at
+  // all rather than a guess — the question goes to a person.
+  cfg27.listPriceAccountId = null;
+  check('an unregistered customer with no house account is not quoted', (await rates27.quote(['16510M65L10'], null, (en) => en)) === null);
+
+  // House account configured: the portal MRP, and ONLY the MRP. That
+  // account's discount is ours, not theirs, and must never be quoted as
+  // their rate.
+  cfg27.listPriceAccountId = 1;
+  const houseOnly27 = await rates27.quote(['16510M65L10'], null, (en) => en);
+  check('an unregistered customer gets the portal MRP', /16510M65L10 - MRP ₹130/.test(houseOnly27));
+  check('...but never the house account discount as their rate', !/114.4/.test(houseOnly27) && !/12% off/.test(houseOnly27));
+
+  // Lower case: the portal catalogue is case-sensitive and the quote
+  // upper-cases before asking. 13 Sep this cost a rate.
+  check('a part typed in lowercase is still priced', /MRP ₹130/.test(await rates27.quote(['16510m65l10'], null, (en) => en)));
+
+  check('a part the portal cannot price is not quoted at all', (await rates27.quote(['ZZZZ9999'], null, (en) => en)) === null);
+  cfg27.listPriceAccountId = hadListAcct27;
 
 
   // ---- 28. the same thing happening twice ----
@@ -3704,21 +3723,19 @@ async function main() {
 
   // "Aapne 16510m65l10 chhote akshar mein likha tha, isliye Odoo mein nahi
   // mila" -> "to isko shi kro auto capital".
-  const odoo39 = require('../src/integrations/odoo');
-  const enabledWas39 = odoo39.enabled;
-  const callWas39 = odoo39._call;
-  odoo39.enabled = () => true;
-  odoo39._call = async (model, method, args) => ((args[0][0][2] || []).includes('16510M65L10') ? [{ default_code: '16510M65L10', list_price: 105 }] : []);
+  const cfg39 = require('../src/config').dealerPortal;
+  const listAcctWas39 = cfg39.listPriceAccountId;
+  cfg39.listPriceAccountId = 1; // a house account, so an unregistered number still gets MRP
+  portal.setMockStock([{ part_no: '16510M65L10', name: 'Oil Filter', quantity: 50, price: 70, mrp: 105, vendor: 'N' }]);
   try {
     const q39 = await require('../src/core/rates').quote(['16510m65l10'], { name: null, ctx: null, lines: [] }, (en) => en);
-    check('a part typed in lowercase still finds its MRP in Odoo', /MRP ₹105/.test(q39 || ''));
+    check('a part typed in lowercase still finds its MRP on the portal', /MRP ₹105/.test(q39 || ''));
     // MRP is the price with GST in it; "GST extra" told the customer to add 18% to it.
     check('an MRP quote says GST is included, never extra', /incl\. GST/i.test(q39 || '') && !/GST extra|GST alag/i.test(q39 || ''));
     const priced39 = await require('../src/core/rates').quote(['16510M65L10'], { name: null, ctx: null, lines: [{ partNo: '16510M65L10', rate: 92.4, mrp: 105, discountPercent: 12, taxPercent: 18 }] }, (en) => en);
     check('a customer rate is quoted with GST inside it', /₹92\.4/.test(priced39 || '') && /incl\. 18% GST/.test(priced39 || '') && !/\+ 18% GST|GST extra/.test(priced39 || ''));
   } finally {
-    odoo39.enabled = enabledWas39;
-    odoo39._call = callWas39;
+    cfg39.listPriceAccountId = listAcctWas39;
   }
 
   // 13 Sep, founder, after marking the replay: where the gates would hand a

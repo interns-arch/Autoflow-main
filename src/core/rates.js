@@ -36,49 +36,19 @@ function money(v) {
 
 const norm = (v) => String(v || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
 
-// MRP, straight from Odoo's price list.
-async function mrpFor(partNos) {
-  const odoo = require('../integrations/odoo');
-  const out = new Map();
-  if (!odoo.enabled() || !partNos.length) return out;
-  try {
-    const rows = await odoo._call(
-      'product.product',
-      'search_read',
-      [[['default_code', 'in', partNos]]],
-      { fields: ['default_code', 'list_price'], limit: 20 },
-    );
-    for (const r of rows) if (num(r.list_price)) out.set(norm(r.default_code), num(r.list_price));
-  } catch (e) {
-    store.log('rate', 'Odoo MRP lookup failed: ' + String((e && e.message) || e).slice(0, 120));
-  }
-  return out;
-}
-
-// The discount this customer got on this very part, last time they bought it.
-// Anything less certain than that is not used to quote a rate.
-async function discountsFor(accountName, partNos) {
-  const portal = require('../integrations/dealerPortal');
-  const out = new Map();
-  if (!accountName || !partNos.length) return out;
-  let orders = [];
-  try {
-    orders = await portal.recentOrders(accountName, { limit: 8 });
-  } catch (e) {
-    store.log('rate', 'past orders lookup failed for ' + accountName + ': ' + String((e && e.message) || e).slice(0, 110));
-    return out;
-  }
-  const want = new Set(partNos.map(norm));
-  for (const o of orders) {
-    for (const l of o.lines || []) {
-      const p = norm(l.part_no);
-      if (!want.has(p) || out.has(p)) continue;
-      const disc = num(l.item_discount_per);
-      if (disc !== null && disc > 0 && disc < 90) out.set(p, disc);
-    }
-  }
-  return out;
-}
+// NO ODOO PRICE HERE, AND THAT IS THE POINT.
+//
+// Odoo's list_price used to be the fallback when the portal could not price
+// something, and the two do not agree: 23820M79J20 is 3,599 on the portal
+// and 3,489 in Odoo (21 Sep). The order is punched against the PORTAL, so an
+// Odoo figure quoted to a customer is a price they will not be charged —
+// a misquote, and the kind that is only discovered on the bill.
+//
+// So the portal is the only source of a price a customer sees. When it
+// cannot price a part, nobody guesses: quote() returns null and the question
+// goes to a person, which is what this bot already does with anything it is
+// not sure of. Odoo is still read for the LEDGER and credit notes
+// (core/customerLookup) — that is their account, not a quote.
 
 // GST is on top of the rate and the desk always says so - but not twice.
 // When the portal gave the tax percent it is already on every line.
@@ -236,19 +206,11 @@ async function quoteInner(partNos, who, t) {
     }
   }
 
-  // 3. Odoo's MRP, and this customer's own discount if a past order shows it
-  const [mrp, disc] = await Promise.all([mrpFor(list), discountsFor(opts.name, list)]);
-  const rows = [];
-  for (const p of list) {
-    const m = mrp.get(norm(p));
-    if (m === undefined) continue;
-    const d = disc.get(norm(p));
-    const match = (opts.lines || []).find((l) => norm(l.partNo || l.item) === norm(p));
-    rows.push({ part: p, mrp: m, discountPercent: d || null, rate: d ? Math.round(m * (1 - d / 100) * 100) / 100 : null, taxPercent: null, qty: match ? match.qty : 1 });
-  }
-  if (!rows.length) return null;
-  store.log('rate', 'quoted ' + rows.length + ' part(s) from Odoo' + (disc.size ? ' with their own past discount' : ' at MRP'));
-  return render(rows, t) + gstNote(rows, t);
+  // The portal could not price it, so nobody does. Null sends the question
+  // to a person — the same thing this bot does with any part it cannot
+  // identify. A guessed price is worse than a short wait.
+  store.log('rate', 'the portal could not price ' + list.length + ' part(s) — asking a person');
+  return null;
 }
 
 
@@ -262,4 +224,4 @@ async function quote(partNos, who, t) {
   return out && label ? t('For ' + label + ':', label + ' ke liye:') + String.fromCharCode(10) + out : out;
 }
 
-module.exports = { quote, _internals: { mrpFor, discountsFor, render } };
+module.exports = { quote, _internals: { render } };
