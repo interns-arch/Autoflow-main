@@ -15,6 +15,11 @@ process.env.DEALER_PORTAL_BASE_URL = ''; // force mock portal
 process.env.DEALER_PORTAL_TOKEN = '';
 process.env.DEALER_PORTAL_USERNAME = '';
 process.env.DEALER_PORTAL_PASSWORD = '';
+// The house account used to read portal MRP for an unregistered customer.
+// Blanked with the rest of the portal settings: the rate tests below stub
+// Odoo and assert the fallback, and a real value in .env would quietly send
+// them down the portal path instead.
+process.env.DEALER_PORTAL_ACCOUNT_ID = '';
 process.env.ANTHROPIC_API_KEY = ''; // deterministic parsers only
 process.env.ODOO_URL = ''; // no live ERP either - MRP and ledgers are stubbed below
 process.env.ODOO_DB = '';

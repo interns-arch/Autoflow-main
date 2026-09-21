@@ -95,6 +95,13 @@ const config = {
     // branch id scopes allocation to a Cartrends warehouse (e.g. 103 =
     // Bijwasan Hub HO, 23 = Bijwasan Warehouse).
     userId: parseInt(process.env.DEALER_PORTAL_USER_ID || '0', 10) || null,
+    // commercial-analyze prices against an ACCOUNT. For a customer the portal
+    // knows we use theirs, and they get their own discount. For everyone else
+    // — a number not registered yet — this account is used to read the
+    // portal's MRP, and ONLY the MRP: the discount on it belongs to this
+    // account, not to the person asking. Unset = no portal price for an
+    // unregistered customer, and the Odoo MRP is used as before.
+    listPriceAccountId: parseInt(process.env.DEALER_PORTAL_ACCOUNT_ID || '0', 10) || null,
     sourceBranchDealerId: parseInt(process.env.DEALER_PORTAL_BRANCH_ID || '0', 10) || null,
     timeoutMs: parseInt(process.env.DEALER_PORTAL_TIMEOUT_MS || '20000', 10),
     // A quoted quantity goes stale: another order may take the same stock.

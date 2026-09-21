@@ -21,6 +21,7 @@
 // shows the discount for that same part. A rate we cannot stand behind is not
 // quoted — it goes to a person, as before.
 const store = require('../store');
+const config = require('../config');
 
 function num(v) {
   const n = Number(v);
@@ -184,20 +185,50 @@ async function quoteInner(partNos, who, t) {
     return render(k, t) + gstNote(k, t);
   }
 
-  // 2. the portal, for a customer it knows
+  // 2. the portal — MRP, and this customer's own discount when it knows them
+  //
+  // The portal is the price of record: it carries the MRP the catalogue
+  // actually holds and the discount set against THAT customer's account.
+  // Odoo below is the fallback, and its MRP can differ (21 Sep: 23820M79J20
+  // is 3,599 on the portal and 3,489 in Odoo), so the portal is asked first
+  // whenever it can answer.
+  //
+  // Two ways it can answer. With a customer the portal knows, we price
+  // against their account and they get their own discount and net rate. With
+  // a number that is not registered yet there is no customer discount to
+  // give, so we price against the house account and keep ONLY the MRP — the
+  // discount on that account is ours, not theirs, and quoting it as their
+  // rate would be a promise nobody made.
   const ctx = opts.ctx || null;
-  if (ctx && (ctx.accountId || ctx.buyerId)) {
+  const theirAccount = (ctx && (ctx.accountId || ctx.buyerId)) || null;
+  const priceAccount = theirAccount || config.dealerPortal.listPriceAccountId || null;
+  if (priceAccount) {
+    const mrpOnly = !theirAccount;
     try {
       const portal = require('../integrations/dealerPortal');
-      const rows = await portal.commercialAnalyze(list.map((p) => ({ item: p, partNo: p, qty: 1 })), ctx);
+      const rows = await portal.commercialAnalyze(
+        list.map((p) => ({ item: p, partNo: p, qty: 1 })),
+        { ...(ctx || {}), accountId: priceAccount },
+      );
       const priced = (rows || [])
-        .filter((r) => r && r.rate)
+        .filter((r) => r && (mrpOnly ? r.mrp : r.rate))
         .map((r) => {
           const match = (opts.lines || []).find((l) => norm(l.partNo || l.item) === norm(r.partNo || r.item));
-          return { part: r.partNo || r.item, rate: r.rate, mrp: r.mrp, discountPercent: r.discountPercent, taxPercent: r.taxPercent, qty: match ? match.qty : 1 };
+          return {
+            part: r.partNo || r.item,
+            rate: mrpOnly ? null : r.rate,
+            mrp: r.mrp,
+            discountPercent: mrpOnly ? null : r.discountPercent,
+            taxPercent: r.taxPercent,
+            qty: match ? match.qty : 1,
+          };
         });
       if (priced.length) {
-        store.log('rate', 'quoted ' + priced.length + ' part(s) from the portal for account ' + (ctx.accountId || ctx.buyerId));
+        store.log(
+          'rate',
+          'quoted ' + priced.length + ' part(s) from the portal ' +
+            (mrpOnly ? 'at MRP (account ' + priceAccount + ', customer not registered)' : 'for account ' + priceAccount),
+        );
         return render(priced, t) + gstNote(priced, t);
       }
     } catch (e) {
