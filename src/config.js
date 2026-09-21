@@ -81,6 +81,10 @@ const config = {
     // but the analyze/confirm paths are still to be confirmed with Aneeq sir.
     // When he shares them this is a .env change, not a code change.
     loginPath: (process.env.DEALER_PORTAL_LOGIN_PATH || '/auth/login').trim(),
+    // The access token lasts 8 hours. Renewing it a few minutes early costs
+    // one request; discovering it expired costs a customer a failed message
+    // and a retry. Verified 21 Sep against the live portal.
+    refreshPath: (process.env.DEALER_PORTAL_REFRESH_PATH || '/auth/refresh-token').trim(),
     // DISCOVERED from the live OpenAPI spec (vagmine.vagminetech.com), 1 Sep 2026:
     //   analyze -> POST /api/v1/PUSH_ORDER/analyze      { items:[{part_no,quantity}] }
     //   confirm -> POST /api/v1/purchase-orders/confirm { user_id, lines:[...] }
@@ -113,6 +117,11 @@ const config = {
     adminUsername: (process.env.DEALER_PORTAL_ADMIN_USERNAME || '').trim(),
     adminPassword: (process.env.DEALER_PORTAL_ADMIN_PASSWORD || '').trim(),
     adminToken: (process.env.DEALER_PORTAL_ADMIN_TOKEN || '').trim(),
+
+    // Token lifecycle: the portal's access_token expires; these control
+    // proactive refresh so no customer request ever hits an expired token.
+    tokenLifetimeMs: parseFloat(process.env.DEALER_PORTAL_TOKEN_LIFETIME_HOURS || '8') * 60 * 60 * 1000,
+    refreshBeforeMs: parseFloat(process.env.DEALER_PORTAL_REFRESH_BEFORE_MIN || '5') * 60 * 1000,
   },
 
   // Official WhatsApp Cloud API (Meta) — customer line ka production transport

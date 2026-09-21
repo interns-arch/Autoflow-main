@@ -26,9 +26,42 @@ const store = require('../store');
 const conversation = require('./conversation');
 const profiles = require('./profiles');
 
-// The house voice, taught by example rather than by rule. Every one of these
-// is a real message from the Kalra Motor chat with the real answer a person
-// gave, or would have.
+// Whatever we already know them as — filled in by customers.resolve() the
+// first time an order/rate lookup runs for this number, and read here for
+// free: no extra portal call just to say hello. Nothing yet for a brand new
+// number, which is fine — the brief already says not to force a name in.
+function knownName(phone) {
+  const p = store.normPhone(phone || '');
+  if (!p) return null;
+  const hit = store.customers().find((c) => store.normPhone(c.phone) === p);
+  return (hit && hit.name && String(hit.name).trim()) || null;
+}
+
+// The house voice, taught by example rather than by rule. The first block is
+// real messages from the Kalra Motor chat with the real answer a person gave,
+// or would have.
+//
+// The block below "jaldi batao yaar..." is curated from
+// cartrends_hinglish_whatsapp_500_dataset.csv (18 Sep, 500 synthetic rows
+// across 25 intents such as refund, cancel_order, part_compatibility). Not
+// copied wholesale:
+//   - product_availability, part_compatibility, part_number_identification,
+//     bulk_order, order_status, order_confirmation: kept close to the
+//     dataset's own "ask for the identifying detail, then check" answers —
+//     they never state a price or a stock figure, so they cost nothing.
+//   - refund, return, cancel_order, address_change, order_modify,
+//     payment_issue, wrong_damaged_item, invoice, discount, human_agent:
+//     the dataset answers these itself ("order number bhej do, refund status
+//     check karta hoon"), but they are money, an existing order, or a
+//     modification — all already (human) territory per WHAT YOU MUST NOT DO
+//     above, so the answer here is (human), not the dataset's self-serve one.
+//   - price_quote: same reasoning as rate elsewhere in this file — "Rates
+//     come from the team, always" - so (human), never "checking the price".
+//   - cod, pincode_delivery: left out entirely. Cartrends is a wholesale
+//     dealer account business with its own dispatch, not courier/parcel
+//     delivery - there is no pincode zone or cash-on-delivery concept
+//     anywhere else in this codebase, and teaching the model to entertain one
+//     would be inventing a policy that does not exist.
 const EXAMPLES = `
 Customer: order kr skta hoon?
 Us: Haan sir, bilkul. Part number aur quantity bhej dijiye.
@@ -92,6 +125,66 @@ Us: (human)
 
 Customer: mera pichla order abhi tak nahi aaya
 Us: (human)
+
+Customer: thanks bhai
+Us: Anytime 😊
+
+Customer: (first message) hi, ye Rahul Motors se bol raha hoon
+Us: Hi Rahul, kaise help karun?
+
+Customer: jaldi batao yaar, dukaan band karni hai
+Us: Bataiye, jaldi karta hoon.
+
+Customer: thank you
+Us: No problem.
+
+Customer: bulk order chahiye
+Us: Part numbers aur quantities bhej do, bulk availability check karta hoon.
+
+Customer: ye part meri car me lagega?
+Us: Car ka make, model aur year bhej do, fitment check karta hoon.
+
+Customer: part no kaha likha hota hai
+Us: Part ki clear photo bhej do, number identify karne ki try karta hoon.
+
+Customer: mera order kaha hai
+Us: Order number bhej do, abhi status check karta hoon.
+
+Customer: order place ho gaya kya?
+Us: Order number bhej do, confirmation status check karta hoon.
+
+Customer: stock me hai?
+Us: Part number ya product name bhej do, stock check karta hoon.
+
+Customer: mujhe human se baat karni hai
+Us: (human)
+
+Customer: refund kab milega
+Us: (human)
+
+Customer: return kaise karna hai
+Us: (human)
+
+Customer: order cancel karna hai
+Us: (human)
+
+Customer: delivery address change karna hai
+Us: (human)
+
+Customer: order me item add kar sakte hain?
+Us: (human)
+
+Customer: payment failed aa raha hai
+Us: (human)
+
+Customer: wrong item mila
+Us: (human)
+
+Customer: invoice chahiye
+Us: (human)
+
+Customer: discount milega?
+Us: (human)
 `.trim();
 
 const SYSTEM = `You answer WhatsApp messages for CARTRENDS, an auto-parts supplier in Gurugram selling to dealers and garages.
@@ -113,6 +206,9 @@ WHAT YOU MUST NOT DO:
 - Never promise a delivery date or a time. "ETA = 7 days" for an out-of-stock part is the only timing you may repeat.
 - Never invent a part number.
 
+PERSONALIZATION:
+- When the brief below gives you "Customer's name", that is who you're talking to — use it the way a counter guy would, not a form letter: mainly at the start of a conversation, or wherever it feels natural, never forced into every line. No name given -> don't guess one.
+
 Reply ONLY with JSON, one of:
 
   {"action":"reply","text":"..."}   you can answer it \u2014 one or two short lines
@@ -124,11 +220,15 @@ Reply ONLY with JSON, one of:
                                     what you sell or how to order is NOT this.
 
 STYLE:
-- Match the customer's language exactly: Hinglish gets Hinglish, English gets English.
-- One line usually. Two at the very most.
-- No "Certainly", "I'd be happy to", "Please note", "Here are", no headings, no bullets.
-- Say "sir" the way the counter does \u2014 often, but not in every sentence.
-- Answer the question that was asked. If they ask what you meant, explain it in plain words; do not repeat the previous message.
+- Match the customer's language exactly: Hinglish gets Hinglish, English gets English. Mostly Hindi in, more Hindi back; mostly English in, lighter Hinglish back. Don't translate every English word into Hindi, and don't reach for textbook-formal Hindi ("kripya", "aadesh sankhya", "samasya") \u2014 nobody at the counter talks like that.
+- One line usually. Two at the very most. Give the answer first, then anything else \u2014 never bury it after a preamble.
+- If you ask something, ask ONE thing. Don't stack two questions in one message, and don't re-ask what they already told you two lines ago.
+- No "Certainly", "Absolutely", "I'd be happy to help", "Thank you for reaching out", "I understand your concern", "We sincerely apologize for the inconvenience", "Please don't hesitate to contact us", "Is there anything else I can help you with", "Rest assured", "Hope this helps", "your satisfaction is our priority". No headings, no bullets, no email voice.
+- Say "sir" the way the counter does \u2014 often, but not in every sentence, and never "bro"/"ma'am" unless the customer's own tone invites it.
+- Match their mood, don't paper over it. Annoyed about a delay -> deal with the actual thing, not a generic sorry. In a hurry -> answer straight, skip the small talk. Just said thanks -> a short "Anytime" or "Ji \ud83d\udc4d", nothing tacked on after it.
+- A name to use is given below when we have one. Use it near the start of a conversation, or when it lands naturally \u2014 never stuffed into a sentence just to personalize it, and never in back-to-back messages.
+- Vary how you open. Don't answer every message with "Hi" \u2014 most of the time, when the conversation is already going, just answer.
+- Emojis occasionally, not on every line, and never more than one.
 
 Here is how this counter actually talks:
 
@@ -146,7 +246,7 @@ const PROMISE =
   /\b(order (is )?(placed|confirmed|booked)|confirm(ed|ing)? (your|the) order|dispatch(ed|ing)? (today|tomorrow)|deliver(ed|y)? (today|tomorrow)|kal (bhej|aa) ?(denge|jayega)|aaj hi (bhej|nikal))\b/i;
 const STOCK_CLAIM = /\b(in stock|out of stock|stock (hai|nahi)|available hai|not available|avl\b)/i;
 const AI_TELL =
-  /\b(certainly|absolutely|of course|i'?d be happy|i understand your concern|great question|here (are|is) (a |the )?(detailed|list|steps)|as an ai|i apologi[sz]e for any)/i;
+  /\b(certainly|absolutely|of course|i'?d be happy|i understand your concern|great question|here (are|is) (a |the )?(detailed|list|steps)|as an ai|i apologi[sz]e for any|thank you for reaching out|please don'?t hesitate|is there anything else i can|rest assured|hope this helps|your satisfaction|we sincerely apologi[sz]e|kripya|humein khed hua)/i;
 
 function fenceFails(text, context) {
   const t = String(text || '').trim();
@@ -201,17 +301,22 @@ async function respond(chatId, message, phone, opts = {}) {
 
   const history = conversation.recent(chatId, 12);
   const style = conversation.styleOf(chatId, body);
+  const name = knownName(phone);
   const user =
     `Language the customer writes in: ${style.language === 'hi' ? 'Hinglish' : 'English'}\n` +
-    `Tone: ${style.formality}\n\n` +
+    `Tone: ${style.formality}\n` +
+    (name ? `Customer's name: ${name}\n` : '') +
+    '\n' +
     (history ? `Conversation so far:\n${history}\n\n` : '') +
     `Their new message:\n${body}`;
 
   let r;
   try {
-    // Who they are is appended to the brief, not to the message. The brief
-    // already forbids stating a price or a stock figure, so this can only
-    // change how it reads.
+    // The profile's style note is appended to the brief; the customer's own
+    // name went into `user` above, next to language and tone, since it is a
+    // fact about THIS message like they are, not a standing style rule. The
+    // brief already forbids stating a price or a stock figure, so either one
+    // can only change how a reply reads, never what it is allowed to say.
     r = await require('./ai')._claude(SYSTEM + profiles.briefFor(phone) + (opts.noHuman ? NO_HUMAN : ''), user);
   } catch (e) {
     store.log('chat', 'smalltalk failed: ' + String((e && e.message) || e).slice(0, 100));

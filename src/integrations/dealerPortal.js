@@ -38,6 +38,37 @@ const store = require('../store');
 
 const dp = config.dealerPortal;
 
+// ---- Token lifecycle constants ----
+// The portal's access_token expires; these control proactive refresh so no
+// customer request ever hits an expired token.
+const TOKEN_LIFETIME_MS = dp.tokenLifetimeMs || 8 * 60 * 60 * 1000; // default 8h
+const REFRESH_BEFORE_MS = dp.refreshBeforeMs || 5 * 60 * 1000;       // default 5 min
+
+// ---- Response cache: survive token refreshes without data loss ----
+// Keyed by method + path + body; entries expire after CACHE_TTL_MS.
+const responseCache = new Map();
+const CACHE_TTL_MS = 10 * 60 * 1000; // 10 min — well beyond the refresh window
+
+function cacheKey(method, urlPath, body) {
+  return `${method}:${urlPath}:${body ? JSON.stringify(body) : ''}`;
+}
+function cacheGet(key) {
+  const entry = responseCache.get(key);
+  if (!entry) return undefined;
+  if (Date.now() - entry.at > CACHE_TTL_MS) { responseCache.delete(key); return undefined; }
+  return entry.data;
+}
+function cacheSet(key, data) {
+  responseCache.set(key, { data, at: Date.now() });
+}
+// Periodic cleanup so the Map does not grow without bound.
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of responseCache) {
+    if (now - v.at > CACHE_TTL_MS) responseCache.delete(k);
+  }
+}, CACHE_TTL_MS).unref();
+
 // A customer name the portal HAS comes back in ~0.4 s; one it does not have
 // takes ~40 s to 404 (measured 13 Sep). Four seconds is ten times the real
 // answer and a tenth of the wait for "not found".
@@ -67,9 +98,20 @@ const isMock = () => !enabled();
 // so sharing a cache between them would have each login silently evict the
 // other.
 const sessions = {
-  sales: { token: null, creds: () => ({ user: dp.username, pass: dp.password, fixed: dp.token }) },
+  sales: {
+    token: null,
+    refresh: null,      // the rotating refresh token, so the password is sent once
+    expiresAt: 0,       // Date.now() at which token becomes invalid
+    refreshTimer: null, // setTimeout handle for proactive refresh
+    renewing: null,     // in-flight renewal, so two callers never race
+    creds: () => ({ user: dp.username, pass: dp.password, fixed: dp.token }),
+  },
   admin: {
     token: null,
+    refresh: null,
+    expiresAt: 0,
+    refreshTimer: null,
+    renewing: null,
     // Falls back to the sales credentials so a deployment with only one
     // account still works — it will simply fail on create with a permission
     // error, which is far clearer than silently doing nothing.
@@ -77,12 +119,27 @@ const sessions = {
   },
 };
 
+// Login and refresh answer in the same shape, and the portal sends it both at
+// the top level and nested under `data`. `expires_at` is authoritative when
+// present; `expires_in` (seconds) is the fallback.
+function readAuth(data) {
+  const d = (data && data.data) || {};
+  const token = d.access_token || d.token || data.access_token || data.token || null;
+  const refresh = d.refresh_token || data.refresh_token || null;
+  const at = d.expires_at || data.expires_at || null;
+  const inSec = Number(d.expires_in || data.expires_in) || 0;
+  let expiresAt = at ? Date.parse(at) : 0;
+  if (!Number.isFinite(expiresAt) || !expiresAt) expiresAt = inSec ? Date.now() + inSec * 1000 : 0;
+  return { token, refresh, expiresAt };
+}
+
 async function login(as = 'sales') {
   const s = sessions[as];
   const { user, pass, fixed } = s.creds();
   // A permanent / refresh token skips the interactive login entirely.
   if (fixed) {
     s.token = fixed;
+    s.expiresAt = Infinity; // permanent tokens do not expire
     return s.token;
   }
   const res = await fetch(dp.baseUrl + dp.loginPath, {
@@ -95,31 +152,166 @@ async function login(as = 'sales') {
     signal: AbortSignal.timeout(dp.timeoutMs),
   });
   if (!res.ok) throw new Error(`Dealer Portal login failed (${as}): HTTP ` + res.status);
-  const data = await res.json();
-  s.token = data.access_token || data.token || (data.data && data.data.access_token);
+  const auth = readAuth(await res.json());
+  s.token = auth.token;
   if (!s.token) throw new Error('Dealer Portal login returned no access_token');
-  store.log('portal', `Dealer Portal login OK as ${user} (${as})`);
+  // Kept so every later renewal can use this instead of the password.
+  s.refresh = auth.refresh;
+
+  // ---- Token lifetime tracking ----
+  // The portal's own expires_at / expires_in, else the configured default.
+  s.expiresAt = auth.expiresAt || Date.now() + TOKEN_LIFETIME_MS;
+  const lifetimeMs = Math.max(0, s.expiresAt - Date.now());
+
+  // Schedule proactive refresh BEFORE the token dies.
+  scheduleRefresh(as, lifetimeMs);
+
+  const expiresInMin = Math.round(lifetimeMs / 60000);
+  store.log('portal', `Dealer Portal login OK as ${user} (${as}), token valid ${expiresInMin} min, refresh in ${expiresInMin - Math.round(REFRESH_BEFORE_MS / 60000)} min`);
   return s.token;
+}
+
+// Schedule a proactive token refresh REFRESH_BEFORE_MS before expiry.
+function scheduleRefresh(as, lifetimeMs) {
+  const s = sessions[as];
+  if (s.refreshTimer) clearTimeout(s.refreshTimer);
+  const delay = Math.max(0, lifetimeMs - REFRESH_BEFORE_MS);
+  s.refreshTimer = setTimeout(() => refreshSession(as), delay);
+  // Don't keep the process alive just for a token timer.
+  if (s.refreshTimer.unref) s.refreshTimer.unref();
+}
+
+// Trade the refresh token for a new access token — WITHOUT the password.
+//
+// Two things the live portal taught us on 21 Sep, both of which this depends
+// on getting right:
+//   * NO Authorization header. Sending one answers 401; the refresh token in
+//     the body is the whole credential.
+//   * The refresh token ROTATES. The reply carries a NEW one and the old one
+//     dies the moment it is used — replaying it answers 401
+//     AUTH_TOKEN_INVALID. So the new one must be stored, or it is the NEXT
+//     renewal that fails, hours later and for no visible reason.
+//
+// Returns true when the session now holds a good token. Never throws: a
+// refresh that cannot be done falls back to a full login, which is exactly
+// what this code did before refreshing existed.
+async function renewWithRefreshToken(as) {
+  const s = sessions[as];
+  if (!s.refresh) return false;
+  try {
+    const res = await fetch(dp.baseUrl + dp.refreshPath, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refresh_token: s.refresh }),
+      signal: AbortSignal.timeout(dp.timeoutMs),
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const auth = readAuth(await res.json());
+    if (!auth.token) throw new Error('no access_token in the refresh reply');
+    s.token = auth.token;
+    if (auth.refresh) s.refresh = auth.refresh;
+    s.expiresAt = auth.expiresAt || Date.now() + TOKEN_LIFETIME_MS;
+    scheduleRefresh(as, Math.max(0, s.expiresAt - Date.now()));
+    store.log('portal', `token refreshed (${as}) without a login, good for another ${Math.round((s.expiresAt - Date.now()) / 60000)} min`);
+    return true;
+  } catch (e) {
+    // A spent or rejected refresh token is worse than none: keeping it would
+    // have every later renewal try the same dead credential.
+    s.refresh = null;
+    store.log('portal', `token refresh failed (${as}): ${String((e && e.message) || e).slice(0, 120)} — falling back to login`);
+    return false;
+  }
+}
+
+// Proactive refresh: renew before the current token expires so no API call
+// ever sees an expired one. The refresh token is tried first; only if that
+// fails does the password come out.
+async function refreshSession(as) {
+  const s = sessions[as];
+  const { fixed } = s.creds();
+  if (fixed) return; // permanent tokens don't refresh
+  try {
+    store.log('portal', `proactive token refresh for ${as} — expires in ${Math.round(Math.max(0, s.expiresAt - Date.now()) / 1000)}s`);
+    if (await renewWithRefreshToken(as)) return;
+    s.token = null; // force login() to fetch a fresh token
+    await login(as);
+  } catch (e) {
+    // Refresh failure is not fatal: the safety-net in api() will re-try on
+    // the next actual request. Log it so the ops team sees it.
+    store.log('portal', `proactive token refresh FAILED for ${as}: ${String(e.message || e).slice(0, 150)}`);
+  }
+}
+
+// Everything that needs a token comes through here.
+//
+// Single-flight per identity: two customer messages arriving together used to
+// mean two logins, and the portal allows one session per user — so they could
+// evict each other. With a rotating refresh token it is worse still: the
+// second renewal would be spending one the first had already used.
+function ensureToken(as) {
+  const s = sessions[as];
+  const { fixed } = s.creds();
+  if (fixed) {
+    s.token = fixed;
+    s.expiresAt = Infinity;
+    return Promise.resolve(s.token);
+  }
+  const usable = s.token && s.expiresAt && Date.now() < s.expiresAt - REFRESH_BEFORE_MS;
+  if (usable) return Promise.resolve(s.token);
+  if (!s.renewing) {
+    s.renewing = (async () => {
+      if (s.token && s.refresh && (await renewWithRefreshToken(as))) return s.token;
+      s.token = null;
+      return login(as);
+    })().finally(() => {
+      s.renewing = null;
+    });
+  }
+  return s.renewing;
 }
 
 async function api(method, urlPath, body, retry = true, as = 'sales', timeoutMs = 0) {
   const s = sessions[as];
-  if (!s.token) await login(as);
-  // A full URL is used as it is: a few portal routes sit outside /api/v1
-  // (GET /api/orders/track/{id}).
-  const res = await fetch(/^https?:\/\//.test(urlPath) ? urlPath : dp.baseUrl + urlPath, {
-    method,
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: 'Bearer ' + s.token,
-    },
-    body: body ? JSON.stringify(body) : undefined,
-    signal: AbortSignal.timeout(timeoutMs || dp.timeoutMs),
-  });
+
+  // ---- Safety-net expiry check ----
+  // If the timer was missed (laptop sleep, event-loop stall), this catches it
+  // BEFORE the fetch, not after a 401 — and renews with the refresh token
+  // rather than the password.
+  await ensureToken(as);
+
+  const ck = cacheKey(method, urlPath, body);
+
+  let res;
+  try {
+    // A full URL is used as it is: a few portal routes sit outside /api/v1
+    // (GET /api/orders/track/{id}).
+    res = await fetch(/^https?:\/\//.test(urlPath) ? urlPath : dp.baseUrl + urlPath, {
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer ' + s.token,
+      },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(timeoutMs || dp.timeoutMs),
+    });
+  } catch (fetchErr) {
+    // Network error during a token refresh window — serve from cache if warm.
+    const cached = cacheGet(ck);
+    if (cached !== undefined) {
+      store.log('portal', `api ${method} ${urlPath} fetch failed, serving from cache: ${String(fetchErr.message || fetchErr).slice(0, 100)}`);
+      return cached;
+    }
+    throw fetchErr;
+  }
+
   // A 401 is usually this identity's session being evicted by another login,
   // not a bad password — so re-login once before giving up.
   if (res.status === 401 && retry && !s.creds().fixed && s.creds().user) {
+    // The clock said the token was still good and the portal disagreed, so
+    // do not trust the refresh token either — start clean with a login.
     s.token = null;
+    s.refresh = null;
+    s.expiresAt = 0;
     return api(method, urlPath, body, false, as, timeoutMs);
   }
   if (!res.ok) {
@@ -132,20 +324,27 @@ async function api(method, urlPath, body, retry = true, as = 'sales', timeoutMs 
     err.code = parsed && parsed.error_code;
     throw err;
   }
-  return res.json();
+
+  const data = await res.json();
+  // ---- Cache the successful response ----
+  cacheSet(ck, data);
+  return data;
 }
 
 // The same door for a PDF: bytes, not JSON. Anything that is not a PDF (an
 // error page, a JSON "detail") is an error, never a file sent to someone.
 async function apiPdf(urlPath, retry = true, as = 'sales') {
   const s = sessions[as];
-  if (!s.token) await login(as);
+  // Safety-net expiry check (same as api()).
+  await ensureToken(as);
   const res = await fetch(dp.baseUrl + urlPath, {
     headers: { Authorization: 'Bearer ' + s.token },
     signal: AbortSignal.timeout(Math.max(dp.timeoutMs, 60000)),
   });
   if (res.status === 401 && retry && !s.creds().fixed && s.creds().user) {
     s.token = null;
+    s.refresh = null;
+    s.expiresAt = 0;
     return apiPdf(urlPath, false, as);
   }
   const buf = Buffer.from(await res.arrayBuffer());
@@ -559,6 +758,8 @@ module.exports = {
   _setMockOrderHistory: (v) => { mockHistory = v; },
   _setMockLookups: (v) => { mockLookups = v || {}; },
   _setMockUser: (mobile, user) => { mockUsers.set(String(mobile).replace(/[^0-9]/g, "").slice(-10), user); },
+  // exported so token renewal can be exercised without waiting eight hours
+  _sessions: () => sessions,
   // exported so the response shape can be tested without a live portal
   _readConfirmResponse: readConfirmResponse,
   _partBody: partBody,
