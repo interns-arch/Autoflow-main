@@ -113,18 +113,37 @@ function render(rows, t) {
     })
     .join('\n');
 
-  if (rows.length > 1) {
-    let total = 0;
-    let allHaveRate = true;
-    for (const r of rows) {
-      if (r.rate) {
-        total += r.rate * (r.qty || 1);
-      } else {
-        allHaveRate = false;
-      }
-    }
-    if (allHaveRate && total > 0) {
-      list += '\n\n' + t('Total: ₹', 'Total: ₹') + money(total);
+  // THE TOTAL.
+  //
+  // This used to be added only when every row carried a net `rate`, so the
+  // commonest case in practice — Odoo MRP with no discount on the account —
+  // printed three prices and no sum. 21 Sep, live: a customer asked "Total
+  // kitna hoga" against a cart of three parts at ×2 each and never got a
+  // figure. MRP is a real price and worth adding up; it is just labelled as
+  // MRP so nobody reads it as their net.
+  //
+  // Never MIX the two. A sum of some net rates and some MRPs is a number
+  // that is true of nothing, and in this trade it would be read as the bill.
+  // Mixed, or any part we could not price, means no total at all — an
+  // incomplete sum is worse than none.
+  const qtyOf = (r) => Math.max(1, Number(r.qty) || 1);
+  const pcs = rows.reduce((n, r) => n + qtyOf(r), 0);
+  const sum = (pick) => rows.reduce((n, r) => n + Number(pick(r)) * qtyOf(r), 0);
+  const label = (amount, isNet) => {
+    const many = pcs > rows.length; // a quantity is in play, so say what the sum covers
+    const head = isNet
+      ? many ? t(`Total for ${pcs} pcs`, `${pcs} pcs ka total`) : t('Total', 'Total')
+      : many ? t(`Total for ${pcs} pcs at MRP`, `${pcs} pcs ka total (MRP)`) : t('Total at MRP', 'Total (MRP)');
+    return '\n\n' + head + ': ₹' + money(amount);
+  };
+
+  if (rows.length > 1 || pcs > 1) {
+    if (rows.every((r) => r.rate)) {
+      const total = sum((r) => r.rate);
+      if (total > 0) list += label(total, true);
+    } else if (rows.every((r) => r.mrp)) {
+      const total = sum((r) => r.mrp);
+      if (total > 0) list += label(total, false);
     }
   }
   return list;
@@ -212,4 +231,4 @@ async function quote(partNos, who, t) {
   return out && label ? t('For ' + label + ':', label + ' ke liye:') + String.fromCharCode(10) + out : out;
 }
 
-module.exports = { quote, _internals: { mrpFor, discountsFor } };
+module.exports = { quote, _internals: { mrpFor, discountsFor, render } };
