@@ -22,6 +22,13 @@ const lang = require('./lang');
 let seq = 0;
 const pending = new Map();
 
+// Track when each helper last sent us a message, so we know whether the 24h
+// Cloud API messaging window is open. WhatsApp's sendText does NOT throw when
+// the window is closed — it returns a message id and silently fails to deliver
+// (error 131047 arrives asynchronously via webhook). The only reliable fix is
+// to send an approved template first to re-open the window.
+const helperLastInbound = new Map();
+
 // Part questions get a "could not confirm" follow-up when the helper is slow;
 // these reasons never do (see create()).
 const NO_FALLBACK_REASONS = ['NOT_A_PART', 'DOCUMENT', 'VOICE'];
@@ -92,6 +99,39 @@ function pickSender(customerBot) {
   }
   if (customerBot.transport.mode === 'SIMULATION') return customerBot.transport; // tests
   return null;
+}
+
+// Open the 24h Cloud API messaging window if it looks closed. The template is
+// a one-line overhead and the only way to guarantee delivery — sendText alone
+// returns a message id but silently drops it when the window is expired.
+//
+// Uses the approved 'order_update' template: "Update on your order {{1}} :{{2}}"
+// with a short heads-up so the helper knows a question is coming.
+const WINDOW_MS = 22 * 60 * 60 * 1000; // 22h with 2h safety margin
+const TEMPLATE_NAME = (process.env.ESCALATION_TEMPLATE || 'order_update').trim();
+async function ensureWindow(sender, helperPhone) {
+  if (!sender.sendTemplate) return; // not Cloud API
+  const norm = store.normPhone(helperPhone);
+  const last = helperLastInbound.get(norm) || 0;
+  if (Date.now() - last < WINDOW_MS) return; // window still open
+  try {
+    // 'order_update' is POSITIONAL with 2 body params: {{1}}=order ref, {{2}}=details.
+    const components = [
+      {
+        type: 'body',
+        parameters: [
+          { type: 'text', text: 'Helper' },
+          { type: 'text', text: 'New customer question incoming — details follow' },
+        ],
+      },
+    ];
+    await sender.sendTemplate(helperPhone, TEMPLATE_NAME, 'en', components);
+    store.log('escalate', `sent ${TEMPLATE_NAME} template to ${norm} to open 24h window`);
+    // Small delay to let WhatsApp process the template before the follow-up.
+    await new Promise((r) => setTimeout(r, 1500));
+  } catch (err) {
+    store.log('escalate', `template send to ${norm} failed: ${String(err.message || err).slice(0, 100)}`);
+  }
 }
 
 // ---------------------------------------------------------------- the ask
@@ -344,6 +384,11 @@ async function create(
   const to = helperFor(e);
   // Who was asked. Only that person's reply may answer it (see handleReply).
   e.sentTo = store.normPhone(to);
+
+  // Open the 24h messaging window if it looks closed. Without this, sendText
+  // silently succeeds but the message never reaches the helper (131047).
+  await ensureWindow(sender, to);
+
   try {
     // Keep the id of the question we asked. The helper answers by REPLYING to
     // it with a bare part number — no "E7" prefix — and with several questions
@@ -583,6 +628,10 @@ function backOut(e, id) {
 // Reply from the helper number (registered on every transport, claims first).
 async function handleReply(m) {
   if (m.isGroup || !helperNumbers().includes(store.normPhone(m.from))) return false;
+
+  // Record that this helper messaged us — the 24h Cloud API window is now open.
+  helperLastInbound.set(store.normPhone(m.from), Date.now());
+
   const text = (m.body || '').trim();
 
   // "pending" / "?" — what is still open. Answered even when nothing is, so a
