@@ -948,21 +948,39 @@ async function geminiOrderImage(base64, mediaType) {
       'https://generativelanguage.googleapis.com/v1beta/models/' +
       encodeURIComponent(g.visionModel) +
       ':generateContent';
-    const res = await fetch(url + '?key=' + encodeURIComponent(g.apiKey), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [
-          {
-            parts: [
-              { text: VISION_PROMPT + '\n\nExtract the order lines from this image.' },
-              { inline_data: { mime_type: mediaType || 'image/jpeg', data: base64 } },
-            ],
-          },
-        ],
-      }),
-      signal: AbortSignal.timeout(g.timeoutMs),
-    });
+    // 503 means "the model is busy, ask again", NOT "this photo cannot be
+    // read" — and the two had the same ending: straight past a dead Claude
+    // key to a person. Measured 21 Sep: one in five calls came back 503 while
+    // the same photo read perfectly on the retry. Backs off 1s, 2s.
+    //
+    // 429 is NOT in that set on purpose. Google answers 429 both for "too
+    // fast, slow down" and for "your quota is gone until it resets", and the
+    // second is not worth three attempts — on 21 Sep a spent free-tier quota
+    // cost five seconds of retries per photo before the same failure. A
+    // rate-limited call is caught by the next photo anyway; an exhausted one
+    // needs a person to fix the billing, not a tighter loop.
+    const RETRY_ON = new Set([500, 502, 503, 504]);
+    let res = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt) await new Promise((r) => setTimeout(r, 1000 * attempt));
+      res = await fetch(url + '?key=' + encodeURIComponent(g.apiKey), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [
+            {
+              parts: [
+                { text: VISION_PROMPT + '\n\nExtract the order lines from this image.' },
+                { inline_data: { mime_type: mediaType || 'image/jpeg', data: base64 } },
+              ],
+            },
+          ],
+        }),
+        signal: AbortSignal.timeout(g.timeoutMs),
+      });
+      if (res.ok || !RETRY_ON.has(res.status)) break;
+      store.log('ai', `Gemini vision HTTP ${res.status} (attempt ${attempt + 1}/3) — retrying`);
+    }
     if (!res.ok) throw new Error('HTTP ' + res.status + ' ' + (await res.text()).slice(0, 120));
     const data = await res.json();
     const text = (((data.candidates || [])[0] || {}).content?.parts || [])

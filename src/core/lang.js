@@ -65,9 +65,20 @@ function note(chatId, text) {
   return l;
 }
 
-// English until a customer shows us otherwise.
+// HINGLISH until a customer shows us otherwise.
+//
+// It used to be English, and that is not what this line sounds like. Most
+// messages carry no language signal at all — "Hii" matches neither list and
+// is one word, so detect() says nothing and the chat kept the default. A
+// dealer who opens with "Hii" and gets a whole conversation in English has
+// been answered in the wrong language by a counter that, in person, would
+// never have used it. The founder's rule is still exactly as it was — write
+// back in what they write in — this only changes the guess made before they
+// have told us anything, and the first Hindi or English marker still moves
+// it either way. DEFAULT_LANG=en restores the old behaviour.
 function of(chatId) {
-  return (chatId && bank()[chatId]) || 'en';
+  const dflt = (process.env.DEFAULT_LANG || 'hi').trim().toLowerCase() === 'en' ? 'en' : 'hi';
+  return (chatId && bank()[chatId]) || dflt;
 }
 
 // t = translate. `t(chatId)` gives a chooser used inline at every message:

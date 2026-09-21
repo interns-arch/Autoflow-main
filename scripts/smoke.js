@@ -771,8 +771,10 @@ async function main() {
   });
   check('switching to English switches the replies', lang.of('sim-' + LANGCUST) === 'en');
 
-  // A customer who has said nothing either way is answered in English.
-  check('English is the default', lang.of('sim-919000000001') === 'en');
+  // A customer who has said nothing either way is answered in HINGLISH: on
+  // this line that is the likelier guess, and the first English word they
+  // write still flips the whole chat over (the check above proves it).
+  check('Hinglish is the default', lang.of('sim-919000000001') === 'hi');
 
 
   // ---- 7k. a part number with no quantity is a QUESTION ----
@@ -1284,7 +1286,7 @@ async function main() {
 
   const manyCars = Array.from({ length: 40 }, (_, i) => ({ partNo: 'C' + i, name: `BRAKE PAD | CAR${i} | FRONT` }));
   const q1b = clarify.nextQuestion(manyCars);
-  check('asks an open question when there are too many cars to list', Boolean(q1b) && /which vehicle/i.test(q1b.text));
+  check('asks an open question when there are too many cars to list', Boolean(q1b) && /which vehicle|kaunsi gaadi/i.test(q1b.text));
 
   const frontRear = many.filter((x) => /ALTO/.test(x.name));
   check('short list needs no question at all', clarify.nextQuestion(frontRear) === null);
@@ -1299,7 +1301,7 @@ async function main() {
     { partNo: 'B7', name: 'BRAKE PAD | ALTO | FRONT' },
   ];
   const q2 = clarify.nextQuestion(positions, [1]);
-  check('asks front or rear when only that differs', Boolean(q2) && /front or rear/i.test(q2.text));
+  check('asks front or rear when only that differs', Boolean(q2) && /front (or|ya) rear/i.test(q2.text));
 
   // The same question must never come round twice — that is what makes a bot
   // feel like a machine.
@@ -1313,7 +1315,7 @@ async function main() {
   clarify.clear('sim-c');
   check('no pending question after clearing', clarify.get('sim-c') === null);
 
-  check('options list is capped and asks, without rates', !/@|Rs\./.test(clarify.options(many)) && /Which one do you need/.test(clarify.options(many)));
+  check('options list is capped and asks, without rates', !/@|Rs\./.test(clarify.options(many)) && /Which one do you need|Kaunsa chahiye/.test(clarify.options(many)));
 
   // The CRM team never quotes a rate on WhatsApp; neither may the bot.
   check('no price anywhere in what the customer was sent', !/@\d|Rs\.\s*\d/.test(sent(customer)));
@@ -1685,7 +1687,7 @@ async function main() {
   });
   const cart = orders.findDraft('sim-' + LN);
   check('"Leave 3no. Item" removed the third line', cart.lines.length === 2 && !cart.lines.some((l) => (l.partNo || l.item) === 'LN-3'));
-  check('and said so', /Removed/i.test(sent(customer)));
+  check('and said so', /Removed|Hata diya/i.test(sent(customer)));
 
   customer.transport.outbox.length = 0;
   await customer.transport.injectIncoming({
@@ -1698,13 +1700,13 @@ async function main() {
   await customer.transport.injectIncoming({
     from: LN, chatId: 'sim-' + LN, isGroup: false, body: 'Leave 3no. Item', mediaType: 'chat', contextId: listWamid,
   });
-  check('a line already removed is named, not shrugged at', /not in the order any more/i.test(sent(customer)));
+  check('a line already removed is named, not shrugged at', /not in the order any more|pehle hi hat chuka/i.test(sent(customer)));
 
   customer.transport.outbox.length = 0;
   await customer.transport.injectIncoming({
     from: LN, chatId: 'sim-' + LN, isGroup: false, body: 'Leave 9no. Item', mediaType: 'chat', contextId: listWamid,
   });
-  check('a line the list never had is named too', /no item 9/i.test(sent(customer)));
+  check('a line the list never had is named too', /no item 9|item 9 tha hi nahi/i.test(sent(customer)));
 
   // A voice note recorded ON the list carries the list to the helper.
   customer.transport.outbox.length = 0;
