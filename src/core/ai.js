@@ -862,7 +862,19 @@ async function parseOrderImage(base64, mediaType) {
     // one managed to emit a single character.
     store.log('ai', `OCR text (${ocrText.trim().length} chars) held no order — trying vision`);
   }
-  // no OCR text at all — try Claude vision if available
+  // GEMINI FIRST, Claude behind it.
+  //
+  // 21 Sep: the Anthropic key was revoked, and with local OCR off that left
+  // no reader at all — every photo went to a person. Gemini reads a label
+  // just as well (3s on the test fixture) and its key is the one that works,
+  // so it leads and Claude catches what it cannot do. A photo that Gemini
+  // reads but finds no part in is a finished answer, not a failure: it
+  // returns an empty list and nobody else is asked, exactly as Claude did
+  // when it led.
+  const primary = await geminiOrderImage(base64, mediaType);
+  if (primary) return primary;
+
+  // Gemini is not configured, or could not answer — Claude vision if available
   if (config.ai.apiKey) {
     try {
       const image = { type: 'image', source: { type: 'base64', media_type: mediaType || 'image/jpeg', data: base64 } };
@@ -921,8 +933,59 @@ async function parseOrderImage(base64, mediaType) {
     return [];
   }
   lastImageNote = "there is no AI key on this machine, so photos cannot be read";
-  store.log('ai', 'no OCR text and no ANTHROPIC_API_KEY — photo cannot be read');
+  store.log('ai', 'no OCR text and no vision key — photo cannot be read');
   return null;
+}
+
+// Ask Gemini to read the photo, in the same shape Claude is asked for.
+// Returns the cleaned lines, or null when Gemini is not configured or could
+// not answer — null means "nothing to add", never "the photo is empty".
+async function geminiOrderImage(base64, mediaType) {
+  const g = config.gemini;
+  if (!g.apiKey) return null;
+  try {
+    const url =
+      'https://generativelanguage.googleapis.com/v1beta/models/' +
+      encodeURIComponent(g.visionModel) +
+      ':generateContent';
+    const res = await fetch(url + '?key=' + encodeURIComponent(g.apiKey), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [
+          {
+            parts: [
+              { text: VISION_PROMPT + '\n\nExtract the order lines from this image.' },
+              { inline_data: { mime_type: mediaType || 'image/jpeg', data: base64 } },
+            ],
+          },
+        ],
+      }),
+      signal: AbortSignal.timeout(g.timeoutMs),
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status + ' ' + (await res.text()).slice(0, 120));
+    const data = await res.json();
+    const text = (((data.candidates || [])[0] || {}).content?.parts || [])
+      .map((p) => p.text || '')
+      .join('');
+    const json = text.match(/\{[\s\S]*\}/);
+    if (!json) throw new Error('no JSON in the reply');
+    const r = JSON.parse(json[0]);
+    if (!r || !Array.isArray(r.lines)) throw new Error('no lines array');
+    const clean = sanitizeOrderLines(r.lines, null);
+    if (r.doc) clean.docType = String(r.doc).toLowerCase().slice(0, 20);
+    lastImageNote = clean.length ? null : 'the photo was read, but no part number is visible in it';
+    store.log(
+      'ai',
+      clean.length
+        ? `photo order read via Gemini vision: ${clean.length} line(s)`
+        : `Gemini vision saw the photo but found no order lines (${r.lines.length} raw)`
+    );
+    return clean;
+  } catch (e) {
+    store.log('ai', 'Gemini vision failed: ' + String((e && e.message) || e).slice(0, 120));
+    return null;
+  }
 }
 
 module.exports = {

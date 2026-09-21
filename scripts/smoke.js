@@ -21,6 +21,12 @@ process.env.ODOO_DB = '';
 process.env.ODOO_USERNAME = '';
 process.env.ODOO_API_KEY = '';
 process.env.GEMINI_API_KEY = ''; // voice notes are not transcribed in the suite
+// The photo tests read the fixture with LOCAL OCR — with both AI keys blanked
+// above there is no vision path, so this is the only reader left. It used to
+// be inherited: config defaults ai.ocr to true on win32, so the suite passed
+// here and would have failed on Linux. Pinned so the result no longer depends
+// on the machine, or on whatever AI_OCR happens to say in .env.
+process.env.AI_OCR = 'on';
 process.env.ORDER_CONFIRM_ENABLED = 'true'; // mock portal — safe to punch here
 
 const path = require('path');

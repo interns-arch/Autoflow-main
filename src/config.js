@@ -247,6 +247,21 @@ const config = {
         : process.platform === 'win32',
   },
 
+  // A SECOND pair of eyes on a photo, for when the first is unavailable.
+  //
+  // 21 Sep: the Anthropic key was revoked and every photo stopped being read —
+  // one dead credential took the whole photo path down, and with local OCR off
+  // there was nothing behind it. Claude is still tried first; this runs only
+  // when that fails or is not configured. Same GEMINI_API_KEY as the voice
+  // notes use, but its own model: reading a label is not transcribing audio.
+  gemini: {
+    apiKey: (process.env.GEMINI_API_KEY || '').trim(),
+    // gemini-2.5-flash is RETIRED (404 "no longer available to new users").
+    // 3.5-flash read the test label correctly in 3s on 21 Sep.
+    visionModel: (process.env.GEMINI_VISION_MODEL || 'gemini-3.5-flash').trim(),
+    timeoutMs: parseInt(process.env.GEMINI_VISION_TIMEOUT_MS || '30000', 10),
+  },
+
   // Voice notes -> text, for the HELPER to read. Claude takes no audio at all,
   // so this is Google. Blank key = the whole feature is off and voice notes
   // reach a person exactly as they did before.
