@@ -900,7 +900,12 @@ const VISION_PROMPT =
   'ALSO say what the photo IS, in "doc": one of "order" (a request for parts), "invoice" (a tax ' +
   'invoice or bill), "gatepass", "challan", "payment" (cheque, receipt, UPI screenshot), "part" (a ' +
   'photo of the component itself with no readable number), or "other". ' +
-  'Reply ONLY with JSON: {"doc":str,"lines":[{"item":str,"qty":int}]}. ' +
+  'ALSO read the vehicle REGISTRATION NUMBER if a number plate is visible anywhere in the photo — ' +
+  'a customer photographing their car means "this is my car, find me a part for it". Indian plates ' +
+  'look like DL7CW1692, HR 26 DQ 5551, MH12AB1234. Give it in "plate", with no spaces. A chassis or ' +
+  'engine number on a VIN plate is NOT a registration number: leave "plate" out for those. Never ' +
+  'guess a plate that is not legible. ' +
+  'Reply ONLY with JSON: {"doc":str,"plate":str,"lines":[{"item":str,"qty":int}]}. ' +
   'If there is no part number and no part name in the photo, use an empty lines array.';
 
 // "33400M" or "33400 M COIL ASSY IGNITION": the printed half of a Maruti number.
@@ -994,6 +999,10 @@ async function parseOrderImage(base64, mediaType) {
         // read it" without a second call to the model. Callers that only use
         // .length / .map are unaffected.
         if (r.doc) clean.docType = String(r.doc).toLowerCase().slice(0, 20);
+        // A number plate in the photo is the customer's CAR, not a part.
+        // Carried on the array so media.js can look it up instead of sending
+        // an unreadable photo to a person.
+        if (r.plate) clean.plate = require('../integrations/vahan').plateIn(String(r.plate)) || null;
         lastImageNote = clean.length ? null : "the photo was read, but no part number is visible in it";
         // Say what happened either way. Without this the log went silent after
         // "OCR found NO text", which reads as "Claude was never called" when in
@@ -1075,6 +1084,10 @@ async function geminiOrderImage(base64, mediaType) {
     if (!r || !Array.isArray(r.lines)) throw new Error('no lines array');
     const clean = sanitizeOrderLines(r.lines, null);
     if (r.doc) clean.docType = String(r.doc).toLowerCase().slice(0, 20);
+    // A number plate in the photo is the customer's CAR, not a part.
+    // Carried on the array so media.js can look it up instead of sending
+    // an unreadable photo to a person.
+    if (r.plate) clean.plate = require('../integrations/vahan').plateIn(String(r.plate)) || null;
     lastImageNote = clean.length ? null : 'the photo was read, but no part number is visible in it';
     store.log(
       'ai',

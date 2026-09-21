@@ -4839,6 +4839,56 @@ async function main() {
   cfg64.approvers = hadAppr64;
 
 
+  // ---- 65. a photo of the CAR, not of a part ----
+  // 21 Sep, live: a customer photographed their car. Vision found no part
+  // number, so the picture went to the helper as "could not read the part
+  // number" — a person was sent a photo of a car and asked to find a part
+  // nobody had named. The registration plate in it is the answer.
+  console.log('\n[65] a photo with a number plate is a car, not an unreadable part');
+  const media65 = require('../src/pipeline/media');
+  const ai65 = require('../src/core/ai');
+  const vahan65 = require('../src/integrations/vahan');
+  const vehicle65 = require('../src/core/vehicle');
+  vahan65.setMockVehicles({ DL7CW1692: { maker: 'MARUTI SUZUKI INDIA LTD', model: 'INVICTO ZETA PLUS 7S', fuel: 'PETROL', year: '2024' } });
+
+  const parseWas65 = ai65.parseOrderImage;
+  const CH65 = 'sim-919000006500';
+  const sent65 = [];
+  const bot65 = {
+    key: 'customer',
+    transport: { sendText: async (to, text) => sent65.push({ to, text }) },
+    processOrderLines: async () => true,
+  };
+  const reply65 = async (text) => { sent65.push({ to: CH65, text }); return true; };
+  const m65 = { chatId: CH65, from: '919000006500', body: '', mediaType: 'image', mediaBase64: 'QUJD', mediaMime: 'image/jpeg' };
+
+  try {
+    // Vision reads no part, but does read the plate off the car.
+    const withPlate = [];
+    withPlate.plate = 'DL7CW1692';
+    ai65.parseOrderImage = async () => withPlate;
+    sent65.length = 0;
+    await media65.handleMedia(bot65, m65, reply65, (en) => en);
+    check('the car is named back to the customer', /INVICTO/i.test(sent65.map((x) => x.text).join(' ')));
+    check('...nothing is sent to the helper', sent65.every((x) => x.to === CH65));
+    check('...and the car is remembered for the next question', (vehicle65.get(CH65) || {}).model === 'INVICTO ZETA PLUS 7S');
+    check('...so "bumper" searches that car', vehicle65.narrow(CH65, 'bumper') === 'bumper MARUTI INVICTO');
+
+    // A plate we cannot resolve is still not a question for a person.
+    vehicle65.clear(CH65);
+    const unknownPlate = [];
+    unknownPlate.plate = 'HR26DQ5551';
+    ai65.parseOrderImage = async () => unknownPlate;
+    sent65.length = 0;
+    await media65.handleMedia(bot65, m65, reply65, (en) => en);
+    check('an unresolvable plate is read back, not escalated',
+      /HR26DQ5551/.test(sent65.map((x) => x.text).join(' ')) && sent65.every((x) => x.to === CH65));
+  } finally {
+    ai65.parseOrderImage = parseWas65;
+    vehicle65.clear(CH65);
+  }
+
+
   console.log(
     failures === 0
       ? '\n✅ ALL CHECKS PASSED\n'

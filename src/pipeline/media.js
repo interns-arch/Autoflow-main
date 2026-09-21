@@ -254,6 +254,38 @@ async function handleMedia(bot, m, reply, t) {
       );
     }
 
+    // NO PART IN IT, BUT A NUMBER PLATE IS. The customer photographed their
+    // car: "this is mine, find me the part for it". 21 Sep, live: those went
+    // to the helper as "could not read the part number" — a person was sent
+    // a picture of a car and asked to find a part nobody had named yet.
+    // Look the plate up and ask which part, the way the counter would.
+    const seenPlate = lines && lines.plate;
+    if (seenPlate) {
+      const vahan = require('../integrations/vahan');
+      const vehicle = require('../core/vehicle');
+      const car = await vahan.lookup(seenPlate);
+      if (car) {
+        vehicle.remember(m.chatId, car);
+        store.log(bot.key, `photo plate ${seenPlate} -> ${vahan.describe(car)}`);
+        return reply(
+          t(
+            `${vahan.describe(car)}. Which part do you need?`,
+            `${vahan.describe(car)}. Kaunsa part chahiye?`,
+          ),
+        );
+      }
+      // The plate was legible, the registry was not reachable (or does not
+      // know it). Still not a question for a person — say what we read and
+      // ask for the part.
+      store.log(bot.key, `photo plate ${seenPlate} not resolved`);
+      return reply(
+        t(
+          `I can see ${seenPlate}. Which part do you need for it?`,
+          `${seenPlate} dikh raha hai. Iske liye kaunsa part chahiye?`,
+        ),
+      );
+    }
+
     // Photo unreadable — but the caption itself may carry the whole order
     // ("<image> 10pcs timing seal 16141M68K00").
     if (caption) {
