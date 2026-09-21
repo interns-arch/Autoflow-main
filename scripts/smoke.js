@@ -15,6 +15,10 @@ process.env.DEALER_PORTAL_BASE_URL = ''; // force mock portal
 process.env.DEALER_PORTAL_TOKEN = '';
 process.env.DEALER_PORTAL_USERNAME = '';
 process.env.DEALER_PORTAL_PASSWORD = '';
+// Number-plate lookups run against data/mock-vehicles.json, never Cashfree:
+// the live API is IP-whitelisted and would fail here for a reason that has
+// nothing to do with the code under test.
+process.env.VAHAN_API_KEY = '';
 // The house account used to read portal MRP for an unregistered customer.
 // Blanked with the rest of the portal settings: the rate tests below stub
 // Odoo and assert the fallback, and a real value in .env would quietly send
@@ -4710,6 +4714,55 @@ async function main() {
   check('group: the same two lines are 48 and 40', qtyOf37('16510M68K10', G38) === 48 && qtyOf37('2630002752', G38) === 40);
   resetG38();
   reset37();
+
+
+  // ---- 63. a number plate is a CAR, not a part ----
+  // "DL7CW1692" satisfies every test for a part number — letters, digits,
+  // nine characters — so before integrations/vahan existed it went to the
+  // portal, found nothing, and reached a person as an unknown part.
+  console.log('\n[63] a number plate names the car, and the car narrows the search');
+  const vahan63 = require('../src/integrations/vahan');
+  const vehicle63 = require('../src/core/vehicle');
+  const partish63 = require('../src/core/partish');
+  vahan63.setMockVehicles({
+    DL7CW1692: { maker: 'MARUTI SUZUKI INDIA LTD', model: 'INVICTO ZETA PLUS 7S', fuel: 'PETROL/HYBRID', year: '2024' },
+    HR26DQ5551: { maker: 'MARUTI SUZUKI INDIA LTD', model: 'SWIFT VXI', fuel: 'PETROL', year: '2018' },
+  });
+
+  check('a plate is read however it is typed',
+    vahan63.plateIn('DL7CW1692') === 'DL7CW1692' &&
+    vahan63.plateIn('DL 7 CW 1692') === 'DL7CW1692' &&
+    vahan63.plateIn('dl-7-cw-1692') === 'DL7CW1692' &&
+    vahan63.plateIn('22BH1234AA') === '22BH1234AA');
+  check('...and found inside a sentence', vahan63.plateIn('is gaadi ka bumper chahiye DL7CW1692') === 'DL7CW1692');
+  check('...but only the bare plate counts as "this is my car"',
+    vahan63.isOnlyPlate('DL7CW1692') === true && vahan63.isOnlyPlate('is gaadi ka bumper DL7CW1692') === false);
+
+  // THE REGRESSION THIS EXISTS FOR, both ways round.
+  check('a part number is never read as a plate',
+    ['23820M79J20', '16510M65L10', '92402C4000', '72421M68P01', 'BP-1001', 'ACG-R134']
+      .every((p) => vahan63.plateIn(p) === null));
+  check('a plate is never read as a part number',
+    ['DL7CW1692', 'HR26DQ5551', 'MH12AB1234'].every((p) => partish63.isPartNumber(p) === false));
+  check('...and real part numbers still are',
+    ['23820M79J20', '16510M65L10', '41800M79G00'].every((p) => partish63.isPartNumber(p) === true));
+
+  const car63 = await vahan63.lookup('DL 7 CW 1692');
+  check('the plate resolves to a car', Boolean(car63) && /INVICTO/i.test(car63.model) && car63.plate === 'DL7CW1692');
+  check('...described for a human, not shouted from the registry', vahan63.describe(car63) === 'Maruti Suzuki Invicto Zeta Plus 7S (2024, Petrol/Hybrid)');
+  check('an unknown plate is not invented', (await vahan63.lookup('MH12AB1234')) === null);
+
+  vehicle63.remember('sim-car63', car63);
+  check('the car is remembered for the chat', (vehicle63.get('sim-car63') || {}).model === 'INVICTO ZETA PLUS 7S');
+  // Brand and nameplate only: part names carry "MARUTI ... INVICTO", never
+  // "ZETA PLUS 7S", and the portal search requires EVERY extra word.
+  check('the search is narrowed to the brand and nameplate', vehicle63.narrow('sim-car63', 'bumper') === 'bumper MARUTI INVICTO');
+  check('...the car is not named twice', vehicle63.narrow('sim-car63', 'invicto bumper') === 'invicto bumper MARUTI');
+  check('...and another chat gets nothing added', vehicle63.narrow('sim-car63-other', 'bumper') === 'bumper');
+  // Only the car is kept. An RC record carries the owner's name and address
+  // and none of it belongs in state.json.
+  check('no owner details are stored', Object.keys(vehicle63.get('sim-car63')).sort().join(',') === 'fuel,maker,model,plate,variant,year');
+  vehicle63.clear('sim-car63');
 
 
   console.log(

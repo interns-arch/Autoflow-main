@@ -254,6 +254,30 @@ const config = {
         : process.platform === 'win32',
   },
 
+  // Number plate -> what the car is (integrations/vahan). Cashfree's
+  // verification suite wraps the VAHAN registry; the key is their client
+  // SECRET and the client id rides in VAHAN_API_HEADERS as x-client-id.
+  // Their production API refuses any IP not whitelisted in their dashboard,
+  // so a new server needs its IP added there before this works at all.
+  // Blank key = mock mode, reading data/mock-vehicles.json.
+  vahan: {
+    apiKey: (process.env.VAHAN_API_KEY || '').trim(),
+    url: (process.env.VAHAN_API_URL || 'https://api.cashfree.com/verification/vehicle-rc').trim(),
+    // Their reference field differs between products, so it is named in env.
+    refParam: (process.env.VAHAN_API_REF_PARAM || 'verification_id').trim(),
+    timeoutMs: parseInt(process.env.VAHAN_TIMEOUT_MS || '20000', 10),
+    headers: (() => {
+      try {
+        const h = JSON.parse(process.env.VAHAN_API_HEADERS || '{}');
+        return h && typeof h === 'object' ? h : {};
+      } catch (e) {
+        // A broken JSON blob here must not stop the bot booting — the
+        // lookup simply goes without the header and says why.
+        return {};
+      }
+    })(),
+  },
+
   // A SECOND pair of eyes on a photo, for when the first is unavailable.
   //
   // 21 Sep: the Anthropic key was revoked and every photo stopped being read —

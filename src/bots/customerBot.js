@@ -33,6 +33,8 @@ const speech = require('../integrations/speech');
 const profiles = require('../core/profiles');
 const voiceOrder = require('../core/voiceOrder');
 const focus = require('../core/focus');
+const vehicle = require('../core/vehicle');
+const vahan = require('../integrations/vahan');
 const salesOrder = require('../core/salesOrder');
 const partApprovals = require('../core/partApprovals');
 const soReview = require('../core/soReview');
@@ -264,6 +266,35 @@ class CustomerBot {
     if (m.body) m.body = ai.normalizeOrderText(m.body);
     const text = (m.body || '').trim();
     if (!text) return false;
+
+    // A NUMBER PLATE. "DL7CW1692" is a car, not a part — and before this it
+    // satisfied every test for a part number, went to the portal, found
+    // nothing and reached a person as an unknown part. Looked up once, the
+    // car is remembered for the day, and "is gaadi ka bumper" after it
+    // searches the catalogue for THAT car instead of every bumper we sell.
+    if (vahan.isOnlyPlate(text)) {
+      const car = await vahan.lookup(text);
+      if (car) {
+        vehicle.remember(m.chatId, car);
+        store.log(this.key, `plate ${car.plate} -> ${vahan.describe(car)}`);
+        return reply(
+          t(
+            `${vahan.describe(car)}. Which part do you need?`,
+            `${vahan.describe(car)}. Kaunsa part chahiye?`,
+          ),
+        );
+      }
+      // The registry did not answer — a wrong plate, or the lookup is down.
+      // Neither is the customer's problem, and neither is worth a person:
+      // ask for the car the way the desk always has.
+      store.log(this.key, `plate "${text}" not resolved`);
+      return reply(
+        t(
+          "I could not pull that number up. Which car is it - make and model?",
+          'Wo number nahi mila. Gaadi kaunsi hai - company aur model bata dijiye?',
+        ),
+      );
+    }
 
     // A greeting is answered, always. Left to the chat layer, a model reads
     // "hi" as the same kind of nothing as "ok" and stays quiet — which is how a
@@ -911,7 +942,7 @@ class CustomerBot {
             .replace(/[?.!,]/g, ' ')
             .replace(/\s+/g, ' ')
             .trim();
-          const hits = phrase.length >= 4 ? await availability.byName(phrase) : { total: 0, top: [] };
+          const hits = phrase.length >= 4 ? await availability.byName(vehicle.narrow(m.chatId, phrase)) : { total: 0, top: [] };
 
           if (hits.top.length === 1) {
             return this.processOrderLines(m, [{ item: hits.top[0].partNo, qty: 1 }], reply);
@@ -1944,7 +1975,7 @@ class CustomerBot {
         lines.push(l);
         continue;
       }
-      const hits = await availability.byName(l.item);
+      const hits = await availability.byName(vehicle.narrow(m.chatId, l.item));
       if (hits.top.length === 1) {
         store.log(this.key, `"${l.item}" -> ${hits.top[0].partNo} by name (only match)`);
         lines.push({ ...l, item: hits.top[0].partNo, requested: l.item });

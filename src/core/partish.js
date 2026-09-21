@@ -84,10 +84,19 @@ function partNumber(text) {
   return ai.partNumberIn(t);
 }
 
+// A registration number is letters and digits in a part-number's clothing:
+// DL7CW1692 and HR26DQ5551 both satisfy every test for a part below, and a
+// customer sending their plate would have had it looked up in the catalogue
+// and escalated as an unknown part. It is a CAR, and integrations/vahan
+// knows which one.
+function isPlate(text) {
+  return Boolean(require('../integrations/vahan').isOnlyPlate(text));
+}
+
 // Is the WHOLE string a part number by itself?
 function isPartNumber(text) {
   const t = joined(text);
-  if (t.length < 5 || isVehicle(t) || isQuestion(t)) return false;
+  if (t.length < 5 || isVehicle(t) || isQuestion(t) || isPlate(t)) return false;
   const found = ai.partNumberIn(t);
   if (!found) return false;
   // The token has to BE the string, not sit inside a sentence.
