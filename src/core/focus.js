@@ -69,8 +69,14 @@ function clear(chatId) {
 // then be read as a question about the last part. The Hindi "is ka rate"
 // does not need them — rate questions use the remembered part whether or not
 // the message points.
+// "dono" and its family are the plural of this: not "that part" but "those
+// two we were just talking about". 21 Sep, live: "In dono ka total price
+// kitna hoga" was read as a part called "in dono total hoga" and sent to a
+// person, while the two parts it meant were sitting in the customer's cart.
+// "jo bheja tha", "previously sent", "parts from photo" are the same thing
+// in the words the model normalises them into.
 const POINTER =
-  /\b(?:iss|es|ess|isk[aie]|iske|isak[aie]|esk[aie]|esak[aie]|isko|esko|isme|isi|ye|yeh|yahi|yehi|wahi|wohi|same|this|ink[aie]|inko|inme|inhe|unk[aie]|unko|unhe|these|them|those)\b/i;
+  /\b(?:iss|es|ess|isk[aie]|iske|isak[aie]|esk[aie]|esak[aie]|isko|esko|isme|isi|ye|yeh|yahi|yehi|wahi|wohi|same|this|ink[aie]|inko|inme|inhe|unk[aie]|unko|unhe|these|them|those|dono|donon|teeno|tino|sab|sabhi|saare|sare|both|above|previous(?:ly)?|earlier|bheja|bheji|bheje|pichl[aei]|puran[aei])\b/i;
 // "Inka mrp batana" (13 Sep, live) - "inka" was searched in the catalogue as a
 // part name and came back as a list of insulation tapes.
 
@@ -89,7 +95,7 @@ function pointsBack(text) {
 // the answer, and the customer got "Rate for item — our team will send it to
 // you shortly" instead of the price of the part their photo was about.
 const FILLER =
-  /^(?:is|iss|es|ess|isk[aie]|iske|isak[aie]|esk[aie]|esak[aie]|isko|esko|isme|isi|ye|yeh|yahi|yehi|wahi|wohi|same|this|it|that|wala|wali|wale|one|saleing|selling|saling|sale|sell|mrp|price|rate|stock|h|he|hai|hain|kya|kitna|kitne|kitni|ka|ki|ke|batao|bata|do|please|pls|plz|sir|ji|bhai|ink[aie]|inko|inhe|unk[aie]|unko|unhe|these|them|those|batana|btao|bta|bataiye|bhejna|of|item|items|part|parts)$/i;
+  /^(?:is|iss|es|ess|isk[aie]|iske|isak[aie]|esk[aie]|esak[aie]|isko|esko|isme|isi|ye|yeh|yahi|yehi|wahi|wohi|same|this|it|that|wala|wali|wale|one|saleing|selling|saling|sale|sell|mrp|price|rate|stock|h|he|hai|hain|kya|kitna|kitne|kitni|ka|ki|ke|batao|bata|do|please|pls|plz|sir|ji|bhai|ink[aie]|inko|inhe|unk[aie]|unko|unhe|these|them|those|batana|btao|bta|bataiye|bhejna|of|item|items|part|parts|dono|donon|teeno|tino|sab|sabhi|saare|sare|both|un|unn|in|inn|total|amount|hoga|hogi|honge|quantity|qty|chahiye|abhi|jo|tha|thi|the|maine|mera|meri|uska|uski|previous|previously|earlier|above|sent|from|photo|photos|pic|bheja|bheji|bheje|pichl[aei]|puran[aei])$/i;
 
 function isOnlyPointer(phrase) {
   const words = String(phrase || '')

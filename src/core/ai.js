@@ -337,6 +337,15 @@ const RATE_RE =
 // "kitne ka hai" is the commonest way of asking a price in this trade, and
 // it names no part, so nothing else catches it.
 const PRICE_ASK_RE = /\b(kitne? k[aiy]|kitni k[iy]|kitne? me|how much)\b/i;
+// "Total kitna hoga" names no rate word, so neither of the two above caught
+// it — 21 Sep it fell all the way through to the chat layer, which is
+// forbidden from quoting money and answered "total hamari sales team
+// batayegi sir". The customer had a priced cart sitting right there, and
+// "Price" one message later worked perfectly. Deliberately narrow: "total"
+// only counts next to a question or an amount word, so "total 5 pcs
+// chahiye" is still a quantity and not a price question.
+const TOTAL_ASK_RE =
+  /\btotal\s*(kitna|kitne|kitni|kya|amount|price|rate|hoga|hogi|batao|bataiye|btao|bta)\b|\b(kitna|kitne|kitni|kya)\s+total\b|\btotal\s+amount\b/i;
 const STATUS_RE = /\b(status|track(ing)?|kitna\s*(time|din|days?)|how\s*long|kaha+n?\s*(hai|tak|pahuncha|pahunchi|pohcha)|where('?s| is)?\s*(my|the)?\s*(order|delivery|goods|maal|gadi)|order (kahan|kidhar|kab)|gadi (kahan|kidhar)|deliver(y|ed)?\s*(kab|when)|kab (tak )?(aayega|milega|pahunchega))\b/i;
 const REMOVE_RE = /^(remove|delete|hata(o| do)?)\s+(.+)$/i;
 
@@ -677,7 +686,7 @@ async function parseCustomerMessage(text, catalogNames) {
   if (!asking0 && SOFT_CANCEL_RE.test(t0)) return { intent: 'maybe_cancel' };
   const rmTail = t0.match(REMOVE_TAIL_RE);
   if (rmTail && clean(rmTail[1]).length >= 3) return { intent: 'remove', item: clean(rmTail[1]) };
-  if (RATE_RE.test(t0) || PRICE_ASK_RE.test(t0)) return { intent: 'rate' };
+  if (RATE_RE.test(t0) || PRICE_ASK_RE.test(t0) || TOTAL_ASK_RE.test(t0)) return { intent: 'rate' };
   // One part number and how many, and nothing else: "16510m65l10 -5",
   // "16510M65L10 - 5", "16510M65L10 x5", "16510m65l10 -5pcs". 13 Sep, live:
   // the model read the first as an inquiry, and the customer was asked for a
