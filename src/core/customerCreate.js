@@ -129,6 +129,32 @@ function commercialDefaults() {
   };
 }
 
+// "Create customer", "account bana do", "naya account chahiye".
+//
+// 21 Sep, live: a customer typed "Create coustomer" and the bot searched the
+// catalogue for it, answering with sixty headlight restorers. There was no
+// way to ASK for the form — it only opened by itself when an unregistered
+// number confirmed an order. Spellings are loose on purpose: coustomer,
+// custmer and costumer are all how it actually arrives.
+const WORD_ACCOUNT = '(?:customer|coustomer|custmer|costumer|custumer|account|akaunt|khata|khaata|id)';
+const WORD_MAKE = '(?:creat\\w*|new|naya|nayi|register|registr\\w*|banao|bana\\s?do|bana\\s?dijiye|banana|banwana|kholo|khol\\s?do|open|add)';
+const START_RE = new RegExp(
+  `\\b${WORD_MAKE}\\b[\\s\\S]{0,24}\\b${WORD_ACCOUNT}\\b` +
+    `|\\b${WORD_ACCOUNT}\\b[\\s\\S]{0,24}\\b${WORD_MAKE}\\b` +
+    `|\\b${WORD_ACCOUNT}\\s+(?:chahiye|chaiye|kab\\s+banega|nahi\\s+hai)\\b`,
+  'i',
+);
+// The same words appear in questions ABOUT an account, which are not a
+// request to open one. "Account balance", "khata dekho", a ledger.
+const NOT_START_RE = /\b(balance|statement|ledger|bakaya|baaki|outstanding|bill|invoice|payment|due|kitna|number|no\.?)\b/i;
+
+function wantsToStart(text) {
+  const t = String(text || '').trim();
+  if (!t || t.length > 90) return false;
+  if (NOT_START_RE.test(t)) return false;
+  return START_RE.test(t);
+}
+
 // ------------------------------------------------------------- the machine
 
 function pending(chatId) {
@@ -329,6 +355,7 @@ function unpark(requestId) {
 }
 
 module.exports = {
+  wantsToStart,
   start,
   answer,
   pending,

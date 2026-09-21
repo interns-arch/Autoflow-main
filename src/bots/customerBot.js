@@ -294,6 +294,25 @@ class CustomerBot {
       }
     }
 
+    // "CREATE CUSTOMER". Asked for in words, rather than waiting for an
+    // unregistered order to trigger it. 21 Sep, live: "Create coustomer"
+    // was searched in the catalogue and answered with sixty headlight
+    // restorers, because nothing above this line knew what it meant.
+    if (customerCreate.wantsToStart(text)) {
+      const already = await customers.resolve(m.from).catch(() => ({ found: null }));
+      if (already && already.found === true) {
+        store.log(this.key, `${m.from} asked to create an account but already has one (${already.name})`);
+        return reply(
+          t(
+            `You already have an account with us${already.name ? ' — ' + already.name : ''}. Send the part number and quantity.`,
+            `Aapka account already hai${already.name ? ' — ' + already.name : ''}. Part number aur quantity bhej dijiye.`,
+          ),
+        );
+      }
+      store.log(this.key, `${m.from} asked to open an account`);
+      return reply(customerCreate.start(m.chatId, m.from, t));
+    }
+
     // A NUMBER PLATE. "DL7CW1692" is a car, not a part — and before this it
     // satisfied every test for a part number, went to the portal, found
     // nothing and reached a person as an unknown part. Looked up once, the

@@ -4784,6 +4784,19 @@ async function main() {
   const t64 = (en, hi) => hi || en;
   const CH64 = 'sim-create64';
 
+  // Asking for it in words. "Create coustomer" was searched in the
+  // catalogue and answered with sixty headlight restorers, because nothing
+  // knew the phrase meant anything. Spellings are loose because that is how
+  // it arrives.
+  check('the form can be asked for, however it is spelt',
+    ['Create coustomer', 'create customer', 'account bana do', 'naya account chahiye', 'customer banana hai', 'khata khol do']
+      .every((s) => cc64.wantsToStart(s)));
+  check('...but a question ABOUT an account does not open one',
+    ['account balance kitna hai', 'mera khata dekho', 'account statement bhejo', 'customer ka bakaya']
+      .every((s) => cc64.wantsToStart(s) === false));
+  check('...and a part is never mistaken for it',
+    ['16510M65L10', 'headlight restorer', 'bumper chahiye', '2 pcs brake pad'].every((s) => cc64.wantsToStart(s) === false));
+
   cc64.cancel(CH64);
   const open64 = cc64.start(CH64, '917355374975', t64);
   check('the form opens on the firm name', /naam/i.test(open64) && Boolean(cc64.pending(CH64)));
