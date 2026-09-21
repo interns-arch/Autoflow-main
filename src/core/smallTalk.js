@@ -282,7 +282,11 @@ const PASSED_ON =
 // bot exactly as silent as it used to be, not break the message.
 // opts.noHuman: the model decided nobody is asked; a hand-over is a refusal.
 async function respond(chatId, message, phone, opts = {}) {
-  if (!config.ai.apiKey) return null;
+  // ANY model will do — ai.claude() falls back to Gemini on its own. This
+  // used to ask for the Anthropic key specifically, so when that key was
+  // revoked the bot went quiet on every conversational message even though
+  // a perfectly good model was configured.
+  if (!require('./ai').modelAvailable()) return null;
   const body = String(message || '').trim();
   if (!body || body.length > 400) return null;
 

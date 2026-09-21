@@ -388,7 +388,7 @@ async function classifyDesk(text) {
   if (!line || line.length > 120 || line.indexOf('\n') >= 0 || !DESK_HINT_RE.test(line)) return null;
   const config = require('../config');
   const ai = require('./ai');
-  if (!config.ai.apiKey) return null;
+  if (!require('./ai').modelAvailable()) return null;
   let r = null;
   try {
     r = await ai._claude(

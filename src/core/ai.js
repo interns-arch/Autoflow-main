@@ -487,9 +487,83 @@ function textGrounded(item, text) {
 // network call.
 let claudeStub = null;
 
+// Gemini, asked the same question and answering in the same shape, so every
+// caller of claude() below works unchanged when Anthropic is not there.
+//
+// 21 Sep: the Anthropic key was revoked and this bot lost its voice — not
+// just photos. smallTalk, the free-text parser and the naming model all go
+// through claude(), so one dead credential turned every conversational reply
+// into "Samajh nahi paya sir". Routing the fallback HERE rather than at each
+// call site means there is one place that knows about providers.
+//
+// `user` is Claude's own shape: a plain string, or content blocks where an
+// image is { type:'image', source:{ media_type, data } }. Both are mapped.
+async function geminiJson(system, user) {
+  const g = config.gemini;
+  if (!g.apiKey) throw new Error('no Gemini key');
+  const blocks = Array.isArray(user) ? user : [{ type: 'text', text: String(user == null ? '' : user) }];
+  const parts = blocks
+    .map((b) => {
+      if (b && b.type === 'image' && b.source && b.source.data) {
+        return { inline_data: { mime_type: b.source.media_type || 'image/jpeg', data: b.source.data } };
+      }
+      const text = b && typeof b === 'object' ? b.text : b;
+      return text ? { text: String(text) } : null;
+    })
+    .filter(Boolean);
+
+  const url =
+    'https://generativelanguage.googleapis.com/v1beta/models/' +
+    encodeURIComponent(g.visionModel) +
+    ':generateContent';
+  // 500-class is the model being busy — worth one more ask. 429 is not: it is
+  // either "slow down" or a spent quota, and neither is fixed by hammering.
+  const RETRY_ON = new Set([500, 502, 503, 504]);
+  let res = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt) await new Promise((r) => setTimeout(r, 1000 * attempt));
+    res = await fetch(url + '?key=' + encodeURIComponent(g.apiKey), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        systemInstruction: system ? { parts: [{ text: String(system) }] } : undefined,
+        contents: [{ parts }],
+      }),
+      signal: AbortSignal.timeout(g.timeoutMs),
+    });
+    if (res.ok || !RETRY_ON.has(res.status)) break;
+  }
+  if (!res.ok) throw new Error('Gemini API HTTP ' + res.status + ' ' + (await res.text()).slice(0, 120));
+  const data = await res.json();
+  const text = (((data.candidates || [])[0] || {}).content?.parts || []).map((p) => p.text || '').join('');
+  const json = text.match(/\{[\s\S]*\}/);
+  if (!json) throw new Error('no JSON in the Gemini reply');
+  return JSON.parse(json[0]);
+}
+
+// Is there any model at all behind this bot? Callers used to ask
+// `config.ai.apiKey`, which is now only half the answer.
+function modelAvailable() {
+  return Boolean(config.ai.apiKey || (config.gemini && config.gemini.apiKey));
+}
+
 // user may be a plain string or a content-block array (for images)
 async function claude(system, user) {
   if (claudeStub) return claudeStub(system, user);
+  // No Anthropic key configured at all — Gemini is the model, not a fallback.
+  if (!config.ai.apiKey) return geminiJson(system, user);
+  try {
+    return await anthropic(system, user);
+  } catch (e) {
+    // A revoked key, a rate limit, an outage: whatever it is, the customer is
+    // still waiting. Try the other provider before giving up on them.
+    if (!config.gemini || !config.gemini.apiKey) throw e;
+    store.log('ai', 'Anthropic failed (' + String((e && e.message) || e).slice(0, 60) + ') — asking Gemini');
+    return geminiJson(system, user);
+  }
+}
+
+async function anthropic(system, user) {
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -611,7 +685,7 @@ async function parseCustomerMessage(text, catalogNames) {
   const pq = partAndQty(t0);
   if (pq) return { intent: 'order', lines: [pq] };
 
-  if (config.ai.apiKey) {
+  if (modelAvailable()) {
     try {
       const r = await claude(
         'You parse WhatsApp messages from auto-parts customers (English/Hindi/Hinglish). ' +
@@ -657,7 +731,7 @@ async function parseCustomerMessage(text, catalogNames) {
 async function parseVendorStock(text) {
   const basic = parseLinesBlock(text);
   if (basic.length) return basic;
-  if (config.ai.apiKey) {
+  if (modelAvailable()) {
     try {
       const r = await claude(
         'You parse WhatsApp stock lists from auto-parts vendors (any format/language). ' +
@@ -839,7 +913,7 @@ async function parseOrderImage(base64, mediaType) {
       store.log('ai', `photo order read via OCR: ${lines.length} line(s)`);
       return lines;
     }
-    if (config.ai.apiKey) {
+    if (modelAvailable()) {
       try {
         const r = await claude(
           'This is raw OCR text from a photo of an auto-parts order (may be messy/Hinglish). ' +
@@ -1019,6 +1093,8 @@ module.exports = {
   bareQty,
   captionQty,
   // The raw model call, so core/smallTalk.js does not open a second one.
+  // Is there a model behind this bot at all — Anthropic, Gemini, either.
+  modelAvailable,
   _claude: claude,
   // With web search, for looking facts up (core/partNaming).
   _claudeWeb: claudeWeb,

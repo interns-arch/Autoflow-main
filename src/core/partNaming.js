@@ -347,7 +347,7 @@ async function nameFor(fields, { useModel = true } = {}) {
     return { name: learned, source: 'learned', check: !proven };
   }
 
-  if (useModel && config.ai && config.ai.apiKey) {
+  if (useModel && require('./ai').modelAvailable()) {
     try {
       const r = await askModel(f, b);
       if (r) return r;
