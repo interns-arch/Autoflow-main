@@ -671,6 +671,20 @@ async function refuseIfTaken(form, field, value, t) {
 async function fillFromGst(form, gstin, t) {
   const gst = require('../integrations/gst');
   form.answers._lastGst = gstin;
+
+  // ALREADY A CUSTOMER? Asked of the portal BEFORE the GST register, because
+  // the portal is free and the register is a paid credit. A GSTIN the portal
+  // holds can never become a new account, so looking it up first only paid
+  // to learn nothing (06CIYPK2053H1ZZ, twice on 22 Sep). Only a well-shaped
+  // GSTIN is asked about: a typo is caught below without either.
+  if (gst.looksValid(String(gstin || '').toUpperCase())) {
+    const takenFirst = await refuseIfTaken(form, 'gstNo', String(gstin).toUpperCase(), t);
+    if (takenFirst) {
+      if (!takenFirst.closed) open.set(form.chatId, form);
+      return takenFirst;
+    }
+  }
+
   const firm = await gst.lookup(gstin);
 
   // Wrong shape. Caught before the network, so a typo never costs a credit.

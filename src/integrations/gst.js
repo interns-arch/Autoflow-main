@@ -81,11 +81,29 @@ function readGst(body) {
 //
 // Never throws. A lookup that cannot be done leaves the form asking the
 // questions by hand, which is how it worked before this existed.
+// Every lookup is a paid credit. 22 Sep: the provider wrote to say the same
+// GSTINs were being checked again and again - 06CIYPK2053H1ZZ twice in one
+// afternoon, from the same customer retrying. An answer is kept for a day
+// (the chatState janitor drops it after that), so a retry costs nothing.
+// Only real answers are kept: a failed call is tried again next time.
+const cache = require('../core/chatState').slot('gst.lookups'); // gstin -> { at, firm }
+const CACHE_MS = 24 * 60 * 60 * 1000;
+
 async function lookup(gstin) {
   const g = String(gstin || '').replace(/\s/g, '').toUpperCase();
   if (!looksValid(g)) return { error: 'shape' };
   if (!enabled()) return null;
+  const kept = cache.get(g);
+  if (kept && Date.now() - kept.at < CACHE_MS) {
+    store.log('gst', `${g}: answered from today's lookup - no credit spent`);
+    return kept.firm;
+  }
+  const firm = await fetchFirm(g);
+  if (firm) cache.set(g, { at: Date.now(), firm });
+  return firm;
+}
 
+async function fetchFirm(g) {
   try {
     const res = await fetch(config.gst.url.replace(/\/$/, '') + '/' + encodeURIComponent(g), {
       headers: { 'x-api-key': config.gst.apiKey, Accept: 'application/json' },

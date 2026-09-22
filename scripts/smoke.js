@@ -5213,7 +5213,12 @@ async function main() {
     const CHD = 'sim-create66-dup';
     cc66.cancel(CHD);
     cc66.start(CHD, '917355374975', t66);
+    let paid66 = 0;
+    const countWas66 = gst66.lookup;
+    gst66.lookup = async (g) => { paid66++; return countWas66(g); };
     const dup66 = await cc66.answer(CHD, {}, '33AAACC1206D1ZN', t66);
+    gst66.lookup = countWas66;
+    check('a GSTIN already on the portal costs no paid GST lookup', paid66 === 0);
     // A CUSTOMER is told the account exists - never whose it is - and sent
     // on to ordering. A GSTIN on the portal is an account; there is nothing
     // "different" to send.
@@ -5245,6 +5250,28 @@ async function main() {
     cc66.start(CHX, '917355374975', t66);
     const quit66b = await cc66.answer(CHX, {}, 'Cancel customer creation. Now tell about the parts price', t66);
     check('...and so does it said in a sentence', quit66b && quit66b.quit === true && !cc66.pending(CHX));
+
+    // Every GST lookup is a paid credit. The same GSTIN asked twice in a day
+    // is answered from the first lookup.
+    {
+      const gcfg = require('../src/config').gst;
+      const keyWas = gcfg.apiKey;
+      const fetchWas = global.fetch;
+      let calls = 0;
+      gcfg.apiKey = 'smoke';
+      global.fetch = async () => {
+        calls++;
+        return { ok: true, status: 200, json: async () => ({ success: true, data: { gstin: '27AAPFU0939F1ZV', trade_name: 'CACHE TEST MOTORS', status: 'Active' } }) };
+      };
+      try {
+        const a = await gstWas66('27AAPFU0939F1ZV');
+        const b = await gstWas66('27AAPFU0939F1ZV');
+        check('a GSTIN looked up twice is paid for once', calls === 1 && a && b && b.name === 'CACHE TEST MOTORS');
+      } finally {
+        gcfg.apiKey = keyWas;
+        global.fetch = fetchWas;
+      }
+    }
 
     // ---- email: mandatory, and unverifiable ----
     // There is no route on the portal that takes an email and no email in
