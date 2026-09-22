@@ -38,6 +38,22 @@ function joined(text) {
 const VEHICLE =
   /\b(swift|dzire|desire|baleno|wagon\s?-?r|wagnor|alto|k10|celerio|ignis|ertiga|brezza|vitara|eeco|omni|ciaz|s-?cross|xl6|fronx|jimny|zen|esteem|a-?star|astar|ritz|sx4|gypsy|kizashi|i10|i20|creta|verna|venue|santro|aura|xcent|eon|accent|elantra|tucson|seltos|sonet|carens|nexon|punch|altroz|tiago|tigor|harrier|safari|zest|bolt|indica|indigo|scorpio|bolero|xuv\d*|thar|marazzo|kuv|tuv|kwid|duster|triber|kiger|lodgy|figo|ecosport|endeavour|aspire|freestyle|city|amaze|jazz|wr-?v|brio|civic|innova|fortuner|etios|glanza|urban\s?cruiser|camry|yaris|polo|vento|ameo|rapid|octavia|superb|kodiaq|creta|magnite|kicks|micra|sunny|terrano)\b/i;
 
+// Who makes the car, as customers say it: "Maruti Suzuki ka bumper", "Tata
+// Nexon front bumper". Separate from VEHICLE (the model) because a maker word
+// on its own is not a car — "maruti" is half the catalogue.
+const MAKER =
+  /^(maruti|suzuki|hyundai|tata|mahindra|honda|toyota|kia|ford|nissan|renault|volkswagen|vw|skoda|chevrolet|datsun|mg|jeep|fiat|mitsubishi|isuzu|force|ashok|leyland|mercedes|benz|bmw|audi)$/i;
+
+// Is this word about the CAR rather than the part? Used when searching the
+// catalogue: part names are written "BUMPER FRONT | MARUTI SWIFT | ...", so a
+// customer who leads with the car ("Maruti Suzuki ka bumper" — which is how
+// nearly everyone SPEAKS it) needs the part words searched and the car words
+// used to narrow. See dealerPortal.searchByName.
+function isCarWord(word) {
+  const w = String(word || '').trim();
+  return MAKER.test(w) || VEHICLE.test(w);
+}
+
 // A question, not a thing to sell. Kept separate from the vehicle list so the
 // reason a phrase was refused can be logged honestly.
 const ASK_ONLY =
@@ -129,4 +145,4 @@ function classify(text) {
   return 'nothing';
 }
 
-module.exports = { classify, isPartNumber, partNumber, isNameQuery, isQuestion, isVehicle, joined };
+module.exports = { classify, isPartNumber, partNumber, isNameQuery, isQuestion, isVehicle, isCarWord, joined };

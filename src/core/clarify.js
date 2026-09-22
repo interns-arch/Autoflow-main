@@ -179,4 +179,26 @@ function options(matches, chatId) {
   );
 }
 
-module.exports = { nextQuestion, ask, refine, isAnswerTo, get, clear, facets, options, alreadyAsked };
+// The short list, shown with the question REMEMBERED. options() ends in
+// "Which one do you need?" — a question — and nothing was kept to answer it:
+// the customer read "BUMPER FRONT / BUMPER REAR", wrote "front", and was told
+// there was no order pending (21 Sep, live, off a voice note). Asking and then
+// forgetting we asked is worse than not asking.
+function offer(chatId, state, matches) {
+  const text = options(matches, chatId);
+  const base = state && state.base;
+  if (!chatId || !base) return text;
+  lastAsked.set(chatId, { text, at: Date.now() });
+  pending.set(chatId, {
+    base,
+    qty: state.qty || 1,
+    ref: state.ref || null,
+    key: state.key || null,
+    asked: state.asked || [],
+    at: Date.now(),
+  });
+  store.log('clarify', `"${base}" -> showed the list, waiting for their pick`);
+  return text;
+}
+
+module.exports = { nextQuestion, ask, refine, isAnswerTo, get, clear, facets, options, offer, alreadyAsked };
