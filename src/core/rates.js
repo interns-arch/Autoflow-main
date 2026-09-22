@@ -224,4 +224,43 @@ async function quote(partNos, who, t) {
   return out && label ? t('For ' + label + ':', label + ' ke liye:') + String.fromCharCode(10) + out : out;
 }
 
-module.exports = { quote, _internals: { render } };
+// The price of each part, for a short list the customer picks from: part
+// number -> { mrp, rate, discountPercent } in one portal call. Same rule as
+// quote(): their own rate when the portal knows them, MRP only when it does
+// not. Parts it cannot price are simply missing - never guessed.
+async function prices(partNos, who) {
+  const list = [...new Set((partNos || []).map((p) => String(p || '').trim().toUpperCase()).filter(Boolean))].slice(0, 8);
+  const out = new Map();
+  if (!list.length) return out;
+  const ctx = (who && who.ctx) || null;
+  const theirAccount = (ctx && (ctx.accountId || ctx.buyerId)) || null;
+  const priceAccount = theirAccount || config.dealerPortal.listPriceAccountId || null;
+  if (!priceAccount) return out;
+  try {
+    const portal = require('../integrations/dealerPortal');
+    const rows = await portal.commercialAnalyze(
+      list.map((p) => ({ item: p, partNo: p, qty: 1 })),
+      { ...(ctx || {}), accountId: priceAccount },
+    );
+    for (const r of rows || []) {
+      if (!r || !r.mrp) continue;
+      out.set(norm(r.partNo || r.item), {
+        mrp: r.mrp,
+        rate: theirAccount ? r.rate : null,
+        discountPercent: theirAccount ? r.discountPercent : null,
+      });
+    }
+  } catch (e) {
+    store.log('rate', 'prices for a list failed: ' + String((e && e.message) || e).slice(0, 110));
+  }
+  return out;
+}
+
+// One line of that list: "MRP ₹2,982" or "MRP ₹2,982, aapka rate ₹2,624".
+function priceText(p, t) {
+  if (!p) return '';
+  if (p.rate && Number(p.rate) !== Number(p.mrp)) return 'MRP ₹' + money(p.mrp) + t(', your rate ₹', ', aapka rate ₹') + money(p.rate);
+  return 'MRP ₹' + money(p.mrp);
+}
+
+module.exports = { quote, prices, priceText, norm, _internals: { render } };

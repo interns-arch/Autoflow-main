@@ -2257,6 +2257,11 @@ async function main() {
   const r20f = await rate20('919000000205', 'front');
   check('...and the pick is answered with its price', r20f.said.includes('71711M79M00') && /₹/.test(r20f.said));
   check('...not put in the cart', !orders.findDraft('sim-919000000205'));
+  const r20g = await rate20('919000000206', 'Swift Dzire ka bumper kitne ka hai');
+  check('the list is numbered and priced', /1\. 71711M79M00/.test(r20g.said) && /2\. 71811M79M00/.test(r20g.said) && /MRP ₹/.test(r20g.said));
+  const r20h = await rate20('919000000206', '2');
+  check('"2" picks the second part and prices it', r20h.said.includes('71811M79M00') && /kitne piece|how many/i.test(r20h.said));
+  check('...not as a quantity', !orders.findDraft('sim-919000000206'));
   portal.searchByName = realSearch20;
 
   // ---- 21. A salesman ordering FOR a customer ----

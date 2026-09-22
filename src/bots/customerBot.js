@@ -89,7 +89,10 @@ const pendingCancel = require('../core/chatState').slot('cancelAsk');
 // said. 13 Sep, live: "Hai kya?" swiped onto the customer's own list of parts
 // got "Samajh nahi paya", and a "3." swiped onto an old list became a
 // quantity of the part discussed since.
-const quotable = require('../core/chatState').slot('quotable'); // chatId -> { at, items: [{ id, dir, text }] }
+const quotable = require('../core/chatState').slot('quotable');
+// The priced short list a rate question was answered with, so "2" picks from
+// it. chatId -> { base, parts: [{ partNo, name }], at }
+const rateOptions = require('../core/chatState').slot('rateOptions'); // chatId -> { at, items: [{ id, dir, text }] }
 function rememberMsg(chatId, id, dir, text) {
   if (!chatId || !id || typeof id !== 'string') return;
   const row = quotable.get(chatId) || { at: 0, items: [] };
@@ -674,6 +677,24 @@ class CustomerBot {
       voiceOrder.clear(m.chatId);
     }
 
+    // A pick from the priced list a rate question was answered with. Before
+    // the quantity readers: the "2" is which part, not how many.
+    {
+      const offered = rateOptions.get(m.chatId);
+      if (offered && Date.now() - offered.at > 30 * 60 * 1000) rateOptions.delete(m.chatId);
+      else if (offered) {
+        const n = /^(\d{1,2})\s*[.)]?$/.exec(text);
+        const byNo = offered.parts.find((o) => rates.norm(o.partNo) === rates.norm(text));
+        const pick = byNo || (n ? offered.parts[Number(n[1]) - 1] : null);
+        if (pick) {
+          rateOptions.delete(m.chatId);
+          clarify.clear(m.chatId);
+          store.log(this.key, `rate: picked ${pick.partNo} from the priced list`);
+          return this.quoteForOrder(m, [{ partNo: pick.partNo, name: pick.name, requested: offered.base }], reply, t);
+        }
+      }
+    }
+
     // "Leave 9no. Item", "4th. No. Item 3pc", "2-9-14-16 ye no saman hata do".
     // Kalra Motor did this seven times in eighteen days and the bot could not
     // read a word of it. Checked before anything else, because a line number is
@@ -749,6 +770,9 @@ class CustomerBot {
           [{ item: hits.top[0].partNo, qty: p.qty, ref: p.ref, key: p.key }],
           reply,
         );
+      }
+      if (hits.top.length > 1 && p.rate) {
+        return this.offerPriced(m, p, hits.top, hits.total || hits.top.length, reply, t);
       }
       if (hits.top.length > 1) {
         const q = clarify.nextQuestion(hits.top, p.asked, m.chatId);
@@ -903,8 +927,10 @@ class CustomerBot {
             continue;
           }
           let top = [];
+          let hits = null;
           try {
-            top = ((await availability.byName(vehicle.narrow(m.chatId, item))) || {}).top || [];
+            hits = await availability.byName(vehicle.narrow(m.chatId, item));
+            top = (hits && hits.top) || [];
           } catch (e) {
             store.log(this.key, 'rate: catalogue lookup failed for "' + item + '": ' + String((e && e.message) || e).slice(0, 80));
           }
@@ -914,14 +940,8 @@ class CustomerBot {
           } else if (top.length > 1) {
             // Front or rear, which car: ask the way the counter would, and
             // remember it was a price they wanted.
-            store.log(this.key, `rate: "${item}" -> ${top.length} catalogue matches; asking which`);
-            const state = { base: item, qty: 1, rate: true };
-            const q = clarify.nextQuestion(top, [], m.chatId);
-            if (q) {
-              clarify.ask(m.chatId, state, q);
-              return reply(q.text);
-            }
-            return reply(clarify.offer(m.chatId, state, top));
+            store.log(this.key, `rate: "${item}" -> ${top.length} catalogue matches; showing them priced`);
+            return this.offerPriced(m, { base: item, qty: 1, rate: true }, top, (hits && hits.total) || top.length, reply, t);
           } else {
             unresolved++;
           }
@@ -2141,10 +2161,44 @@ class CustomerBot {
     );
   }
 
+  // Several parts fit what they asked the price of: the Dzire has had four
+  // front bumpers. Show the first few - in stock first - each with its price,
+  // and let them pick by number, part number, or by saying which car ("2nd
+  // gen", "2019"). A question with no prices ("Kaunsa? Front Side / Front")
+  // answers nothing they asked.
+  async offerPriced(m, state, top, total, reply, t) {
+    const shown = top.slice(0, 5);
+    const onBehalf = route.onBehalfOf(m);
+    const rateCtx = onBehalf || (await customers.resolve(m.from).catch(() => null));
+    const priced = await rates.prices(shown.map((x) => x.partNo), { ctx: rateCtx && rateCtx.found ? rateCtx : null });
+    // The car and fitment, not the part name they already said: the name is
+    // "Bumper| Front Side | Swift 2nd Gen / Dzire 2nd Gen | Petrol / Diesel".
+    const fits = (name) => {
+      const segs = String(name || '').split('|').map((s) => s.trim()).filter(Boolean);
+      return (segs.length > 1 ? segs.slice(1) : segs).join(' · ');
+    };
+    const lines = shown.map((x, i) => {
+      const p = priced.get(rates.norm(x.partNo));
+      const stock = x.available > 0 ? t('in stock', 'stock hai') : t('on order', 'order pe');
+      return `${i + 1}. ${x.partNo} — ${fits(x.name)}\n    ${p ? rates.priceText(p, t) + ' · ' : ''}${stock}`;
+    });
+    askQty.clear(m.chatId);
+    askQty.forget(m.chatId);
+    rateOptions.set(m.chatId, { base: state.base, parts: shown.map((x) => ({ partNo: x.partNo, name: x.name })), at: Date.now() });
+    // Kept too, so "2nd gen" narrows the same search instead of starting over.
+    clarify.offer(m.chatId, state, top);
+    const more = total > shown.length ? t(` (${total} fit - the first ${shown.length})`, ` (${total} milte hain - pehle ${shown.length})`) : '';
+    return reply(
+      `${state.base}${more}:\n\n${lines.join('\n')}\n\n` +
+        t('Which one? Send the number - or the model / year of the car.', 'Kaunsa chahiye? Number bhejiye - ya gaadi ka model / saal bata dijiye.'),
+    );
+  }
+
   // A part they asked the price of, found by name: what it is, whether we
   // have it, their rate, and "how many?" - so the next message is the order.
   // A rate the portal and Odoo both lack still goes to a person.
   async quoteForOrder(m, found, reply, t) {
+    rateOptions.delete(m.chatId);
     const partNos = [...new Set(found.map((f) => f.partNo))];
     const resolved = await availability.resolve(partNos.map((p) => ({ item: p, qty: 1 }))).catch(() => []);
     if (resolved.length) {

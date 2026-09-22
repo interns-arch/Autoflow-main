@@ -53,6 +53,22 @@ function isCarWord(word) {
   const w = String(word || '').trim();
   return MAKER.test(w) || VEHICLE.test(w);
 }
+function isMaker(word) {
+  return MAKER.test(String(word || '').trim());
+}
+
+// Where on the car: "front", "rear", "LH". A filter on the part, never a part
+// on its own - and the portal's search reads "front bumper" as a phrase, so
+// these are kept out of the words it is sent.
+const POSITION = /^(front|rear|back|fr|rr|lh|rh|left|right|upper|lower|side|inner|outer|agla|aage|peeche|pichla|piche)$/i;
+function isPositionWord(word) {
+  return POSITION.test(String(word || '').trim());
+}
+// Joining words a spoken name carries: "Swift Dzire KA front bumper".
+const FILLER = /^(ka|ki|ke|wala|wali|wale|for|of|the|a|an|and|aur|chahiye|chaiye|chahie|hai|h)$/i;
+function isFiller(word) {
+  return FILLER.test(String(word || '').trim());
+}
 
 // A question, not a thing to sell. Kept separate from the vehicle list so the
 // reason a phrase was refused can be logged honestly.
@@ -145,4 +161,4 @@ function classify(text) {
   return 'nothing';
 }
 
-module.exports = { classify, isPartNumber, partNumber, isNameQuery, isQuestion, isVehicle, isCarWord, joined };
+module.exports = { classify, isPartNumber, partNumber, isNameQuery, isQuestion, isVehicle, isCarWord, isMaker, isPositionWord, isFiller, joined };

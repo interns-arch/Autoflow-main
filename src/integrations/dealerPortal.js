@@ -980,10 +980,22 @@ module.exports = {
       const partish = require('../core/partish');
       const partWords = words.filter((w) => !partish.isCarWord(w));
 
-      // In order: the phrase as they said it; the part words alone; then the
+      // 22 Sep, live, against the real portal: "Maruti Suzuki Swift Dzire
+      // front bumper" came down to "front bumper", which the portal reads as
+      // a phrase - 140 rows, a Ciaz garnish and Chevrolet retainers, and not
+      // one Dzire bumper. The search is a literal phrase ("bumper dzire" finds
+      // nothing), so when a MODEL is named, search the part word alone -
+      // "bumper" - and let the model, the position ("front") and the rest
+      // narrow it below. That gives 176 rows, every one a Dzire bumper.
+      const core = partWords.filter((w) => !partish.isPositionWord(w) && !partish.isFiller(w));
+      const models = words.filter((w) => partish.isCarWord(w) && !partish.isMaker(w));
+      const tries = [];
+      if (core.length && models.length) tries.push(core);
+
+      // Then: the phrase as they said it; the part words alone; then the
       // leading words, shortest last — the old behaviour, still the right
       // answer for "brake pad front" where nothing is a car word.
-      const tries = [words];
+      tries.push(words);
       if (partWords.length && partWords.length !== words.length) tries.push(partWords);
       for (let n = words.length - 1; n >= 1; n--) tries.push(words.slice(0, n));
 
@@ -1008,11 +1020,24 @@ module.exports = {
       // "Maruti Suzuki Swift" against names written "MARUTI SWIFT" would
       // otherwise have the whole narrowing thrown away over "suzuki", and get
       // every bumper we sell instead of the Swift ones.
+      // Maker and joining words never narrow: "suzuki" would keep only the
+      // rows that happen to spell the maker out, and "ka" matches anything.
       const inUse = new Set(used.map((w) => w.toLowerCase()));
-      const extra = words.map((w) => w.toLowerCase()).filter((w) => !inUse.has(w));
+      const extra = words
+        .map((w) => w.toLowerCase())
+        .filter((w) => !inUse.has(w) && !partish.isMaker(w) && !partish.isFiller(w));
       for (const w of extra) {
         const narrowed = rows.filter((r) => String(r.partName || '').toLowerCase().includes(w));
         if (narrowed.length) rows = narrowed;
+      }
+      // A bumper, not a bumper bracket. Names lead with what the part IS
+      // ("Bumper| Front Side | Swift..."), so when some rows are exactly what
+      // was asked for, the brackets, holders and garnishes that merely
+      // mention it go.
+      if (core.length) {
+        const want = core.join(' ').toLowerCase();
+        const exact = rows.filter((r) => String(r.partName || '').split('|')[0].trim().toLowerCase() === want);
+        if (exact.length) rows = exact;
       }
       const out = rows.map((r) => {
         const dealers = Array.isArray(r.dealers) ? r.dealers : [];
