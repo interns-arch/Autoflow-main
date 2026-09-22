@@ -273,6 +273,9 @@ class CustomerBot {
       const said = String((m.body || '')).trim();
       const step = await customerCreate.answer(m.chatId, m, said, t);
       if (step && step.done) return this.finishNewCustomer(m, step.form, reply, t);
+      // The GSTIN would not verify. The customer is off the form; the Sales
+      // Heads get to decide whether this account is opened by hand.
+      if (step && step.review) return this.reviewNewCustomer(m, step, reply, t);
       if (step) return reply(step.reply);
     }
 
@@ -1886,6 +1889,30 @@ class CustomerBot {
     );
   }
 
+
+  // A GSTIN that would not verify. Nothing is created and the customer is
+  // not left arguing with a form — the Sales Heads are told what was tried
+  // and decide whether this firm is opened by hand.
+  async reviewNewCustomer(m, step, reply, t) {
+    const form = step.form;
+    const approvers = Object.keys(config.creation.approvers);
+    if (!approvers.length) {
+      store.log(this.key, `${form.answers.requestId} could not verify GST and NO approver is configured`);
+      return reply(step.reply);
+    }
+    customerCreate.park(form);
+    const text = customerCreate.summary(form, t);
+    for (const phone of approvers) {
+      try {
+        await this.transport.sendText(phone, text);
+      } catch (e) {
+        store.log(this.key, `could not reach approver ${phone}: ${String((e && e.message) || e).slice(0, 90)}`);
+      }
+    }
+    store.log(this.key, `${form.answers.requestId} (GST review) sent to ${approvers.length} approver(s)`);
+    return reply(step.reply);
+  }
+
   // "OK WA-ABC123" from the Sales Head. The only path that creates an
   // account on the portal.
   async decideNewCustomer(m, decision, reply, t) {
@@ -1894,6 +1921,31 @@ class CustomerBot {
       return reply(t(`${decision.requestId} not found — it may already be done.`, `${decision.requestId} nahi mila — shayad pehle hi ho chuka hai.`));
     }
     const who = customerCreate.approverName(m.from);
+
+    // A GST REVIEW, not a finished form. There is nothing to create yet:
+    // yes means "let them fill the rest in without a verified GSTIN", and
+    // the form reopens in the customer's chat where it stopped.
+    if (req.answers.kind === 'gst-review') {
+      customerCreate.unpark(decision.requestId);
+      if (!decision.yes) {
+        store.log(this.key, decision.requestId + ' (GST review) rejected by ' + who);
+        await this.transport.sendText(
+          req.answers.phone,
+          t(
+            'Our team needs to check a few things before opening the account — someone will call you.',
+            'Account kholne se pehle team ko kuch check karna hai — aapko call aayega.',
+          ),
+        );
+        return reply(t('Rejected. The customer was told we will call.', 'Reject kar diya. Customer ko bata diya ki call karenge.'));
+      }
+      store.log(this.key, decision.requestId + ' (GST review) waived by ' + who);
+      const first = customerCreate.resumeWithoutGst(req, t);
+      await this.transport.sendText(
+        req.answers.phone,
+        t('Thank you for waiting. Let us carry on — ', 'Intezaar ke liye shukriya. Aage badhte hain — ') + '\n' + '\n' + first,
+      );
+      return reply(t('Done — the form is open again without GST.', 'Ho gaya — bina GST ke form phir se khul gaya.'));
+    }
 
     if (!decision.yes) {
       customerCreate.unpark(decision.requestId);

@@ -4824,92 +4824,149 @@ async function main() {
   check('...and a part is never mistaken for it',
     ['16510M65L10', 'headlight restorer', 'bumper chahiye', '2 pcs brake pad'].every((s) => cc64.wantsToStart(s) === false));
 
-  cc64.cancel(CH64);
-  const open64 = cc64.start(CH64, '917355374975', t64);
-  // GSTIN FIRST: it answers five of the questions on its own.
-  check('the form opens on the GST number', /GST/i.test(open64) && Boolean(cc64.pending(CH64)));
-
-  const say64 = (txt, extra) => cc64.answer(CH64, extra || {}, txt, t64);
-  check('a malformed GSTIN is refused, not stored', /15 character/i.test((await say64('12345')).reply));
-  // GST_API_KEY is blank in this suite, so a well-formed one simply moves on
-  // and the fields are asked by hand — the path a customer with no GST takes.
-  check('...and a well-formed one is accepted', /naam/i.test((await say64('07AABCU9603R1ZM')).reply));
-  await say64('Sharma Auto Parts');
-  await say64('retailer');
-  await say64('Rakesh Sharma');
-  check('a bad PAN is refused', /PAN 10 character/i.test((await say64('XX1')).reply));
-  check('an optional field can be skipped', /Email/i.test((await say64('skip')).reply));
-  await say64('skip');
-  await say64('12 MG Road');
-  await say64('Delhi');
-  await say64('Delhi');
-  check('a required field cannot be skipped with a bad value', /6 digit/i.test((await say64('99')).reply));
-  await say64('110070');
-  // Typed coordinates are how a shop ends up in the sea.
-  check('typed coordinates are refused — the pin is asked for', /Location attach/i.test((await say64('28.6139, 77.2090')).reply));
-  check('...and a dropped pin is taken', /photo/i.test((await say64('', { location: { lat: 28.61, lng: 77.2 } })).reply));
-  check('a photo is required, words will not do', /Photo bhejiye/i.test((await say64('koi photo nahi hai')).reply));
-
-  const done64 = await say64('', { mediaBase64: 'QUJD', mediaMime: 'image/jpeg' });
-  const final64 = done64.done ? done64 : await say64('skip');
-  check('the form completes', final64.done === true);
-
-  const a64 = final64.form.answers;
-  check('the commercial terms are NOT asked of the customer', a64.creditDays === cfg64.defaultCreditDays && a64.creditLimit === cfg64.defaultCreditLimit);
-  check('...and the mobile is the number they wrote from', a64.phone === '917355374975');
-  const sum64 = cc64.summary(final64.form, t64);
-  check('the approver sees the whole form', /Sharma Auto Parts/.test(sum64) && /07AABCU9603R1ZM/.test(sum64) && /28\.61/.test(sum64));
-  check('...and is told how to answer', /OK WA-/.test(sum64));
-
-  // Only a Sales Head may say yes.
-  check('an approver is recognised', cc64.isApprover('919999492550') === true);
-  check('...and anyone else is not', cc64.isApprover('919888888888') === false);
-  const dec64 = cc64.readDecision('OK ' + a64.requestId);
-  check('a decision is read', Boolean(dec64) && dec64.yes === true && dec64.requestId === a64.requestId);
-  check('...and a rejection too', cc64.readDecision('NO ' + a64.requestId).yes === false);
-  check('...while a bare part number is not a decision', cc64.readDecision('16510M65L10') === null);
-
-  cc64.park(final64.form);
-  check('a parked request can be found by its id', Boolean(cc64.parked(a64.requestId)));
-  check('...and is no longer an open form', cc64.pending(CH64) === null);
-
-  const acct64 = require('../src/core/dataEntryRequests').buildAccount({ ...a64, kind: 'customer' });
-  check('the username follows the house rule', acct64.username === 'sharma_auto_parts');
-  check('...and the password does too', acct64.password === 'rakesh@123');
-
-  // ---- the GSTIN doing the typing ----
-  // Stubbed, so the suite never spends a metered lookup and never depends
-  // on gstinapi.in being reachable.
+  // The register is STUBBED for the whole section: a live lookup is metered
+  // and gstinapi.in being reachable must never decide whether the suite
+  // passes.
   const gst64 = require('../src/integrations/gst');
   const lookupWas64 = gst64.lookup;
   const enabledWas64 = gst64.enabled;
+  const FIRM64 = {
+    gstin: '33AAACC1206D1ZN', name: 'CENTRAL WAREHOUSING CORPORATION', legalName: 'CENTRAL WAREHOUSING CORPORATION',
+    status: 'Active', address: 'No.4, North Avenue, Saidapet', city: 'Chennai', state: 'Tamil Nadu', pin: '600015',
+    businessType: 'Government Department',
+  };
+  let a64;
   try {
     gst64.enabled = () => true;
-    gst64.lookup = async () => ({
-      gstin: '33AAACC1206D1ZN', name: 'CENTRAL WAREHOUSING CORPORATION', legalName: 'CENTRAL WAREHOUSING CORPORATION',
-      status: 'Active', address: 'No.4, North Avenue, Saidapet', city: 'Chennai', state: 'Tamil Nadu', pin: '600015',
-    });
-    const CH64B = 'sim-create64b';
-    cc64.cancel(CH64B);
-    cc64.start(CH64B, '917355374975', t64);
-    const afterGst = await cc64.answer(CH64B, {}, '33AAACC1206D1ZN', t64);
-    check('the GSTIN fills the firm in and says so', /CENTRAL WAREHOUSING/.test(afterGst.reply));
-    check('...so the firm name is never asked', /naam/i.test(afterGst.reply) === false);
-    const f64b = cc64.pending(CH64B).answers;
-    check('...and address, city, state and PIN come from the register',
-      f64b.city === 'Chennai' && f64b.state === 'Tamil Nadu' && f64b.pin === '600015' && /Saidapet/.test(f64b.address));
+    gst64.lookup = async (g) => (cc64._internals.GSTIN_RE.test(String(g)) ? FIRM64 : { error: 'shape' });
 
-    // A cancelled registration must never open an account: the order would
-    // be billed against a GSTIN the tax portal has already closed.
-    gst64.lookup = async () => ({ gstin: 'X', name: 'DEAD FIRM', status: 'Cancelled' });
-    const CH64C = 'sim-create64c';
-    cc64.cancel(CH64C);
-    cc64.start(CH64C, '917355374975', t64);
-    const dead64 = await cc64.answer(CH64C, {}, '33AAACC1206D1ZN', t64);
-    check('a cancelled GSTIN is refused', /Cancelled/i.test(dead64.reply));
-    check('...and is not kept on the form', cc64.pending(CH64C).answers.gstNo === undefined);
-    cc64.cancel(CH64B);
-    cc64.cancel(CH64C);
+    cc64.cancel(CH64);
+    const open64 = cc64.start(CH64, '917355374975', t64);
+    // GSTIN FIRST, and it is now the CONDITION for opening an account here,
+    // not a shortcut: it is the only field that proves the firm exists.
+    check('the form opens on the GST number', /GST/i.test(open64) && Boolean(cc64.pending(CH64)));
+
+    const say64 = (txt, extra) => cc64.answer(CH64, extra || {}, txt, t64);
+    check('a verified GSTIN is taken', /CENTRAL WAREHOUSING/.test((await say64('33AAACC1206D1ZN')).reply));
+
+    const pre64 = cc64.pending(CH64).answers;
+    check('...and the firm, address, city, state and PIN come from the register',
+      pre64.name === FIRM64.name && pre64.city === 'Chennai' && pre64.state === 'Tamil Nadu'
+      && pre64.pin === '600015' && /Saidapet/.test(pre64.address));
+    // Characters 3-12 of a GSTIN ARE the PAN. Reading it is not a guess.
+    check('...the PAN is read off the GSTIN, never asked', pre64.panNo === 'AAACC1206D');
+    check('...and it is marked verified', pre64.gstVerified === true);
+    // "Government Department" is a legal constitution, NOT the
+    // retailer/wholesaler/garage/fleet the sales desk means. Filling the
+    // trade channel with it would put a wrong word on every account.
+    check('...but the GST constitution is never used as the business type',
+      pre64.businessType === undefined && pre64.constitution === 'Government Department');
+
+    check('the first question asked is the one GST cannot answer', /Business type/i.test(cc64.FIELDS[cc64.pending(CH64).idx].ask[1]));
+    await say64('retailer');
+    await say64('Rakesh Sharma');
+    check('an optional field can be skipped', /Location/i.test((await say64('skip')).reply)); // email
+    // Typed coordinates are how a shop ends up in the sea.
+    check('typed coordinates are refused, the pin is asked for', /Location attach/i.test((await say64('28.6139, 77.2090')).reply));
+    check('...and a dropped pin is taken', /photo/i.test((await say64('', { location: { lat: 28.61, lng: 77.2 } })).reply));
+    check('a photo is required, words will not do', /Photo bhejiye/i.test((await say64('koi photo nahi hai')).reply));
+
+    const done64 = await say64('', { mediaBase64: 'QUJD', mediaMime: 'image/jpeg' });
+    const final64 = done64.done ? done64 : await say64('skip');
+    check('the form completes', final64.done === true);
+    // Six fields the customer never typed: firm, address, city, state, PIN
+    // and PAN were all answered by the GSTIN.
+    check('...and the customer was never asked what the register knows',
+      final64.form.fromGst.length === 6);
+
+    a64 = final64.form.answers;
+    check('the commercial terms are NOT asked of the customer', a64.creditDays === cfg64.defaultCreditDays && a64.creditLimit === cfg64.defaultCreditLimit);
+    check('...and the mobile is the number they wrote from', a64.phone === '917355374975');
+    const sum64 = cc64.summary(final64.form, t64);
+    check('the approver sees the whole form', /CENTRAL WAREHOUSING/.test(sum64) && /33AAACC1206D1ZN \(verified\)/.test(sum64) && /28\.61/.test(sum64));
+    check('...and is told how to answer', /OK WA-/.test(sum64));
+
+    // Only a Sales Head may say yes.
+    check('an approver is recognised', cc64.isApprover('919999492550') === true);
+    check('...and anyone else is not', cc64.isApprover('919888888888') === false);
+    const dec64 = cc64.readDecision('OK ' + a64.requestId);
+    check('a decision is read', Boolean(dec64) && dec64.yes === true && dec64.requestId === a64.requestId);
+    check('...and a rejection too', cc64.readDecision('NO ' + a64.requestId).yes === false);
+    check('...while a bare part number is not a decision', cc64.readDecision('16510M65L10') === null);
+
+    cc64.park(final64.form);
+    check('a parked request can be found by its id', Boolean(cc64.parked(a64.requestId)));
+    check('...and is no longer an open form', cc64.pending(CH64) === null);
+
+    const acct64 = require('../src/core/dataEntryRequests').buildAccount({ ...a64, kind: 'customer' });
+    check('the username follows the house rule', acct64.username === 'central_warehousing_corporation');
+    check('...and the password does too', acct64.password === 'rakesh@123');
+
+    // ---- a GSTIN that will not verify ----
+    // The account is NOT opened and the customer is NOT left on the form.
+    // It goes to the Sales Heads, who decide whether a person opens it.
+    gst64.lookup = async () => ({ error: 'notfound' });
+    const CHBAD = 'sim-create64-bad';
+    cc64.cancel(CHBAD);
+    cc64.start(CHBAD, '917355374975', t64);
+    const bad1 = await cc64.answer(CHBAD, {}, '07AABCU9603R1ZM', t64);
+    check('a GSTIN not on the register is refused', /nahi mila/i.test(bad1.reply) && bad1.review !== true);
+    check('...and the customer is told how many tries are left', /2 koshish/i.test(bad1.reply));
+    check('...and the bad number is not kept', cc64.pending(CHBAD).answers.gstNo === undefined);
+    await cc64.answer(CHBAD, {}, '07AABCU9603R1ZM', t64);
+    const bad3 = await cc64.answer(CHBAD, {}, '07AABCU9603R1ZM', t64);
+    check('the third failure stops the form', bad3.review === true && cc64.pending(CHBAD) === null);
+    check('...and nothing is created', bad3.form.answers.kind === 'gst-review');
+    const rev64 = cc64.summary(bad3.form, t64);
+    check('the Sales Heads are told what went wrong', /GST not verified/.test(rev64) && /not on the GST database/.test(rev64));
+    check('...and which numbers were tried', /07AABCU9603R1ZM/.test(rev64));
+    check('...and how to answer', /OK WA-/.test(rev64) && /NO WA-/.test(rev64));
+
+    // A wrong SHAPE never reaches the register, so it never costs a credit.
+    gst64.lookup = lookupWas64;
+    const CHSHAPE = 'sim-create64-shape';
+    cc64.cancel(CHSHAPE);
+    cc64.start(CHSHAPE, '917355374975', t64);
+    const shape64 = await cc64.answer(CHSHAPE, {}, '12345', t64);
+    check('a malformed GSTIN is refused without a lookup', /15 character/i.test(shape64.reply));
+
+    // A cancelled registration is not a typo. There is nothing to try
+    // again, so it goes to a person at once.
+    gst64.lookup = async () => ({ ...FIRM64, status: 'Cancelled' });
+    const CHDEAD = 'sim-create64-dead';
+    cc64.cancel(CHDEAD);
+    cc64.start(CHDEAD, '917355374975', t64);
+    const dead64 = await cc64.answer(CHDEAD, {}, '33AAACC1206D1ZN', t64);
+    check('a cancelled GSTIN stops the form on the first try', dead64.review === true);
+    check('...and says so to the approver', /Cancelled/.test(cc64.summary(dead64.form, t64)));
+    check('...and the dead number is never stored', dead64.form.answers.gstNo === undefined);
+
+    // "I have no GST." Not an argument to have with a customer.
+    const CHNONE = 'sim-create64-none';
+    cc64.cancel(CHNONE);
+    cc64.start(CHNONE, '917355374975', t64);
+    const none64 = await cc64.answer(CHNONE, {}, 'skip', t64);
+    check('a customer with no GST is handed to a person, not refused', none64.review === true && none64.form.answers.gstProblem === 'no-gst');
+
+    // The register being down is OUR problem. The account still cannot be
+    // opened unverified, but the customer does not argue with a form.
+    gst64.lookup = async () => null;
+    const CHDOWN = 'sim-create64-down';
+    cc64.cancel(CHDOWN);
+    cc64.start(CHDOWN, '917355374975', t64);
+    const down64 = await cc64.answer(CHDOWN, {}, '33AAACC1206D1ZN', t64);
+    check('the register being unreachable goes straight to a person', down64.review === true && down64.form.answers.gstProblem === 'unavailable');
+
+    // ---- the Sales Head waives it ----
+    cc64.park(down64.form);
+    const waived64 = cc64.resumeWithoutGst(cc64.parked(down64.form.answers.requestId), t64);
+    check('a waiver reopens the form in the customer chat', Boolean(cc64.pending(CHDOWN)));
+    check('...at the firm name, since GST answered nothing', /naam/i.test(waived64));
+    check('...and the account is marked NOT verified', cc64.pending(CHDOWN).answers.gstVerified === false);
+    check('...with the waiver it was opened under', cc64.pending(CHDOWN).answers.gstWaiver === down64.form.answers.requestId);
+    cc64.unpark(down64.form.answers.requestId);
+
+    [CHBAD, CHSHAPE, CHDEAD, CHNONE, CHDOWN].forEach((c) => cc64.cancel(c));
   } finally {
     gst64.lookup = lookupWas64;
     gst64.enabled = enabledWas64;

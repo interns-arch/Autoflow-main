@@ -56,10 +56,14 @@ const QUIT = /^(cancel|stop|rehne do|rhne do|chhodo|chodo|baad me karenge|baad m
 const FIELDS = [
   {
     key: 'gstNo',
-    req: false,
+    req: true,
     type: 'gst',
-    ask: ['GST number? (nahi hai to "skip")', 'GST number bhej dijiye — baaki details khud bhar jayengi. (nahi hai to "skip")'],
-    check: (v) => (GSTIN_RE.test(v.replace(/\s/g, '')) ? null : 'GST number 15 character ka hota hai, jaise 07AABCU9603R1ZM. Dobara bhejiye ya "skip".'),
+    // No "skip". A verified GSTIN is the condition for opening an account
+    // over WhatsApp at all: it is the only thing in this form that proves
+    // the firm exists and that the person typing is not inventing one. The
+    // shape is NOT checked here — integrations/gst checks it first and
+    // costs nothing for a typo, and the tries are counted in one place.
+    ask: ['GST number?', 'GST number bhej dijiye — baaki details khud bhar jayengi.'],
     clean: (v) => v.replace(/\s/g, '').toUpperCase(),
   },
   {
@@ -80,6 +84,9 @@ const FIELDS = [
   {
     key: 'panNo',
     req: false,
+    // Asked only if the GSTIN somehow did not supply it. Characters 3-12 of
+    // any GSTIN ARE the PAN, by construction, so a verified GSTIN answers
+    // this question and the customer never sees it.
     ask: ['PAN number? (optional)', 'PAN number? (optional, "skip" chalega)'],
     check: (v) => (PAN_RE.test(v.replace(/\s/g, '')) ? null : 'PAN 10 character ka hota hai, jaise AABCU9603R. Dobara bhejiye ya "skip".'),
     clean: (v) => v.replace(/\s/g, '').toUpperCase(),
@@ -232,6 +239,12 @@ async function answer(chatId, m, text, t) {
 
   // "skip" on an optional field moves on; on a required one it does not.
   if (SKIP.test(said)) {
+    // The GSTIN is the one field with a reason worth giving. "Ye chhod
+    // nahi sakte" invites an argument; saying a firm without GST is opened
+    // by a person ends it, and that is what actually happens next.
+    if (field.type === 'gst' && !form.gstWaived) {
+      return escalate(form, 'no-gst', t);
+    }
     if (field.req && field.type !== 'location' && field.type !== 'photo') {
       return { reply: t('Ye chhod nahi sakte sir — ' + field.ask[1], 'Ye chhod nahi sakte sir — ' + field.ask[1]), done: false, form };
     }
@@ -286,52 +299,126 @@ async function answer(chatId, m, text, t) {
   return advance(form, t);
 }
 
+// How many GSTINs a customer may try before this stops being a typo and
+// starts being a firm we cannot verify. Counted across ALL failures —
+// wrong shape, not on the register, cancelled — because from the form's
+// point of view they are the same thing: no verified firm.
+const MAX_GST_TRIES = 3;
+
+// The form cannot go on, and the customer must not be left on it. Their
+// side closes with an honest sentence; the request goes to the Sales Heads
+// with the GSTINs that were tried, and THEY decide whether this account is
+// opened by hand. Nothing is created either way — this is a hand-off, not
+// a rejection the customer has to argue with.
+function escalate(form, why, t) {
+  // An unverified GSTIN is never kept as THE GSTIN — an account must not
+  // carry a number nobody confirmed. It is recorded as something that was
+  // tried, which is what the approver needs to see.
+  const tried = form.gstTried || [];
+  for (const g of [form.answers.gstNo, form.answers._lastGst]) if (g && !tried.includes(g)) tried.push(g);
+  if (tried.length) form.answers.gstTried = tried;
+  delete form.answers.gstNo;
+  delete form.answers._lastGst;
+  delete form.answers._firm;
+  form.answers.gstVerified = false;
+  form.answers.requestId = 'WA-' + Date.now().toString(36).toUpperCase();
+  form.answers.kind = 'gst-review';
+  form.answers.gstProblem = why;
+  Object.assign(form.answers, commercialDefaults());
+  open.delete(form.chatId);
+  store.log('create', `${form.chatId}: GST not verified (${why}) — ${form.answers.requestId} to the Sales Heads`);
+  return {
+    reply: t(
+      'I could not verify that GST number, so I cannot open the account from here. Our team is checking it and will call you.',
+      'Ye GST number verify nahi ho paya, isliye main yahan se account nahi khol sakta. Hamari team check kar rahi hai, aapko call aayega.',
+    ),
+    done: false,
+    review: true,
+    form,
+  };
+}
+
+// A GSTIN that did not verify. Either ask again, or — once the tries are
+// used up — hand it to a person.
+function gstFail(form, why, message, t) {
+  delete form.answers.gstNo;
+  form.gstTries = (form.gstTries || 0) + 1;
+  form.gstTried = form.gstTried || [];
+  const last = form.answers._lastGst;
+  if (last && !form.gstTried.includes(last)) form.gstTried.push(last);
+  form.answers.gstTried = form.gstTried;
+
+  if (form.gstTries >= MAX_GST_TRIES) return escalate(form, why, t);
+
+  const left = MAX_GST_TRIES - form.gstTries;
+  open.set(form.chatId, form);
+  return {
+    reply: `${message} (${left} ${left === 1 ? 'koshish' : 'koshishein'} baaki)`,
+    done: false,
+    form,
+  };
+}
+
 async function fillFromGst(form, gstin, t) {
   const gst = require('../integrations/gst');
+  form.answers._lastGst = gstin;
   const firm = await gst.lookup(gstin);
 
-  // Not configured, or the service is down. Not the customer's problem —
-  // ask the questions by hand, exactly as before this existed.
-  if (!firm) return advance(form, t);
-
-  if (firm.error === 'notfound') {
-    delete form.answers.gstNo;
-    return {
-      reply: t(
-        'That GSTIN is not on the GST database. Check it and send again, or "skip".',
-        'Ye GSTIN GST database mein nahi mila. Check karke dobara bhejiye, ya "skip".',
-      ),
-      done: false,
-      form,
-    };
+  // Wrong shape. Caught before the network, so a typo never costs a credit.
+  if (firm && firm.error === 'shape') {
+    return gstFail(form, 'shape', t(
+      'That is not a GST number — they are 15 characters, like 07AABCU9603R1ZM. Send it again.',
+      'Ye GST number nahi lag raha — 15 character ka hota hai, jaise 07AABCU9603R1ZM. Dobara bhejiye.',
+    ), t);
   }
-  if (firm.error) return advance(form, t);
+
+  if (firm && firm.error === 'notfound') {
+    return gstFail(form, 'notfound', t(
+      'That GSTIN is not on the GST database. Check it and send again.',
+      'Ye GSTIN GST database mein nahi mila. Check karke dobara bhejiye.',
+    ), t);
+  }
+
+  // Not configured, or the register is down. NOT the customer's fault, so
+  // they do not spend a try on it — but the account still cannot be opened
+  // unverified, so it goes to a person immediately.
+  if (!firm) return escalate(form, 'unavailable', t);
 
   // A cancelled registration must not open an account: the order would be
-  // billed against a GSTIN the tax portal has already closed.
-  if (!gst.isLive(firm)) {
-    delete form.answers.gstNo;
+  // billed against a GSTIN the tax portal has already closed. Not a typo,
+  // so there is nothing to try again — straight to a person.
+  if (!gst.isLive(form.answers._firm = firm)) {
     store.log('create', `${form.chatId}: GSTIN ${gstin} is ${firm.status}, not Active`);
-    return {
-      reply: t(
-        `That GSTIN shows as ${firm.status}, not Active. Send a live one, or "skip" and our team will check.`,
-        `Ye GSTIN ${firm.status} dikha raha hai, Active nahi. Chalu wala bhejiye, ya "skip" kar dijiye — team dekh legi.`,
-      ),
-      done: false,
-      form,
-    };
+    form.answers.gstStatus = firm.status;
+    return escalate(form, `status:${firm.status}`, t);
   }
 
+  // VERIFIED. Everything the register knows is filled in, and only what it
+  // cannot know is still asked.
   const a = form.answers;
+  delete a._lastGst;
+  delete a._firm;
+  a.gstNo = firm.gstin || gstin;
+  a.gstVerified = true;
   a.name = firm.name;
   a.legalName = firm.legalName;
   a.address = firm.address;
   a.city = firm.city;
   a.state = firm.state;
   a.pin = firm.pin;
-  if (firm.businessType) a.businessType = firm.businessType;
-  form.fromGst = ['name', 'address', 'city', 'state', 'pin'].filter((k) => a[k]);
-  store.log('create', `${form.chatId}: GSTIN ${gstin} filled ${form.fromGst.length} field(s) — ${firm.name}`);
+  // Characters 3-12 of a GSTIN ARE the PAN. Reading it off a verified
+  // GSTIN is not a guess, and it removes a question.
+  const pan = a.gstNo.slice(2, 12).toUpperCase();
+  if (PAN_RE.test(pan)) a.panNo = pan;
+  // The GST register's "constitution" is Proprietorship / Private Limited —
+  // a legal form, NOT the retailer/wholesaler/garage/fleet the sales desk
+  // means by business type. Kept for the approver to read, never used to
+  // answer that question.
+  if (firm.businessType) a.constitution = firm.businessType;
+  if (firm.taxpayerType) a.taxpayerType = firm.taxpayerType;
+
+  form.fromGst = ['name', 'address', 'city', 'state', 'pin', 'panNo'].filter((k) => a[k]);
+  store.log('create', `${form.chatId}: GSTIN ${a.gstNo} verified — filled ${form.fromGst.length} field(s) — ${firm.name}`);
 
   const step = advance(form, t);
   // Say what was found BEFORE the next question, so a wrong GSTIN is caught
@@ -360,10 +447,58 @@ function advance(form, t) {
   return { reply: null, done: true, form };
 }
 
+// A GST that would not verify. The approver gets the little that is known
+// and the numbers that were tried, and decides whether a person opens this
+// account by hand. Nothing has been created.
+function reviewSummary(form, t) {
+  const a = form.answers;
+  const why = {
+    shape: 'the number was never a valid GSTIN',
+    notfound: 'not on the GST database',
+    'no-gst': 'the customer says they have no GST number',
+    unavailable: 'the GST service could not be reached',
+  }[a.gstProblem] || `registration is ${String(a.gstProblem || '').replace(/^status:/, '')}, not Active`;
+  return [
+    `*GST not verified* — ${a.requestId}`,
+    form.byName ? `Bheja: ${form.byName}` : `Customer: ${a.phone}`,
+    '',
+    `Problem: ${why}`,
+    a.gstTried && a.gstTried.length ? `Tried: ${a.gstTried.join(', ')}` : null,
+    a.name ? `Firm (unverified): ${a.name}` : null,
+    '',
+    t(
+      `Reply *OK ${a.requestId}* to let them fill the form without GST, or *NO ${a.requestId}* and we will call them instead.`,
+      `*OK ${a.requestId}* bhejiye to bina GST ke form bhar lenge, ya *NO ${a.requestId}* — phir hum call kar lenge.`,
+    ),
+  ]
+    .filter((l) => l !== null)
+    .join('\n');
+}
+
+// An approver said yes to a firm whose GST would not verify. The form
+// reopens in the CUSTOMER's chat at the question after the GSTIN, and the
+// account carries gstVerified: false so nobody downstream assumes it was.
+function resumeWithoutGst(req, t) {
+  const form = {
+    at: Date.now(),
+    chatId: req.chatId,
+    phone: req.answers.phone,
+    byName: req.byName || null,
+    idx: 0,
+    gstWaived: true,
+    answers: { phone: req.answers.phone, gstVerified: false, gstWaiver: req.answers.requestId },
+  };
+  open.set(req.chatId, form);
+  store.log('create', `${req.chatId}: GST waived on ${req.answers.requestId} — form reopened`);
+  const step = advance(form, t);
+  return step.reply;
+}
+
 // What the approver reads. Every field, in the order of the paper form, so
 // it can be checked against one.
 function summary(form, t) {
   const a = form.answers;
+  if (a.kind === 'gst-review') return reviewSummary(form, t);
   const line = (label, v) => (v === undefined || v === null || v === '' ? null : `${label}: ${v}`);
   return [
     `*New customer* — ${a.requestId}`,
@@ -373,7 +508,9 @@ function summary(form, t) {
     line('Business type', a.businessType),
     line('Contact', a.contactPerson),
     line('Mobile', a.phone),
-    line('GSTIN', a.gstNo),
+    line('GSTIN', a.gstNo ? `${a.gstNo}${a.gstVerified ? ' (verified)' : ''}` : null),
+    a.gstVerified === false ? `GSTIN: NOT VERIFIED — waived on ${a.gstWaiver}` : null,
+    line('Constitution', a.constitution),
     line('PAN', a.panNo),
     line('Email', a.email),
     '',
@@ -432,6 +569,8 @@ module.exports = {
   pending,
   cancel,
   summary,
+  reviewSummary,
+  resumeWithoutGst,
   readDecision,
   isApprover,
   approverName,
@@ -439,5 +578,5 @@ module.exports = {
   parked,
   unpark,
   FIELDS,
-  _internals: { GSTIN_RE, PAN_RE, PIN_RE, commercialDefaults },
+  _internals: { GSTIN_RE, PAN_RE, PIN_RE, commercialDefaults, MAX_GST_TRIES },
 };

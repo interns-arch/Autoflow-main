@@ -22,14 +22,15 @@ const escalation = require('../core/escalation');
 const lists = require('../core/lists');
 const documents = require('../core/documents');
 const speech = require('../integrations/speech');
+const lang = require('../core/lang');
+const voiceNote = require('../core/voiceNote');
 
 const NOT_MEDIA = Symbol('not media');
 
 async function handleMedia(bot, m, reply, t) {
-  // Voice notes go straight to a person, with the recording. Nothing here
-  // can listen to audio, and the one thing that could — whisper, running
-  // locally — was measured on this box at 46 seconds a clip and came back in
-  // Devanagari. A person hears it in ten seconds and answers properly.
+  // A voice note is transcribed and then treated as what it is: a message
+  // the customer spoke instead of typing. Only a note we could NOT read goes
+  // straight to a person, with the recording attached.
   if (['ptt', 'audio'].includes(m.mediaType)) {
     // If they recorded it ON one of our numbered lists, send the list with
     // the recording. "Leave the ninth one, third one three pieces" is
@@ -63,6 +64,28 @@ async function handleMedia(bot, m, reply, t) {
       //    Nothing is added to the cart here.
       const heard = await bot.heardOrder(m, transcript, reply, t);
       if (heard) return true;
+
+      // 3. ANYTHING ELSE THEY SAID. 21 Sep, live: "Maruti Suzuki Swift Dzire
+      //    ka bumper price" was transcribed perfectly and still went to a
+      //    person, because the only two things a transcript could do here
+      //    were edit a numbered list or carry a part number. Typed, that
+      //    same sentence gets a car, a part and a rate without anyone being
+      //    asked — so hand the words to the text path and let it answer.
+      //    A voice note is a message the customer spoke instead of typing.
+      //
+      //    Nothing downstream reads m.mediaBase64 on the customer path, so
+      //    the words are all that changes. The recording waits in
+      //    core/voiceNote, and goes with the question if the text path does
+      //    end up asking a person after all.
+      m.body = transcript;
+      lang.note(m.chatId, transcript);
+      voiceNote.hold(m.chatId, {
+        base64: m.mediaBase64,
+        mime: m.mediaMime || 'audio/ogg',
+        transcript,
+      });
+      store.log(bot.key, `voice note read as text: "${transcript.slice(0, 60)}"`);
+      return NOT_MEDIA;
     }
     const asked = m.mediaBase64
       ? await escalation.create(bot, {

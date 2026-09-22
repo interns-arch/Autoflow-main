@@ -180,7 +180,22 @@ function prettyPhone(p) {
   return d ? '+' + d : 'customer';
 }
 
+// Every question reads the same whether it was typed or spoken. When it was
+// spoken, the reader is told so — the words above are Google's best guess and
+// the recording is right underneath them. VOICE says this in its own words,
+// because there the recording is the whole question.
 function composeAsk(e) {
+  const text = composeAskBody(e);
+  if (e.reason === 'VOICE' || !e.audio || !e.transcript) return text;
+  const note =
+    `\n\n_Heard in their voice note:_ "${e.transcript}"` +
+    `\n_(machine transcript — the recording follows)_`;
+  return text.includes('*Reply:*')
+    ? text.replace('\n\n*Reply:*', note + '\n\n*Reply:*')
+    : text + note;
+}
+
+function composeAskBody(e) {
   const qty = e.qty && e.qty > 1 ? `  (qty ${e.qty})` : '';
   const head = `Question *#${e.id}* — ${prettyPhone(e.customerPhone)}\n_customer's inquiry_`;
 
@@ -303,6 +318,19 @@ async function create(
 ) {
   // The gate chain handed this to a person - noted for the shadow log only.
   require('../pipeline/shadow').noteHandoff(reason);
+
+  // The customer SPOKE this message and the text path could not finish it.
+  // The words the helper is about to read are a machine's best guess, so the
+  // recording goes with them — "16510M65L10" against "16510M65L70" is settled
+  // by playing the clip, never by reading it. core/voiceNote holds the clip
+  // for the message being handled and nothing else.
+  if (!audio) {
+    const clip = require('./voiceNote').forChat(chatId);
+    if (clip) {
+      audio = { base64: clip.base64, mime: clip.mime };
+      if (!transcript) transcript = clip.transcript;
+    }
+  }
   // Learning only applies to questions about a PART. "voice note", "a bill",
   // "Please collect cheque tomorrow" are not phrases that map to a part
   // number, and teaching the bot that "voice note" MEANS 55810M75J30 would
