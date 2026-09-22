@@ -5040,6 +5040,35 @@ async function main() {
     gst64.lookup = lookupWas64;
     gst64.enabled = enabledWas64;
   }
+  // ---- the Sales Head swipes "already created" onto the summary ----
+  // 22 Sep, live: "Ye toh already created hai" was neither OK nor NO, got
+  // "koi order pending nahi hai", and the customer never heard a word.
+  {
+    const RID = 'WA-SMOKE64X';
+    cc64.park({ chatId: 'sim-create64-dup', answers: { requestId: RID, phone: '917355374975', name: 'KALRA MOTORS' } });
+    cc64.noteSummary('wamid.smoke64dup', RID);
+    const sentDup = [];
+    const botDup = Object.create(customer);
+    botDup.transport = { sendText: async (to, text) => { sentDup.push({ to, text }); return 'wamid.x'; } };
+    const replyDup = async (text) => { sentDup.push({ to: 'approver', text }); return true; };
+    const tDup = (en, hi) => hi;
+    const mDup = { chatId: '919999492550@c.us', from: '919999492550', contextId: 'wamid.smoke64dup', body: 'Ye toh already created hai' };
+    const rid = cc64.requestForMessage(mDup.contextId);
+    check('a swipe onto the summary finds its request', rid === RID);
+    await botDup.noteOnNewCustomer(mDup, rid, mDup.body, replyDup, tDup);
+    check('..."already created" closes it', cc64.parked(RID) === null);
+    check('...the customer is told they already have an account', sentDup.some((x) => x.to === '917355374975' && /pehle se/.test(x.text)));
+    check('...and the approver is told it was done', sentDup.some((x) => x.to === 'approver' && /band kar diya/.test(x.text)));
+
+    cc64.park({ chatId: 'sim-create64-dup', answers: { requestId: RID, phone: '917355374975', name: 'KALRA MOTORS' } });
+    sentDup.length = 0;
+    await botDup.noteOnNewCustomer(mDup, RID, 'ek baar call karke dekho', replyDup, tDup);
+    check('any other note leaves the request waiting', Boolean(cc64.parked(RID)));
+    check('...is not passed to the customer', sentDup.every((x) => x.to === 'approver'));
+    check('...and asks the approver for OK / NO', sentDup.some((x) => /OK WA-SMOKE64X/.test(x.text)));
+    check('an id typed in the text is found too', cc64.requestIdIn('wa-smoke64x pehle se hai') === RID);
+    cc64.unpark(RID);
+  }
   cc64.unpark(a64.requestId);
   cfg64.approvers = hadAppr64;
 

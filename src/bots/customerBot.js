@@ -302,6 +302,14 @@ class CustomerBot {
         store.log(this.key, `${m.from} tried to approve ${decision.requestId} but is not an approver`);
         return reply(t('Only the Sales Head can approve that.', 'Ye sirf Sales Head approve kar sakte hain.'));
       }
+      // Anything else an approver says ABOUT a request - swiped onto its
+      // summary, or naming its id. 22 Sep, live: "Ye toh already created
+      // hai" swiped onto the summary was answered "koi order pending nahi
+      // hai", and the customer was never told.
+      if (customerCreate.isApprover(m.from)) {
+        const rid = (m.contextId && customerCreate.requestForMessage(m.contextId)) || customerCreate.requestIdIn(text);
+        if (rid) return this.noteOnNewCustomer(m, rid, text, reply, t);
+      }
     }
 
     // "CREATE CUSTOMER". Asked for in words, rather than waiting for an
@@ -1923,11 +1931,11 @@ class CustomerBot {
     const text = customerCreate.summary(form, t);
     for (const phone of approvers) {
       try {
-        if (form._photo && this.transport.sendImage) {
-          await this.transport.sendImage(phone, Buffer.from(form._photo, 'base64'), form.answers.shopPhoto.mime, text);
-        } else {
-          await this.transport.sendText(phone, text);
-        }
+        const sentId =
+          form._photo && this.transport.sendImage
+            ? await this.transport.sendImage(phone, Buffer.from(form._photo, 'base64'), form.answers.shopPhoto.mime, text)
+            : await this.transport.sendText(phone, text);
+        customerCreate.noteSummary(sentId, form.answers.requestId);
       } catch (e) {
         store.log(this.key, `could not reach approver ${phone}: ${String((e && e.message) || e).slice(0, 90)}`);
       }
@@ -1956,7 +1964,7 @@ class CustomerBot {
     const text = customerCreate.summary(form, t);
     for (const phone of approvers) {
       try {
-        await this.transport.sendText(phone, text);
+        customerCreate.noteSummary(await this.transport.sendText(phone, text), form.answers.requestId);
       } catch (e) {
         store.log(this.key, `could not reach approver ${phone}: ${String((e && e.message) || e).slice(0, 90)}`);
       }
@@ -2046,6 +2054,54 @@ class CustomerBot {
       store.log(this.key, `${decision.requestId} create FAILED: ${why}`);
       return reply(t(`Could not create it: ${why}\nThe request is still here — try *OK ${decision.requestId}* again.`, `Nahi ban paya: ${why}\nRequest abhi bhi hai — dobara *OK ${decision.requestId}* bhejiye.`));
     }
+  }
+
+  // An approver's words on a request that are not OK or NO. "Already has an
+  // account" closes it and tells the customer to carry on ordering; anything
+  // else is NOT passed to the customer (it may be meant for the desk, not for
+  // them) and the approver is asked for the answer that does something.
+  async noteOnNewCustomer(m, requestId, text, reply, t) {
+    const req = customerCreate.parked(requestId);
+    if (!req) {
+      return reply(t(`${requestId} is no longer pending — it may already be done.`, `${requestId} ab pending nahi hai — shayad pehle hi ho chuka hai.`));
+    }
+    const who = customerCreate.approverName(m.from);
+    const firm = req.answers.name || req.answers.phone;
+
+    if (customerCreate.saysAlreadyExists(text)) {
+      customerCreate.unpark(requestId);
+      customers.forget(req.answers.phone); // the next order looks the account up afresh
+      store.log(this.key, `${requestId} closed by ${who}: account already exists ("${text.slice(0, 80)}")`);
+      await this.transport.sendText(
+        req.answers.phone,
+        t(
+          'Good news — you already have an account with us, so no new one is needed. Send the part number and quantity and I will place the order.',
+          'Aapka account pehle se bana hua hai sir — naya banane ki zaroorat nahi. Part number aur quantity bhejiye, order laga deta hoon.',
+        ),
+      );
+      for (const phone of Object.keys(config.creation.approvers)) {
+        if (store.normPhone(phone) === store.normPhone(m.from)) continue;
+        try {
+          await this.transport.sendText(phone, `${requestId} (${firm}) band — ${who}: account pehle se hai.`);
+        } catch (e) {
+          /* the other approver missing this must not undo the close */
+        }
+      }
+      return reply(
+        t(
+          `Closed ${requestId} — ${firm} was told they already have an account.`,
+          `${requestId} band kar diya — ${firm} ko bata diya ki account pehle se hai.`,
+        ),
+      );
+    }
+
+    store.log(this.key, `${who} wrote on ${requestId} without a decision: "${text.slice(0, 80)}"`);
+    return reply(
+      t(
+        `${requestId} (${firm}) is still waiting. Reply *OK ${requestId}* to create, *NO ${requestId}* to reject, or "already hai" if they have an account.`,
+        `${requestId} (${firm}) abhi pending hai. Banane ke liye *OK ${requestId}*, reject ke liye *NO ${requestId}*, ya account pehle se hai to "already hai" likhiye.`,
+      ),
+    );
   }
 
   whereWeAre(m, t, { unclear = false } = {}) {

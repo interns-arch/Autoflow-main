@@ -795,6 +795,10 @@ function summary(form, t) {
       `Reply *OK ${a.requestId}* to create, or *NO ${a.requestId}* to reject.`,
       `*OK ${a.requestId}* bhejiye banane ke liye, ya *NO ${a.requestId}* reject karne ke liye.`,
     ),
+    t(
+      'Already has an account? Swipe-reply to this message with "already hai".',
+      'Account pehle se hai? Is message pe swipe karke "already hai" likh dijiye.',
+    ),
   ]
     .filter((l) => l !== null)
     .join('\n');
@@ -829,6 +833,32 @@ function unpark(requestId) {
   awaiting.delete(String(requestId || '').toUpperCase());
 }
 
+// Which of OUR messages carried which request, by WhatsApp id. 22 Sep, live:
+// the Sales Head swiped onto the summary and wrote "Ye toh already created
+// hai" — no OK, no NO, so it fell through to "koi order pending nahi hai",
+// the customer heard nothing and the request sat there. A swipe tells us
+// only the id of the message it quotes; this is what turns that back into
+// a request.
+const summaries = chatState.slot('customerCreate.summaries'); // wamid -> requestId
+function noteSummary(wamid, requestId) {
+  if (wamid && typeof wamid === 'string') summaries.set(wamid, String(requestId || '').toUpperCase());
+}
+function requestForMessage(wamid) {
+  return (wamid && summaries.get(wamid)) || null;
+}
+// "WA-MUCA1E42 pehle se hai" — typed rather than swiped.
+function requestIdIn(text) {
+  const m = String(text || '').match(/\bWA-[A-Z0-9]{4,}\b/i);
+  return m ? m[0].toUpperCase() : null;
+}
+// The approver saying this firm is already on the portal. Anything else
+// they write is not a decision, and is never guessed at as one.
+function saysAlreadyExists(text) {
+  return /already|pehle\s*(se|hi)|pahle\s*(se|hi)|exist|duplicate|bana\s*hua|bani\s*hui|bana\s*(hai|h)\b|ban\s*chuka|khula\s*hua|created|account\s*(hai|h)\b/i.test(
+    String(text || ''),
+  );
+}
+
 module.exports = {
   wantsToStart,
   wantsSomeoneElse,
@@ -847,6 +877,10 @@ module.exports = {
   park,
   parked,
   unpark,
+  noteSummary,
+  requestForMessage,
+  requestIdIn,
+  saysAlreadyExists,
   FIELDS,
   _internals: { GSTIN_RE, PAN_RE, PIN_RE, commercialDefaults, MAX_GST_TRIES },
 };
