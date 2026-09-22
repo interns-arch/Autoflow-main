@@ -739,6 +739,11 @@ class CustomerBot {
       if (hits.top.length === 1) {
         clarify.clear(m.chatId);
         store.log(this.key, `"${p.base}" -> ${hits.top[0].partNo} after clarifying`);
+        // They asked what it costs. Answer that, and ask how many - putting
+        // one in the cart would be an order nobody placed.
+        if (p.rate) {
+          return this.quoteForOrder(m, [{ partNo: hits.top[0].partNo, name: hits.top[0].name, requested: p.base }], reply, t);
+        }
         return this.processOrderLines(
           m,
           [{ item: hits.top[0].partNo, qty: p.qty, ref: p.ref, key: p.key }],
@@ -878,23 +883,55 @@ class CustomerBot {
         // "Kis part ka?". Ask the catalogue first: one match is that part;
         // several means the name is real and the person answering can say
         // which. No match falls through to the usual order below.
-        let byName = [];
+        //
+        // 22 Sep, live: a voice note, "Maruti Suzuki Swift Dzire ka front
+        // bumper kitne ka hai?", transcribed word for word. The parser named
+        // the part, so the catalogue was never asked; the rate lookup knows
+        // only part numbers, and the customer was told "our team will send
+        // it" for a part the portal had, with its price. A NAMED part is
+        // looked up by name too, and a person is asked only if the catalogue
+        // cannot say which part it is.
         const phrase = named.length ? '' : focus.stripPointers(text.replace(RATE_STRIP, ' '));
-        if (phrase.length >= 3) {
-          try {
-            const hits = await availability.byName(phrase);
-            const top = (hits && hits.top) || [];
-            if (top.length === 1) byName = [top[0].partNo];
-            else if (top.length > 1) byName = [phrase];
-          } catch (e) {
-            store.log(this.key, 'rate: catalogue lookup failed for "' + phrase + '": ' + String((e && e.message) || e).slice(0, 80));
+        const lookups = named.length ? named : phrase.length >= 3 ? [phrase] : [];
+        const found = [];
+        let unresolved = 0;
+        for (const item of lookups) {
+          const no = ai.partNumberIn(item);
+          if (no || !availability.isNameQuery(item)) {
+            if (no) found.push({ partNo: no });
+            else unresolved++;
+            continue;
           }
+          let top = [];
+          try {
+            top = ((await availability.byName(vehicle.narrow(m.chatId, item))) || {}).top || [];
+          } catch (e) {
+            store.log(this.key, 'rate: catalogue lookup failed for "' + item + '": ' + String((e && e.message) || e).slice(0, 80));
+          }
+          if (top.length === 1) {
+            store.log(this.key, `rate: "${item}" -> ${top[0].partNo} by name (only match)`);
+            found.push({ partNo: top[0].partNo, name: top[0].name, requested: item });
+          } else if (top.length > 1) {
+            // Front or rear, which car: ask the way the counter would, and
+            // remember it was a price they wanted.
+            store.log(this.key, `rate: "${item}" -> ${top.length} catalogue matches; asking which`);
+            const state = { base: item, qty: 1, rate: true };
+            const q = clarify.nextQuestion(top, [], m.chatId);
+            if (q) {
+              clarify.ask(m.chatId, state, q);
+              return reply(q.text);
+            }
+            return reply(clarify.offer(m.chatId, state, top));
+          } else {
+            unresolved++;
+          }
+        }
+        if (found.length && !unresolved && found.some((f) => f.name)) {
+          return this.quoteForOrder(m, found, reply, t);
         }
         const known = named.length
           ? named
-          : byName.length
-            ? byName
-            : focus.pointsBack(text) && discussed.length
+          : focus.pointsBack(text) && discussed.length
               ? discussed
               : inCart.length
                 ? inCart
@@ -2101,6 +2138,58 @@ class CustomerBot {
         `${requestId} (${firm}) is still waiting. Reply *OK ${requestId}* to create, *NO ${requestId}* to reject, or "already hai" if they have an account.`,
         `${requestId} (${firm}) abhi pending hai. Banane ke liye *OK ${requestId}*, reject ke liye *NO ${requestId}*, ya account pehle se hai to "already hai" likhiye.`,
       ),
+    );
+  }
+
+  // A part they asked the price of, found by name: what it is, whether we
+  // have it, their rate, and "how many?" - so the next message is the order.
+  // A rate the portal and Odoo both lack still goes to a person.
+  async quoteForOrder(m, found, reply, t) {
+    const partNos = [...new Set(found.map((f) => f.partNo))];
+    const resolved = await availability.resolve(partNos.map((p) => ({ item: p, qty: 1 }))).catch(() => []);
+    if (resolved.length) {
+      inquiries.recordMany(resolved, { customer: m.from, chatId: m.chatId });
+      focus.remember(m.chatId, resolved);
+    }
+    const onBehalf = route.onBehalfOf(m);
+    const rateCtx = onBehalf || (await customers.resolve(m.from).catch(() => null));
+    const acct = onBehalf ? { name: onBehalf.name } : await require('../core/customerLookup').ownRow(m.from).catch(() => null);
+    const cart = orders.findDraft(m.chatId);
+    const quoted = await rates
+      .quote(partNos, {
+        name: acct && acct.name,
+        ctx: rateCtx && rateCtx.found ? rateCtx : null,
+        lines: onBehalf ? [] : (cart && cart.lines) || [],
+        label: onBehalf ? onBehalf.name : null,
+      }, t)
+      .catch((e) => {
+        store.log(this.key, 'rate quote failed: ' + String((e && e.message) || e).slice(0, 110));
+        return null;
+      });
+
+    const what = found.filter((f) => f.name).map((f) => `${f.partNo} — ${f.name}`).join('\n');
+    const stock = resolved.map((l) => availability.describe(l, m.chatId)).join('\n');
+    askQty.ask(m.chatId, partNos.map((p) => ({ item: p })));
+
+    let price = quoted;
+    if (!quoted) {
+      await escalation.create(this, {
+        chatId: m.chatId,
+        customerPhone: m.from,
+        item: partNos.join(', '),
+        qty: 1,
+        kind: 'inquiry',
+        reason: 'RATE',
+      });
+      price = t('Rate: confirming it, will send shortly.', 'Rate: confirm karke abhi bhejta hoon.');
+    } else {
+      store.upsertCustomer(m.from);
+    }
+    store.log(this.key, `rate: quoted ${partNos.join(', ')} by name${quoted ? '' : ' (no price found - asked a person)'}`);
+    return reply(
+      [what, price, stock ? 'Stock: ' + stock : null, t('How many do you need?', 'Kitne piece chahiye?')]
+        .filter(Boolean)
+        .join('\n\n'),
     );
   }
 

@@ -2231,6 +2231,32 @@ async function main() {
   check('oil filter ka rate kya hai finds the part by its name', r20b.said.indexOf('16510M65L10') !== -1);
   const r20c = await rate20('919000000203', 'aaj ka rate kya hai');
   check('aaj ka rate kya hai still asks which part, and asks no one', /kis part ka|which part/i.test(r20c.said) && !r20c.q);
+
+  // 22 Sep, live: a voice note transcribed as "Maruti Suzuki Swift Dzire ka
+  // front bumper kitne ka hai?" went to a person as "our team will send it".
+  // The catalogue had the part and the portal had its price.
+  portal.setMockStock([
+    { part_no: '71711M79M00', name: 'BUMPER FRONT | MARUTI SWIFT DZIRE', quantity: 4, price: 2100, mrp: 2500, vendor: 'K' },
+    { part_no: '71811M79M00', name: 'BUMPER REAR | MARUTI SWIFT DZIRE', quantity: 2, price: 2300, mrp: 2700, vendor: 'K' },
+  ]);
+  const bumpers20 = [['71711M79M00', 'BUMPER FRONT | MARUTI SWIFT DZIRE'], ['71811M79M00', 'BUMPER REAR | MARUTI SWIFT DZIRE']];
+  portal.searchByName = async (q) => {
+    const s = String(q).toLowerCase();
+    if (!/bumper/.test(s)) return { total: 0, top: [] };
+    const rows = bumpers20.filter(([, n]) => !/front|rear/.test(s) || n.toLowerCase().includes(s.match(/front|rear/)[0]));
+    return { total: rows.length, top: rows.map(([partNo, name]) => ({ partNo, name, available: 3 })) };
+  };
+  const r20d = await rate20('919000000204', 'Maruti Suzuki Swift Dzire ka front bumper kitne ka hai?');
+  check('a spoken part name with its price asked finds the part', r20d.said.includes('71711M79M00'));
+  check('...gives its price', /₹/.test(r20d.said));
+  check('...asks how many, to take the order', /how many|kitne piece/i.test(r20d.said));
+  check('...and asks no one', !r20d.q && !/team/i.test(r20d.said));
+  check('...nothing went into the cart', !orders.findDraft('sim-919000000204'));
+  const r20e = await rate20('919000000205', 'Swift Dzire ka bumper kitne ka hai');
+  check('a name that fits two parts asks which', /front|rear|kaunsa|which/i.test(r20e.said) && !r20e.q);
+  const r20f = await rate20('919000000205', 'front');
+  check('...and the pick is answered with its price', r20f.said.includes('71711M79M00') && /₹/.test(r20f.said));
+  check('...not put in the cart', !orders.findDraft('sim-919000000205'));
   portal.searchByName = realSearch20;
 
   // ---- 21. A salesman ordering FOR a customer ----

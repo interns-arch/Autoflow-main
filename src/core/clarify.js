@@ -95,12 +95,13 @@ function alreadyAsked(chatId, text) {
 
 function ask(chatId, state, question) {
   lastAsked.set(chatId, { text: question.text, at: Date.now() });
-  const { base, qty, ref, key } = state;
+  const { base, qty, ref, key, rate } = state;
   // Keep the facets already answered. Resetting them here made the bot ask
   // "kaunsi gaadi?" a second time after the customer had already said "alto" —
   // the one thing that makes a chatbot feel like a machine.
   const asked = [...new Set([...(state.asked || []), question.facet])];
-  pending.set(chatId, { base, qty: qty || 1, ref: ref || null, key: key || null, asked, at: Date.now() });
+  // `rate`: they asked what it costs, so the answer is a price, not a cart line.
+  pending.set(chatId, { base, qty: qty || 1, ref: ref || null, key: key || null, rate: Boolean(rate), asked, at: Date.now() });
   store.log('clarify', `"${base}" -> asking: ${question.text}`);
 }
 
@@ -194,6 +195,7 @@ function offer(chatId, state, matches) {
     qty: state.qty || 1,
     ref: state.ref || null,
     key: state.key || null,
+    rate: Boolean(state.rate),
     asked: state.asked || [],
     at: Date.now(),
   });
