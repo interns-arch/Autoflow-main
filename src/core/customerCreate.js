@@ -14,9 +14,12 @@
 // The order of the questions follows the paper form, because the sales desk
 // reads them in that order when they check one.
 //
-// No GST lookup: only the SHAPE of a GSTIN is checked here. There is no GST
-// API key, so the number is recorded as given and a person verifies it at
-// approval — the form has always worked that way.
+// The GSTIN is asked FIRST and does most of the typing: the firm's name,
+// registered address, city, state and PIN are public record against it
+// (integrations/gst), so those questions are filled and skipped. A garage
+// owner typing an address on a phone gets it wrong; the GST register does
+// not. A cancelled registration is refused outright — an order billed
+// against a closed GSTIN is a problem nobody wants to find later.
 const store = require('../store');
 const config = require('../config');
 const chatState = require('./chatState');
@@ -45,7 +48,20 @@ const SKIP = /^(skip|nahi|nhi|no|na|-|n\/a|none|baad mein|later)$/i;
 // address to escape. Their cart is untouched — only the form closes.
 const QUIT = /^(cancel|stop|rehne do|rhne do|chhodo|chodo|baad me karenge|baad mein karenge|nahi banana|abhi nahi)$/i;
 
+// GSTIN FIRST, because it answers five of the questions below on its own.
+// A firm's name, registered address, city, state and PIN are public record
+// against its GSTIN, and a garage owner typing them on a phone gets them
+// wrong. Everything the lookup fills is marked `fromGst` so the form skips
+// it, and the customer is shown what was found before it is used.
 const FIELDS = [
+  {
+    key: 'gstNo',
+    req: false,
+    type: 'gst',
+    ask: ['GST number? (nahi hai to "skip")', 'GST number bhej dijiye — baaki details khud bhar jayengi. (nahi hai to "skip")'],
+    check: (v) => (GSTIN_RE.test(v.replace(/\s/g, '')) ? null : 'GST number 15 character ka hota hai, jaise 07AABCU9603R1ZM. Dobara bhejiye ya "skip".'),
+    clean: (v) => v.replace(/\s/g, '').toUpperCase(),
+  },
   {
     key: 'name',
     req: true,
@@ -60,13 +76,6 @@ const FIELDS = [
     key: 'contactPerson',
     req: true,
     ask: ['Contact person ka naam?', 'Contact person ka naam?'],
-  },
-  {
-    key: 'gstNo',
-    req: false,
-    ask: ['GST number? (nahi hai to "skip")', 'GST number? (nahi hai to "skip" likh dijiye)'],
-    check: (v) => (GSTIN_RE.test(v.replace(/\s/g, '')) ? null : 'GST number 15 character ka hota hai, jaise 07AABCU9603R1ZM. Dobara bhejiye ya "skip".'),
-    clean: (v) => v.replace(/\s/g, '').toUpperCase(),
   },
   {
     key: 'panNo',
@@ -198,7 +207,7 @@ function start(chatId, phone, t) {
 // the answer as easily as text.
 //
 // Returns { reply, done, form } — `done` true when every field is in.
-function answer(chatId, m, text, t) {
+async function answer(chatId, m, text, t) {
   const form = pending(chatId);
   if (!form) return null;
   const field = fieldAt(form.idx);
@@ -271,11 +280,73 @@ function answer(chatId, m, text, t) {
     if (problem) return { reply: problem, done: false, form };
   }
   form.answers[field.key] = field.clean ? field.clean(said) : said;
+
+  // THE GSTIN FILLS THE FORM IN. Five questions answered by one.
+  if (field.type === 'gst') return fillFromGst(form, form.answers.gstNo, t);
   return advance(form, t);
+}
+
+async function fillFromGst(form, gstin, t) {
+  const gst = require('../integrations/gst');
+  const firm = await gst.lookup(gstin);
+
+  // Not configured, or the service is down. Not the customer's problem —
+  // ask the questions by hand, exactly as before this existed.
+  if (!firm) return advance(form, t);
+
+  if (firm.error === 'notfound') {
+    delete form.answers.gstNo;
+    return {
+      reply: t(
+        'That GSTIN is not on the GST database. Check it and send again, or "skip".',
+        'Ye GSTIN GST database mein nahi mila. Check karke dobara bhejiye, ya "skip".',
+      ),
+      done: false,
+      form,
+    };
+  }
+  if (firm.error) return advance(form, t);
+
+  // A cancelled registration must not open an account: the order would be
+  // billed against a GSTIN the tax portal has already closed.
+  if (!gst.isLive(firm)) {
+    delete form.answers.gstNo;
+    store.log('create', `${form.chatId}: GSTIN ${gstin} is ${firm.status}, not Active`);
+    return {
+      reply: t(
+        `That GSTIN shows as ${firm.status}, not Active. Send a live one, or "skip" and our team will check.`,
+        `Ye GSTIN ${firm.status} dikha raha hai, Active nahi. Chalu wala bhejiye, ya "skip" kar dijiye — team dekh legi.`,
+      ),
+      done: false,
+      form,
+    };
+  }
+
+  const a = form.answers;
+  a.name = firm.name;
+  a.legalName = firm.legalName;
+  a.address = firm.address;
+  a.city = firm.city;
+  a.state = firm.state;
+  a.pin = firm.pin;
+  if (firm.businessType) a.businessType = firm.businessType;
+  form.fromGst = ['name', 'address', 'city', 'state', 'pin'].filter((k) => a[k]);
+  store.log('create', `${form.chatId}: GSTIN ${gstin} filled ${form.fromGst.length} field(s) — ${firm.name}`);
+
+  const step = advance(form, t);
+  // Say what was found BEFORE the next question, so a wrong GSTIN is caught
+  // by the person who knows, rather than by the approver an hour later.
+  const found = t(`Got it — ${gst.describe(firm)}\n\n`, `Mil gaya — ${gst.describe(firm)}\n\n`);
+  return step.done ? step : { ...step, reply: found + step.reply };
 }
 
 function advance(form, t) {
   form.idx += 1;
+  // Skip anything the GSTIN already answered. Asking a customer to type a
+  // city we just read off the GST register is how a form gets abandoned.
+  while (fieldAt(form.idx) && form.answers[fieldAt(form.idx).key] !== undefined && fieldAt(form.idx).key !== 'remarks') {
+    form.idx += 1;
+  }
   const next = fieldAt(form.idx);
   if (next) {
     open.set(form.chatId, form);

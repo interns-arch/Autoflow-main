@@ -19,6 +19,10 @@ process.env.DEALER_PORTAL_PASSWORD = '';
 // the live API is IP-whitelisted and would fail here for a reason that has
 // nothing to do with the code under test.
 process.env.VAHAN_API_KEY = '';
+// GSTIN lookups are metered (a live key spends a credit per call) and the
+// register is a third party we must not depend on to pass. Blanked here; the
+// prefill path is tested below against a stub instead.
+process.env.GST_API_KEY = '';
 // The house account used to read portal MRP for an unregistered customer.
 // Blanked with the rest of the portal settings: the rate tests below stub
 // Odoo and assert the fallback, and a real value in .env would quietly send
@@ -1871,7 +1875,12 @@ async function main() {
   // produces. It must reach a person, never be read back as though it were real.
   await asVoice('99999X99X99 2 pise');
   check('an unknown part is not read back', !/^(?:right|sahi hai)\?$/im.test(sent(customer)));
-  check('an unknown part reaches a person', /voice note/i.test(sent(customer)));
+  // It reaches a person NAMING the part number, not as an anonymous "voice
+  // note": once the words are read they go down the ordinary text path, and
+  // the helper gets the same question they would from a typed message — with
+  // the recording underneath it, because the number is a machine's guess.
+  check('an unknown part reaches a person', /99999X99X99/.test(sent(customer)));
+  check('...and the recording goes with it', customer.transport.outbox.some((o) => o.audio));
 
   // A no is the case a person most needs to see.
   await asVoice('VN-1001 5 pise');
@@ -1882,10 +1891,27 @@ async function main() {
   check('and the customer is told', /(heard that wrong|galat samjha)/i.test(sent(customer)));
   check('a rejected voice note adds nothing', orders.findDraft(vChat).lines.length === 1);
 
-  // The transcript reaches the helper above the recording.
-  await asVoice('bhai wo kal wala maal kab aayega');
-  check('an unparseable voice note still reaches a person', /voice note/i.test(sent(customer)));
-  check('with the transcript above it', /Heard:/.test(sent(customer)));
+  // ANYTHING ELSE THEY SAID is a message they spoke instead of typing. 21 Sep,
+  // live: "Maruti Suzuki Swift Dzire ka bumper price" was transcribed word for
+  // word and still went to a person, because the only two things a transcript
+  // could do was edit a list or carry a part number. Typed, that sentence gets
+  // an answer; spoken, it must get the same one.
+  customer.transport.outbox.length = 0;
+  await asVoice('mera order ka kya hua');
+  check('a spoken question is answered, not handed over', /(item|confirm)/i.test(sent(customer)));
+  check('...and nobody was asked about it', !/Question \*#/.test(sent(customer)));
+
+  // Only a note we could NOT read goes straight to a person, with the audio.
+  customer.transport.outbox.length = 0;
+  await asVoice(null);
+  check('an unreadable voice note still reaches a person', /voice note/i.test(sent(customer)));
+  check('and the customer is told someone is listening', /(listening|sun kar)/i.test(sent(customer)));
+
+  // A transcript we DID read still reaches the helper above the recording
+  // whenever the text path ends up asking them.
+  customer.transport.outbox.length = 0;
+  await asVoice('88888Y88Y88 chahiye');
+  check('with the transcript above it', /Heard in their voice note:/.test(sent(customer)));
 
   speechMod.transcribe = realTranscribe;
 
@@ -3223,7 +3249,8 @@ async function main() {
     // Waiting for a call-back is how an order dies, so the account is opened
     // here instead: the paper form, asked one question at a time.
     check('a number not on the portal is told why the order cannot go', /regist/i.test(first38));
-    check('...and the form starts there and then', /naam/i.test(first38));
+    // The form now opens on the GSTIN, which answers five of its own questions.
+    check('...and the form starts there and then', /GST/i.test(first38));
     check('...with a form actually open for that chat', Boolean(require('../src/core/customerCreate').pending(C38)));
 
     // Every message now belongs to the form, so there has to be a way out.
@@ -4799,28 +4826,32 @@ async function main() {
 
   cc64.cancel(CH64);
   const open64 = cc64.start(CH64, '917355374975', t64);
-  check('the form opens on the firm name', /naam/i.test(open64) && Boolean(cc64.pending(CH64)));
+  // GSTIN FIRST: it answers five of the questions on its own.
+  check('the form opens on the GST number', /GST/i.test(open64) && Boolean(cc64.pending(CH64)));
 
   const say64 = (txt, extra) => cc64.answer(CH64, extra || {}, txt, t64);
-  check('a malformed GSTIN is refused, not stored', (() => {
-    say64('Sharma Auto Parts'); say64('retailer'); say64('Rakesh Sharma');
-    return /15 character/i.test(say64('12345').reply);
-  })());
-  check('...and a well-formed one is taken', /PAN/i.test(say64('07AABCU9603R1ZM').reply));
-  check('an optional field can be skipped', /email/i.test(say64('skip').reply));
-  check('...but a required one cannot', (() => {
-    say64('skip'); say64('12 MG Road'); say64('Delhi'); say64('Delhi');
-    return /6 digit/i.test(say64('99').reply);
-  })());
-
+  check('a malformed GSTIN is refused, not stored', /15 character/i.test((await say64('12345')).reply));
+  // GST_API_KEY is blank in this suite, so a well-formed one simply moves on
+  // and the fields are asked by hand — the path a customer with no GST takes.
+  check('...and a well-formed one is accepted', /naam/i.test((await say64('07AABCU9603R1ZM')).reply));
+  await say64('Sharma Auto Parts');
+  await say64('retailer');
+  await say64('Rakesh Sharma');
+  check('a bad PAN is refused', /PAN 10 character/i.test((await say64('XX1')).reply));
+  check('an optional field can be skipped', /Email/i.test((await say64('skip')).reply));
+  await say64('skip');
+  await say64('12 MG Road');
+  await say64('Delhi');
+  await say64('Delhi');
+  check('a required field cannot be skipped with a bad value', /6 digit/i.test((await say64('99')).reply));
+  await say64('110070');
   // Typed coordinates are how a shop ends up in the sea.
-  say64('110070');
-  check('typed coordinates are refused — the pin is asked for', /Location attach/i.test(say64('28.6139, 77.2090').reply));
-  check('...and a dropped pin is taken', /photo/i.test(say64('', { location: { lat: 28.61, lng: 77.2 } }).reply));
-  check('a photo is required, words will not do', /Photo bhejiye/i.test(say64('koi photo nahi hai').reply));
+  check('typed coordinates are refused — the pin is asked for', /Location attach/i.test((await say64('28.6139, 77.2090')).reply));
+  check('...and a dropped pin is taken', /photo/i.test((await say64('', { location: { lat: 28.61, lng: 77.2 } })).reply));
+  check('a photo is required, words will not do', /Photo bhejiye/i.test((await say64('koi photo nahi hai')).reply));
 
-  const done64 = say64('', { mediaBase64: 'QUJD', mediaMime: 'image/jpeg' });
-  const final64 = done64.done ? done64 : say64('skip');
+  const done64 = await say64('', { mediaBase64: 'QUJD', mediaMime: 'image/jpeg' });
+  const final64 = done64.done ? done64 : await say64('skip');
   check('the form completes', final64.done === true);
 
   const a64 = final64.form.answers;
@@ -4842,12 +4873,47 @@ async function main() {
   check('a parked request can be found by its id', Boolean(cc64.parked(a64.requestId)));
   check('...and is no longer an open form', cc64.pending(CH64) === null);
 
-  // The portal payload uses the SAME conventions as the email path, so an
-  // account opened from WhatsApp is indistinguishable from one opened from
-  // a form.
   const acct64 = require('../src/core/dataEntryRequests').buildAccount({ ...a64, kind: 'customer' });
   check('the username follows the house rule', acct64.username === 'sharma_auto_parts');
   check('...and the password does too', acct64.password === 'rakesh@123');
+
+  // ---- the GSTIN doing the typing ----
+  // Stubbed, so the suite never spends a metered lookup and never depends
+  // on gstinapi.in being reachable.
+  const gst64 = require('../src/integrations/gst');
+  const lookupWas64 = gst64.lookup;
+  const enabledWas64 = gst64.enabled;
+  try {
+    gst64.enabled = () => true;
+    gst64.lookup = async () => ({
+      gstin: '33AAACC1206D1ZN', name: 'CENTRAL WAREHOUSING CORPORATION', legalName: 'CENTRAL WAREHOUSING CORPORATION',
+      status: 'Active', address: 'No.4, North Avenue, Saidapet', city: 'Chennai', state: 'Tamil Nadu', pin: '600015',
+    });
+    const CH64B = 'sim-create64b';
+    cc64.cancel(CH64B);
+    cc64.start(CH64B, '917355374975', t64);
+    const afterGst = await cc64.answer(CH64B, {}, '33AAACC1206D1ZN', t64);
+    check('the GSTIN fills the firm in and says so', /CENTRAL WAREHOUSING/.test(afterGst.reply));
+    check('...so the firm name is never asked', /naam/i.test(afterGst.reply) === false);
+    const f64b = cc64.pending(CH64B).answers;
+    check('...and address, city, state and PIN come from the register',
+      f64b.city === 'Chennai' && f64b.state === 'Tamil Nadu' && f64b.pin === '600015' && /Saidapet/.test(f64b.address));
+
+    // A cancelled registration must never open an account: the order would
+    // be billed against a GSTIN the tax portal has already closed.
+    gst64.lookup = async () => ({ gstin: 'X', name: 'DEAD FIRM', status: 'Cancelled' });
+    const CH64C = 'sim-create64c';
+    cc64.cancel(CH64C);
+    cc64.start(CH64C, '917355374975', t64);
+    const dead64 = await cc64.answer(CH64C, {}, '33AAACC1206D1ZN', t64);
+    check('a cancelled GSTIN is refused', /Cancelled/i.test(dead64.reply));
+    check('...and is not kept on the form', cc64.pending(CH64C).answers.gstNo === undefined);
+    cc64.cancel(CH64B);
+    cc64.cancel(CH64C);
+  } finally {
+    gst64.lookup = lookupWas64;
+    gst64.enabled = enabledWas64;
+  }
   cc64.unpark(a64.requestId);
   cfg64.approvers = hadAppr64;
 

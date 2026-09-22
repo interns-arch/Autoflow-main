@@ -268,6 +268,16 @@ const config = {
         : process.platform === 'win32',
   },
 
+  // GSTIN -> the firm (integrations/gst, gstinapi.in). Fills in the half of
+  // the customer form nobody should have to type. NOTE the URL has no /api
+  // in it — /api/v1/gstin answers "Route not found" for every key, which
+  // looks exactly like a bad one. Blank key = the form asks by hand.
+  gst: {
+    apiKey: (process.env.GST_API_KEY || '').trim(),
+    url: (process.env.GST_API_URL || 'https://gstinapi.in/v1/gstin').trim(),
+    timeoutMs: parseInt(process.env.GST_TIMEOUT_MS || '15000', 10),
+  },
+
   // NEW CUSTOMER, asked for over WhatsApp.
   //
   // The paper form is "filled by the sales person, goes to Sales Head for

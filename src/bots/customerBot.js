@@ -33,6 +33,7 @@ const lists = require('../core/lists');
 const speech = require('../integrations/speech');
 const profiles = require('../core/profiles');
 const voiceOrder = require('../core/voiceOrder');
+const voiceNote = require('../core/voiceNote');
 const focus = require('../core/focus');
 const vehicle = require('../core/vehicle');
 const vahan = require('../integrations/vahan');
@@ -218,6 +219,12 @@ class CustomerBot {
     // not a Cartrends person talking in a group (pipeline/route).
     if (!route.forBot(m)) return false;
 
+    // Whatever recording the last message left behind is finished with. A
+    // voice note's clip is held only for as long as its own words are being
+    // handled (core/voiceNote), so a question raised two messages later never
+    // arrives with somebody else's audio underneath it.
+    voiceNote.clear(m.chatId);
+
     // Blue-tick their message and show "typing..." straight away, before the
     // portal call, the vision read or anything else that takes a second. The
     // customer sees the same thing they would from a person at the counter:
@@ -264,7 +271,7 @@ class CustomerBot {
     // carries no text so it would fall out of the handler entirely.
     if (customerCreate.pending(m.chatId)) {
       const said = String((m.body || '')).trim();
-      const step = customerCreate.answer(m.chatId, m, said, t);
+      const step = await customerCreate.answer(m.chatId, m, said, t);
       if (step && step.done) return this.finishNewCustomer(m, step.form, reply, t);
       if (step) return reply(step.reply);
     }
