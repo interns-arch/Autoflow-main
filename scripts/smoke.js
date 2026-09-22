@@ -3257,6 +3257,16 @@ async function main() {
     await dm(customer, CUST, 'rehne do');
     check('...that the customer can back out of', require('../src/core/customerCreate').pending(C38) === null);
     check('...and backing out does not touch their list', (orders.findDraft(C38) || { lines: [] }).lines.length > 0);
+
+    // 22 Sep, live: the portal answered HTTP 500 (its connection pool was
+    // exhausted) and EVERY number looked unregistered. Asking a customer who
+    // already has an account for twelve answers - and then failing to create
+    // it, because the same portal is down - is the worst of both.
+    cust38.resolve = async () => ({ found: null });
+    customer.transport.outbox.length = 0;
+    await dm(customer, CUST, 'create customer');
+    check('the portal being down is not treated as "no account"', /respond nahi kar raha|isn.t responding/i.test(lastOut(customer)));
+    check('...so no form is opened we could not finish', require('../src/core/customerCreate').pending(C38) === null);
   } finally {
     cust38.resolve = resolveWas38;
     require('../src/core/customerCreate').cancel(C38);

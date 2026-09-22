@@ -319,6 +319,20 @@ class CustomerBot {
           ),
         );
       }
+      // The portal being down is NOT "no account". 22 Sep, live: the
+      // portal answered HTTP 500 (its connection pool was exhausted) and
+      // every number looked unregistered. Opening a form here would ask a
+      // customer who ALREADY has an account for twelve answers, and the
+      // creation at the end would fail anyway.
+      if (already && already.found === null) {
+        store.log(this.key, `${m.from} asked to open an account but the portal is not answering`);
+        return reply(
+          t(
+            "Our system isn't responding right now — give me a few minutes and ask again.",
+            'System abhi respond nahi kar raha — thodi der baad phir bolieye, turant bana denge.',
+          ),
+        );
+      }
       store.log(this.key, `${m.from} asked to open an account`);
       return reply(customerCreate.start(m.chatId, m.from, t));
     }
