@@ -137,15 +137,36 @@ function addNote(question, answer, source) {
 }
 
 // Best-effort recall of a previously answered question.
+//
+// Same words, in any order, give or take one: "cartrend wiper blade 16
+// number" finds what the helper said about "Cartrend wiper blade 16 no.". A
+// substring was not enough - "wiper" alone would have found every note that
+// mentions a wiper, and answered a question nobody asked.
 function findNote(question) {
   const k = key(question);
   if (k.length < 4) return null;
-  return (
-    bank().notes.find((n) => {
-      const nk = key(n.question);
-      return nk && (nk === k || nk.includes(k) || k.includes(nk));
-    }) || null
-  );
+  const DROP = /^(ka|ki|ke|ko|hai|h|chahiye|chaiye|number|no|pcs|pc|piece|pieces|pise|nos|qty|the|a|of)$/;
+  const words = (s) => new Set(key(s).split(' ').filter((w) => w && !DROP.test(w)));
+  const mine = words(question);
+  if (!mine.size) return null;
+  let best = null;
+  let bestScore = 0;
+  for (const n of bank().notes) {
+    const theirs = words(n.question);
+    if (!theirs.size) continue;
+    let common = 0;
+    for (const w of mine) if (theirs.has(w)) common++;
+    const union = mine.size + theirs.size - common;
+    const score = common / union;
+    // Every word of the shorter one present, and at most one extra word.
+    const ok = common === Math.min(mine.size, theirs.size) && union - common <= 1;
+    if (ok && score > bestScore) {
+      best = n;
+      bestScore = score;
+    }
+  }
+  // Latest wins among equals: bank().notes is in the order they were taught.
+  return best;
 }
 
 function all() {

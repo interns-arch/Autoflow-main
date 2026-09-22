@@ -120,10 +120,15 @@ function looksLikeListEdit(text) {
   // A real part number in the message means it is a part order, not a line
   // reference, whatever else it says.
   if (/\b(?=[A-Za-z0-9-]*[A-Za-z])(?=[A-Za-z0-9-]*\d)[A-Za-z0-9][A-Za-z0-9-]{5,}\b/.test(t)) return false;
+  // "9no" / "4th. No." names a LINE only with an ordinal or the word "item"
+  // beside it. On its own it is part of a part's name: "cartrend wiper blade
+  // 16 number 10 pcs" is a 16-inch blade (22 Sep, live), and was answered
+  // "Which item?" as if it were an edit to a list that did not exist.
   return (
     BULK.test(t) ||
     /\b(?:leave|remove|delete|hata\s*do|hatao|nikal\s*do)\b/i.test(t) ||
-    /\d\s*(?:st|nd|rd|th)?\s*\.?\s*(?:no|number)\b/i.test(t)
+    /\d\s*(?:st|nd|rd|th)\s*\.?\s*(?:no|number)\b/i.test(t) ||
+    (/\d\s*\.?\s*(?:no|number)\b/i.test(t) && /\bitem\b/i.test(t))
   );
 }
 

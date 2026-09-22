@@ -356,7 +356,11 @@ class CloudTransport {
               (value.metadata && value.metadata.group_id) ||
               null;
             const isGroup = Boolean(groupId);
+            // The name on their WhatsApp profile. Meta sends it beside the
+            // message; the helper asked about a part needs to know WHO is asking.
+            const contact = (value.contacts || []).find((c) => c && c.wa_id === msg.from) || (value.contacts || [])[0];
             const m = {
+              profileName: (contact && contact.profile && contact.profile.name) || '',
               from: store.normPhone(msg.from),
               chatId: isGroup ? String(groupId) : store.normPhone(msg.from) + '@cloud',
               chatName: (msg.group && msg.group.subject) || '',

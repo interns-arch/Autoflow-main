@@ -1875,11 +1875,10 @@ async function main() {
   // produces. It must reach a person, never be read back as though it were real.
   await asVoice('99999X99X99 2 pise');
   check('an unknown part is not read back', !/^(?:right|sahi hai)\?$/im.test(sent(customer)));
-  // Once the words are read they go down the ordinary text path, so a part
-  // number the portal has no match for is answered as a typed one is: not
-  // available, and nobody is asked (founder, 22 Sep).
-  check('an unknown part number is said to be unavailable', /99999X99X99 available nahi hai|99999X99X99 is not available/i.test(sent(customer)));
-  check('...and nobody is asked about it', !/Question \*#/.test(sent(customer)));
+  // It reaches a person NAMING the part number, with the recording under it,
+  // because the number is a machine's guess.
+  check('an unknown part reaches a person', /Question \*#[\s\S]*99999X99X99/.test(sent(customer)));
+  check('...and the recording goes with it', customer.transport.outbox.some((o) => o.audio));
 
   // A no is the case a person most needs to see.
   await asVoice('VN-1001 5 pise');
@@ -2304,9 +2303,13 @@ async function main() {
     return { total: rows.length, top: rows.map(([partNo, name, available]) => ({ partNo, name, available })) };
   };
   const near20 = await rate20('919000000210', '16510M65L10 2 pcs\n71761m67LA0 4 pcs\n71791m85S00 4 pcs\n71799Z99Z99 2 pcs');
-  const asked20 = customer.transport.outbox.filter((o) => o.to === config.escalationNumber && /Question \*#/.test(o.text || '')).map((o) => o.text).join('\n');
-  check('close matches are offered, not sent to a person', !/71761m67LA0|71791m85S00/i.test(asked20) && /71761M67LA05PK/.test(near20.said) && /\(1\/2\)/.test(near20.said));
-  check('...a number with no match is not available, and nobody is asked', !/71799Z99Z99/.test(asked20) && /Sorry, 71799Z99Z99 is not available/i.test(near20.said));
+  const asks20 = customer.transport.outbox.filter((o) => o.to === config.escalationNumber && /Question \*#/.test(o.text || ''));
+  const asked20 = asks20.map((o) => o.text).join('\n');
+  check('close matches are offered, not sent to a person', asks20.length === 1 && /71761M67LA05PK/.test(near20.said) && /\(1\/2\)/.test(near20.said));
+  // A number with NO match goes to a person - with who is asking and the
+  // whole list it came in - and the customer hears it is being checked.
+  check('...a number with no match goes to a person', /71799Z99Z99/.test(asked20) && /Checking 71799Z99Z99|71799Z99Z99 check kar raha/i.test(near20.said));
+  check('...who sees the customer\'s name and the whole list', /Mock Customer/.test(asked20) && /_Their message:_[\s\S]*71761m67LA0 4 pcs/.test(asked20));
   check('...and the part that WAS found is already in the order', (orders.findDraft('sim-919000000210') || { lines: [] }).lines.length === 1);
   const near20b = await rate20('919000000210', 'haan');
   check('"haan" adds the close match with the quantity asked', (orders.findDraft('sim-919000000210').lines.find((l) => /71761M67LA05PK/.test(l.partNo || l.item)) || {}).qty === 4);
@@ -2317,6 +2320,30 @@ async function main() {
   check('...with the refused part left out', !orders.findDraft('sim-919000000210').lines.some((l) => /71791M85S0/.test(l.partNo || l.item)));
   check('a pack part says so in the question', /71761M67LA05PK\* \(5 ka pack\)|71761M67LA05PK\* \(pack of 5\)/.test(near20.said) && /4 pcs/.test(near20.said));
   orders.clearDraft && orders.clearDraft('sim-919000000210');
+
+  // The founder's example, 22 Sep: "cartrend wiper blade 16 number 10 pcs"
+  // is not on the portal. It goes to the helper with who is asking and what
+  // they sent; the helper's words go to the customer AND are kept, so the next
+  // customer asking the same thing gets them without anyone being asked.
+  {
+    const k20 = require('../src/core/knowledge');
+    customer.transport.outbox.length = 0;
+    await dm(customer, '919000000292', 'cartrend wiper blade 16 number 10 pcs');
+    const wq = customer.transport.outbox.find((o) => o.to === config.escalationNumber && /Question \*#/.test(o.text || '') && /wiper/i.test(o.text || ''));
+    check('a part the portal does not have goes to the helper, with who is asking', Boolean(wq) && /Mock Customer/.test(wq.text));
+    customer.transport.outbox.length = 0;
+    await customer.transport.injectIncoming({
+      from: config.escalationNumber, chatId: 'sim-' + config.escalationNumber, isGroup: false,
+      body: 'Cartrend wiper 16 inch abhi stock mein nahi hai, 2 din mein aayega', contextId: wq && wq.id, mediaType: 'chat',
+    });
+    check('...the helper\'s words reach the customer', customer.transport.outbox.some((o) => String(o.to).indexOf('919000000292') >= 0 && /2 din mein aayega/.test(o.text || '')));
+    check('...and are learned', Boolean(k20.findNote('cartrend wiper blade 16 number')));
+    customer.transport.outbox.length = 0;
+    await dm(customer, '919000000293', 'Cartrend wiper blade 16 number 5 pcs');
+    check('the next customer asking the same gets that answer', customer.transport.outbox.some((o) => String(o.to).indexOf('919000000293') >= 0 && /2 din mein aayega/.test(o.text || '')));
+    check('...and nobody is asked again', !customer.transport.outbox.some((o) => o.to === config.escalationNumber && /Question \*#/.test(o.text || '')));
+    check('a learned answer is not given to a different question', !k20.findNote('wiper') && !k20.findNote('cartrend wiper blade 18 number'));
+  }
 
   // "2 box" is two boxes, whatever each holds; "4 pcs" is four pieces.
   const box20 = await rate20('919000000291', '71791m85S00 2 box');
@@ -4629,7 +4656,7 @@ async function main() {
     const inq57 = await customer.answerInquiry(['71771M76T10', '71721M74T00'], { chatId: 'sim-919000000359', from: '919000000359' });
     check('no "will get back to you" for a part nobody is asked about', !/get back to you|confirm karke batata/i.test(inq57));
     check('the unknown part names the closest one, with its stock', /71771M76T10 - (not on the portal; closest|portal pe nahi mila; milta-julta): 71771M76T10ZSC \((available|only \d+ available|sirf \d+ available)\)/.test(inq57));
-    check('an unknown part with nothing close says to check the number', /71721M74T00 - (not on the portal|portal pe nahi mila)/.test(inq57));
+    check('an unknown part with nothing close goes to the team', /71721M74T00 - (checking with the team|team se check karke batata hoon)/.test(inq57));
   } finally {
     portal.searchByName = searchWas57;
   }

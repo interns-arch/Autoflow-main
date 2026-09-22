@@ -2688,13 +2688,11 @@ class CustomerBot {
     const notFound = resolved.filter((l) => l.source === 'unidentified' && (digitsOnly(l) || desk));
     let unknown = resolved.filter((l) => l.source === 'unidentified' && !digitsOnly(l) && !desk);
 
-    // A CUSTOMER'S part number the portal does not know. Nobody is asked:
-    // look for the close match - usually the same number with "5PK" on the
-    // end - and offer it, one line at a time, for a yes or a no. A number with
-    // no match at all is simply not available (founder, 22 Sep: eighteen
-    // "abhi confirm nahi ho paya" for one list was the alternative). Only a
-    // line with no part number in it at all - nothing to say "not available"
-    // about - still goes to a person.
+    // A CUSTOMER'S part number the portal does not know. First the close
+    // match - usually the same number with "5PK" on the end - offered one
+    // line at a time for a yes or a no. A number with NO match goes to a
+    // person with the rest of the list, and their answer is learned
+    // (founder, 22 Sep).
     const nearQueue = [];
     const noMatch = [];
     if (unknown.length && !this.inquiryOnly(m.from, m.chatId)) {
@@ -2709,7 +2707,25 @@ class CustomerBot {
         if (c) nearQueue.push({ asked, qty: u.qtyMissing ? 1 : u.qty || 1, unit: unitFor(m.body, asked), ref: u.ref || null, key: u.key || null, partNo: c.partNo, name: c.name, available: c.available });
         else noMatch.push(asked);
       }
-      unknown = unknown.filter((u) => !isNumber(u));
+      unknown = unknown.filter((u) => !isNumber(u) || noMatch.includes(u.requested || u.partNo || u.item));
+      noMatch.length = 0;
+    }
+    // Who is asking, and everything they sent, for the person being asked.
+    const askWith = {
+      customerName: (ctx && ctx.name) || m.profileName || m.chatName || null,
+      context: m.body || null,
+      ...(m.mediaBase64 && /^image\//.test(m.mediaMime || '') ? { photo: { base64: m.mediaBase64, mime: m.mediaMime } } : {}),
+    };
+    // Asked and answered before, in words: say that again, ask nobody.
+    const taughtNow = [];
+    unknown = unknown.filter((u) => {
+      const n = knowledge.findNote(u.requested || u.item);
+      if (n) taughtNow.push(`${u.requested || u.item}: ${n.answer}`);
+      return !n;
+    });
+    if (taughtNow.length) {
+      store.log(this.key, `${taughtNow.length} line(s) answered from what a person said before`);
+      await reply(taughtNow.join('\n\n'));
     }
     for (const u of unknown) {
       await escalation.create(this, {
@@ -2724,6 +2740,7 @@ class CustomerBot {
         reason: u.partNo ? 'NOT_IN_CATALOGUE' : 'NO_PART_NUMBER',
         qty: u.qty,
         kind: 'order',
+        ...askWith,
       });
     }
 
@@ -3029,10 +3046,44 @@ class CustomerBot {
       const ctx = m ? route.onBehalfOf(m) : null;
       near = await this.nearParts(unknown.map((l) => l.requested || l.item), { ctx: ctx || null, t });
     }
+    // Anything else the portal could not place - a part number with no close
+    // match, or a part described in words ("cartrend wiper blade 16 number")
+    // - goes to a person, with who is asking and everything they sent. What
+    // that person said before about the same thing is answered straight away
+    // (founder, 22 Sep). A customer on the sales desk is never sent there.
+    const ask = [];
+    const taught = new Map();
+    if (m && !salesOrder.isSalesPerson(m.from)) {
+      for (const l of resolved) {
+        if (l.source !== 'unidentified') continue;
+        const asked = l.requested || l.item;
+        if (unknown.includes(l) && near.get(asked)) continue;
+        const n = knowledge.findNote(asked);
+        if (n) taught.set(l, n.answer);
+        else ask.push(l);
+      }
+      const onBehalf = route.onBehalfOf(m);
+      const who = onBehalf || (await customers.resolve(m.from).catch(() => null));
+      for (const l of ask) {
+        await escalation.create(this, {
+          chatId: m.chatId,
+          customerPhone: m.from,
+          item: l.requested || l.item,
+          partNo: ai.partNumberIn(String(l.requested || l.item || '')) || null,
+          reason: ai.partNumberIn(String(l.requested || l.item || '')) ? 'NOT_IN_CATALOGUE' : 'NO_PART_NUMBER',
+          qty: l.qty || 1,
+          kind: 'inquiry',
+          customerName: (who && who.name) || m.profileName || m.chatName || null,
+          context: m.body || null,
+        });
+      }
+    }
     const shown = resolved
       .map((l) => {
-        if (!unknown.includes(l)) return availability.describe(l, m && m.chatId);
         const asked = l.requested || l.item;
+        if (taught.has(l)) return `${asked} - ${taught.get(l)}`;
+        if (ask.includes(l)) return t(`${asked} - checking with the team, will confirm shortly`, `${asked} - team se check karke batata hoon`);
+        if (!unknown.includes(l)) return availability.describe(l, m && m.chatId);
         const close = near.get(asked);
         return close
           ? t(`${asked} - not on the portal; closest: ${close.join(', ')}`, `${asked} - portal pe nahi mila; milta-julta: ${close.join(', ')}`)

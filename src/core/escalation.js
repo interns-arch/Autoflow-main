@@ -197,7 +197,14 @@ function composeAsk(e) {
 
 function composeAskBody(e) {
   const qty = e.qty && e.qty > 1 ? `  (qty ${e.qty})` : '';
-  const head = `Question *#${e.id}* — ${prettyPhone(e.customerPhone)}\n_customer's inquiry_`;
+  // WHO is asking, and the whole message it came from. A part a helper has to
+  // identify is identified from its neighbours - the other lines of the list
+  // say which car, which brand - and a name says whether this is a regular.
+  const who = e.customerName ? `${e.customerName} (${prettyPhone(e.customerPhone)})` : prettyPhone(e.customerPhone);
+  const whole = e.context && String(e.context).trim() && String(e.context).trim() !== String(e.item || '').trim()
+    ? `\n\n_Their message:_\n${String(e.context).trim().slice(0, 700)}`
+    : '';
+  const head = `Question *#${e.id}* — ${who}\n_customer's inquiry_${whole}`;
 
   // Show the customer's own words ONLY when they differ from what the bot
   // extracted. Repeating an identical line twice reads as a mistake, and the
@@ -314,7 +321,7 @@ function candidatesFor(item) {
 
 async function create(
   customerBot,
-  { chatId, item, qty, kind, partNo, reason, customerPhone, photo, audio, docName, about, transcript },
+  { chatId, item, qty, kind, partNo, reason, customerPhone, photo, audio, docName, about, transcript, customerName, context },
 ) {
   // The gate chain handed this to a person - noted for the shadow log only.
   require('../pipeline/shadow').noteHandoff(reason);
@@ -351,6 +358,19 @@ async function create(
     return null;
   }
 
+  // Answered before in WORDS ("ye brand hum nahi rakhte", "16 inch wala
+  // kal aayega"): the customer gets the same answer, and nobody is asked.
+  const taught = teachable ? knowledge.findNote(item) : null;
+  if (taught) {
+    store.log('escalate', `"${item}" answered before (${taught.id}) - sent that, no human needed`);
+    try {
+      await customerBot.transport.sendToChat(chatId, `${item}: ${taught.answer}`);
+    } catch (err) {
+      store.log('escalate', 'could not send the learned answer: ' + String((err && err.message) || err).slice(0, 80));
+    }
+    return { fromNote: true, note: taught };
+  }
+
   // Questions now outlive their timeout so a late answer is still learned, so
   // something has to retire them eventually. A day is far longer than any
   // helper takes, and keeps the map from growing for the life of the process.
@@ -375,6 +395,8 @@ async function create(
     // gets asked. Defaults to the commonest case.
     reason: reason || (partNo ? 'NOT_IN_CATALOGUE' : 'NO_PART_NUMBER'),
     customerPhone: customerPhone || String(chatId || '').replace(/@.*$/, ''),
+    customerName: customerName || null,
+    context: context || null,
     // The customer's own photo, when the question IS the photo. Nobody can
     // name a part from the words "label photo".
     photo: photo || null,
@@ -578,6 +600,12 @@ function asksOnlyFor(e) {
 async function relayWords(e, id, words) {
   await e.customerBot.transport.sendToChat(e.chatId, words);
   store.log('escalate', '#' + id + ' helper wrote back in words (' + e.reason + ') - relayed as written');
+  // And KEPT, when it was about a part: the next customer asking the same
+  // thing gets the same answer without anyone being asked (founder, 22 Sep:
+  // "what prateek sir reply is learn by bot for future").
+  if (['NOT_IN_CATALOGUE', 'NO_PART_NUMBER'].includes(e.reason) && e.item) {
+    knowledge.addNote(e.item, words, 'helper');
+  }
   await ack(e, '✅ *#' + id + ' sent* to ' + prettyPhone(e.customerPhone) + ' as written.' + waitingLine());
 }
 
