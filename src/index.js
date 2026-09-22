@@ -67,6 +67,15 @@ async function main() {
 
   require('./wa/relayPoller').start(bots); // Cloud API incoming via Render relay
 
+  // Every GSTIN the portal already holds, pulled in the background. There
+  // is no "is this GSTIN taken" route — the only way to know is the full
+  // customer list, which is 7551 rows and 84 SECONDS. Warmed here so the
+  // first customer who types a GSTIN is not the one who finds that out.
+  // Nothing waits on it: until it lands, a duplicate check says so.
+  require('./integrations/dealerPortal')
+    .warmGstIndex()
+    .catch(() => {});
+
   store.log('boot', 'ready. Console: http://localhost:' + config.consolePort);
 }
 

@@ -371,6 +371,73 @@ async function apiPdf(urlPath, retry = true, as = 'sales') {
 // end to end offline.
 const mockOrderLines = new Map();
 let mockCredit = null;
+// Rows the duplicate check pretends the portal already holds, for tests.
+let mockDuplicates = [];
+
+// EVERY GSTIN THE PORTAL ALREADY HOLDS, kept in memory.
+//
+// There is no "is this GSTIN taken" route. The only way to know is
+// /users/customers/list, which on 22 Sep returned 7551 rows and 3.2 MB in
+// 84 seconds. Nobody waits 84 seconds in the middle of a WhatsApp form, so
+// the list is pulled in the background and answered from memory.
+//
+// Deliberately NOT persisted: a stale file read at boot would answer a
+// duplicate question with yesterday's truth and we would never know which.
+// A restart simply rebuilds it, and until it is built the answer is
+// "could not check", which is the honest one.
+const GST_INDEX_TTL_MS = 6 * 60 * 60 * 1000;
+const gstIndex = {
+  map: null, // GSTIN -> customer name
+  at: 0,
+  building: null,
+
+  // The index if it is fresh, else null. Never blocks.
+  ready() {
+    if (this.map && Date.now() - this.at < GST_INDEX_TTL_MS) return this.map;
+    return null;
+  },
+
+  // Kick off a rebuild. Returns the promise so a caller that CAN wait
+  // (the boot warm-up) may; callers inside a conversation must not.
+  refresh() {
+    if (this.building) return this.building;
+    this.building = (async () => {
+      const t0 = Date.now();
+      try {
+        const data = await api('GET', '/users/customers/list', null, true, 'sales', 180000);
+        const rows = Array.isArray(data) ? data : (data && (data.items || data.data || data.results)) || [];
+        const map = new Map();
+        for (const r of rows) {
+          const g = String((r && r.gst_no) || '').trim().toUpperCase();
+          if (g && g !== 'NULL') map.set(g, r.name || null);
+        }
+        this.map = map;
+        this.at = Date.now();
+        store.log('portal', `GSTIN index built: ${map.size} GSTIN(s) from ${rows.length} customer(s) in ${((Date.now() - t0) / 1000).toFixed(0)}s`);
+        return map;
+      } catch (e) {
+        store.log('portal', 'GSTIN index build failed: ' + String((e && e.message) || e).slice(0, 120));
+        return null;
+      } finally {
+        this.building = null;
+      }
+    })();
+    return this.building;
+  },
+};
+
+// The portal has no box for the contact person's phone, and a number the
+// customer was asked for must not be thrown away. Anything else the form
+// collected that the schema cannot hold joins it here.
+function remarksWith(fields) {
+  const bits = [];
+  if (fields.remarks) bits.push(String(fields.remarks));
+  if (fields.contactPhone && String(fields.contactPhone) !== String(fields.phone)) {
+    bits.push('Contact phone: ' + fields.contactPhone);
+  }
+  if (fields.gstVerified === false) bits.push('GST NOT verified' + (fields.gstWaiver ? ' (waived on ' + fields.gstWaiver + ')' : ''));
+  return bits.join(' | ') || null;
+}
 let mockHistory = null;
 // tests: { track: {id: obj}, dispatches: [], invoiceStatus: {id: obj}, challans: {id: true}, shortages: [], partStatus: {part: obj}, incoming: [] }
 let mockLookups = {};
@@ -753,6 +820,11 @@ module.exports = {
   },
   setMockStock,
   setMockCustomers,
+  _setMockDuplicates: (rows) => { mockDuplicates = rows || []; },
+  // Pulled at boot so the first customer who types a GSTIN is not the
+  // one who finds out it takes 84 seconds.
+  warmGstIndex: () => (isMock() ? Promise.resolve(null) : gstIndex.refresh()),
+  _setGstIndex: (pairs) => { gstIndex.map = new Map(pairs || []); gstIndex.at = Date.now(); },
   _setMockOrderLines: (id, lines) => mockOrderLines.set(String(id), lines),
   _setMockCredit: (v) => { mockCredit = v; },
   _setMockOrderHistory: (v) => { mockHistory = v; },
@@ -797,9 +869,37 @@ module.exports = {
       // the wrong role. Sent explicitly.
       ...(fields.userType ? { user_type: fields.userType } : {}),
       ...(fields.alsoVendor ? { also_add_as_vendor: true } : {}),
+      // WHO opened this account. Anik, 12 Sep, about sales orders: "baad
+      // mein main dekh paun kis agent ne kitna kiya" — the same question
+      // gets asked about accounts, and an account opened by an agent is
+      // that agent's. A customer who registered themselves has no agent,
+      // and the field is left off rather than filled with their own name.
+      // FIELD NAMES ARE THE PORTAL'S, checked against its own OpenAPI
+      // schema (CustomerCreateSchema) on 22 Sep — not guessed. Several of
+      // the obvious spellings are wrong there: it is state_name not state,
+      // pin_code not pincode, primary_contact_person not contact_person,
+      // and destination_latitude not latitude.
+      ...(fields.createdByName ? { sales_representative_name: fields.createdByName } : {}),
+      ...(fields.createdByEmail ? { sales_representative_email: fields.createdByEmail } : {}),
+      ...(fields.contactPerson ? { primary_contact_person: fields.contactPerson } : {}),
+      ...(fields.businessType ? { business_type: fields.businessType } : {}),
+      ...(fields.city ? { city: fields.city } : {}),
+      ...(fields.state ? { state_name: fields.state } : {}),
+      ...(fields.pin ? { pin_code: fields.pin } : {}),
+      ...(fields.panNo ? { pan_no: fields.panNo } : {}),
+      ...(fields.lat != null ? { destination_latitude: fields.lat, destination_longitude: fields.lng } : {}),
+      // The schema has NO field for the contact person's phone. Rather
+      // than drop a number the customer was asked for, it rides along in
+      // remarks, which is where the data team looks for anything the form
+      // had no box for.
+      ...(remarksWith(fields) ? { remarks: remarksWith(fields) } : {}),
     };
-    // dealer_type only exists on the approval-request schema, not the direct one.
-    if (asApprovalRequest && fields.businessType) body.dealer_type = fields.businessType;
+    // The two schemas spell the same thing differently: the direct create
+    // takes business_type (set above), the approval-request one dealer_type.
+    if (asApprovalRequest && fields.businessType) {
+      delete body.business_type;
+      body.dealer_type = fields.businessType;
+    }
 
     const path = asApprovalRequest
       ? '/finance/approval-requests/customer-creation'
@@ -867,24 +967,51 @@ module.exports = {
     const words = q.split(/\s+/).filter(Boolean);
     try {
       // The portal matches the phrase literally, and part names are written
-      // "BRAKE PAD | MAHINDRA SCORPIO | FRONT" — so "brake pad scorpio front"
-      // finds nothing. Search on the leading words the catalogue actually
-      // contains, then narrow on the rest here.
+      // "BRAKE PAD | MAHINDRA SCORPIO | FRONT" — the PART first, the car after.
+      // So the words to search on are the part words, and everything else is a
+      // filter applied here.
+      //
+      // Trying only leading words assumed the customer writes the part first
+      // ("brake pad scorpio front"), which is how people TYPE. It is not how
+      // they SPEAK: "Maruti Suzuki ka bumper chahiye" led with the car, so the
+      // search ran on "maruti", matched half the catalogue, and the customer
+      // was told to send a part number for a part they had just named
+      // (21 Sep, live — three voice notes about a Swift bumper in one chat).
+      const partish = require('../core/partish');
+      const partWords = words.filter((w) => !partish.isCarWord(w));
+
+      // In order: the phrase as they said it; the part words alone; then the
+      // leading words, shortest last — the old behaviour, still the right
+      // answer for "brake pad front" where nothing is a car word.
+      const tries = [words];
+      if (partWords.length && partWords.length !== words.length) tries.push(partWords);
+      for (let n = words.length - 1; n >= 1; n--) tries.push(words.slice(0, n));
+
       let rows = [];
-      let used = words.length;
-      for (let n = words.length; n >= 1 && !rows.length; n--) {
-        const data = await api('GET', `/search?q=${encodeURIComponent(words.slice(0, n).join(' '))}`);
+      let used = words;
+      const asked = new Set();
+      for (const cand of tries) {
+        const phrase = cand.join(' ');
+        if (!phrase || asked.has(phrase.toLowerCase())) continue;
+        asked.add(phrase.toLowerCase());
+        const data = await api('GET', `/search?q=${encodeURIComponent(phrase)}`);
         rows = Array.isArray(data.results) ? data.results : [];
-        used = n;
+        if (rows.length) {
+          used = cand;
+          break;
+        }
       }
-      // Words the customer gave that were not part of the search go here as a
-      // filter: "scorpio", "front", "rear", a model name.
-      const extra = words.slice(used).map((w) => w.toLowerCase());
-      if (extra.length) {
-        const narrowed = rows.filter((r) => {
-          const hay = String(r.partName || '').toLowerCase();
-          return extra.every((w) => hay.includes(w));
-        });
+
+      // Words the customer gave that were not part of the search: "scorpio",
+      // "front", "rear", a model name. Applied ONE AT A TIME and kept only
+      // when the catalogue actually knows the word — a customer saying
+      // "Maruti Suzuki Swift" against names written "MARUTI SWIFT" would
+      // otherwise have the whole narrowing thrown away over "suzuki", and get
+      // every bumper we sell instead of the Swift ones.
+      const inUse = new Set(used.map((w) => w.toLowerCase()));
+      const extra = words.map((w) => w.toLowerCase()).filter((w) => !inUse.has(w));
+      for (const w of extra) {
+        const narrowed = rows.filter((r) => String(r.partName || '').toLowerCase().includes(w));
         if (narrowed.length) rows = narrowed;
       }
       const out = rows.map((r) => {
@@ -1143,6 +1270,72 @@ module.exports = {
     const data = await api('DELETE', '/orders/' + id);
     store.log('portal', 'order ' + id + ' cancelled');
     return { ok: true, raw: data };
+  },
+
+
+  // ALREADY ON THE PORTAL?
+  //
+  // The portal will not hold the same GSTIN or mobile twice, and it says so
+  // by refusing the create — AFTER a customer has answered every question
+  // and a Sales Head has approved it. Asking here turns a dead end into
+  // "wo number pehle se hai, doosra bhejiye".
+  //
+  // WHAT CAN ACTUALLY BE CHECKED, from the portal's own OpenAPI schema
+  // (read 22 Sep, 504 routes):
+  //   mobile -> /users/customer/mobile, one fast call. Authoritative.
+  //   GSTIN  -> only by pulling /users/customers/list, which is 7551 rows,
+  //             3.2 MB and 84 SECONDS. Far too slow to do inside a form, so
+  //             it is cached (see gstIndex) and refreshed in the background.
+  //   email  -> NOT POSSIBLE. No route takes it and the list does not carry
+  //             it. Reported as unchecked rather than quietly passed.
+  //
+  // Returns { dup, field, name, unchecked: [...] } where dup is true, false
+  // or null. NULL MEANS NOBODY LOOKED — never "no duplicate".
+  async findDuplicate({ phone, gstNo, email } = {}) {
+    if (isMock()) {
+      const hit = mockDuplicates.find(
+        (d) =>
+          (phone && d.phone === String(phone)) ||
+          (gstNo && String(d.gstNo || '').toUpperCase() === String(gstNo).toUpperCase()),
+      );
+      if (hit) {
+        const field = hit.phone === String(phone) ? 'phone' : 'gstNo';
+        return { dup: true, field, name: hit.name || null, unchecked: email ? ['email'] : [] };
+      }
+      return { dup: false, unchecked: email ? ['email'] : [] };
+    }
+
+    const unchecked = [];
+    // Email has nowhere to be looked up. Said out loud so no caller can
+    // read a clean result as "this email is free".
+    if (email) unchecked.push('email');
+
+    if (phone) {
+      try {
+        const data = await api('GET', `/users/customer/mobile?mobileno=${encodeURIComponent(phone)}`);
+        if (data) return { dup: true, field: 'phone', name: data.name || null, unchecked };
+      } catch (e) {
+        if (e.status !== 404) {
+          store.log('portal', 'duplicate check (phone) failed: ' + String(e.message || e).slice(0, 100));
+          return { dup: null, field: 'phone', unchecked };
+        }
+      }
+    }
+
+    if (gstNo) {
+      const idx = gstIndex.ready();
+      if (!idx) {
+        // The index is being built, or the last build failed. A customer
+        // must not wait 84 s for it, so this is honestly unknown.
+        gstIndex.refresh();
+        unchecked.push('gstNo');
+      } else {
+        const hit = idx.get(String(gstNo).toUpperCase());
+        if (hit) return { dup: true, field: 'gstNo', name: hit, unchecked };
+      }
+    }
+
+    return { dup: false, unchecked };
   },
 
   async lookupCustomer(mobile) {

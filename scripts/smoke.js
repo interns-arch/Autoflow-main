@@ -1913,6 +1913,53 @@ async function main() {
   await asVoice('88888Y88Y88 chahiye');
   check('with the transcript above it', /Heard in their voice note:/.test(sent(customer)));
 
+  // A PART NAMED IN WORDS, spoken. 21 Sep, live: "Maruti Suzuki Swift Dzire ka
+  // bumper price" was transcribed word for word, and the customer was told
+  // "check karke batata hoon" — no part number, no stock, and nobody checking.
+  // The portal's analyze only understands part NUMBERS, so an inquiry by name
+  // has to go through the catalogue search first, exactly as an order line
+  // does. The mock portal does not search, so it is stubbed here.
+  const realSearch = portal.searchByName;
+  portal.searchByName = async (q) => {
+    const rows = [
+      { partNo: '71711M74L00', name: 'BUMPER FRONT | MARUTI SWIFT', available: 4, price: 3150, dealers: [] },
+      { partNo: '71811M74L00', name: 'BUMPER REAR | MARUTI SWIFT', available: 2, price: 2990, dealers: [] },
+    ].filter((r) => {
+      const words = String(q).toLowerCase().split(/\s+/).filter((w) => /^(front|rear)$/.test(w));
+      return words.every((w) => r.name.toLowerCase().includes(w));
+    });
+    return { total: rows.length, top: rows };
+  };
+
+  const VNAME = '919000000023';
+  const nChat = 'sim-' + VNAME;
+  customer.transport.outbox.length = 0;
+  heardNext = 'Maruti Suzuki Swift ka bumper chahiye';
+  await customer.transport.injectIncoming({
+    from: VNAME, chatId: nChat, isGroup: false, body: '',
+    mediaType: 'ptt', mediaBase64: 'AAAA', mediaMime: 'audio/ogg',
+  });
+  check('a part named in a voice note is searched in the catalogue', /71711M74L00/.test(sent(customer)));
+  check('...and nobody is asked about it', !/Question \*#/.test(sent(customer)));
+
+  // The list ends in "Kaunsa chahiye?" — so the answer to it has to work.
+  // Showing options used to keep no state, and "front" came back as "no order
+  // pending", which ends the sale on the message after the bot got it right.
+  customer.transport.outbox.length = 0;
+  await dm(customer, VNAME, 'front');
+  check('and their answer to it picks the part', /71711M74L00/.test(sent(customer)));
+  check('...not the other one', !/71811M74L00/.test(sent(customer)));
+  portal.searchByName = realSearch;
+
+  // The catalogue is searched on the PART words, with the car words used to
+  // narrow — part names read "BUMPER FRONT | MARUTI SWIFT". Searching on the
+  // leading words assumed the part comes first, which is how people type and
+  // not how they speak ("Maruti Suzuki ka bumper chahiye").
+  const partish = require('../src/core/partish');
+  check('a maker is a car word', partish.isCarWord('maruti') && partish.isCarWord('suzuki'));
+  check('...so is a model', partish.isCarWord('swift') && partish.isCarWord('baleno'));
+  check('...and a part is not', !partish.isCarWord('bumper') && !partish.isCarWord('brake'));
+
   speechMod.transcribe = realTranscribe;
 
 
@@ -4874,14 +4921,25 @@ async function main() {
 
     check('the first question asked is the one GST cannot answer', /Business type/i.test(cc64.FIELDS[cc64.pending(CH64).idx].ask[1]));
     await say64('retailer');
-    await say64('Rakesh Sharma');
-    check('an optional field can be skipped', /Location/i.test((await say64('skip')).reply)); // email
+    check('the contact person is followed by their phone', /phone number/i.test((await say64('Rakesh Sharma')).reply));
+    check('...which must be a real mobile', /mobile number nahi/i.test((await say64('12').reply || '')) || /mobile number nahi/i.test((await say64('12')).reply));
+    // "same" is the common case: the owner is the contact.
+    check('..."same" means the number they are writing from', /[Ee]mail/.test((await say64('same')).reply)
+      && cc64.pending(CH64).answers.contactPhone === '917355374975');
+    // The email is NOT optional any more: every invoice goes to it.
+    check('the email cannot be skipped', /Email/i.test((await say64('skip')).reply));
+    check('...and must look like one', /theek nahi/i.test((await say64('rakesh at gmail')).reply));
+    check('...and is lower-cased', /[Pp]hoto/.test((await say64('Rakesh@Sharma.COM')).reply)
+      && cc64.pending(CH64).answers.email === 'rakesh@sharma.com');
+
+    // THE PHOTO IS ASKED BEFORE THE PIN, because it may answer it.
+    check('a photo is required, words will not do', /Photo bhejiye/i.test((await say64('koi photo nahi hai')).reply));
+    check('...and a plain photo still leaves the pin to ask for',
+      /location bhej/i.test((await say64('', { mediaBase64: 'QUJD', mediaMime: 'image/jpeg' })).reply));
     // Typed coordinates are how a shop ends up in the sea.
     check('typed coordinates are refused, the pin is asked for', /Location attach/i.test((await say64('28.6139, 77.2090')).reply));
-    check('...and a dropped pin is taken', /photo/i.test((await say64('', { location: { lat: 28.61, lng: 77.2 } })).reply));
-    check('a photo is required, words will not do', /Photo bhejiye/i.test((await say64('koi photo nahi hai')).reply));
 
-    const done64 = await say64('', { mediaBase64: 'QUJD', mediaMime: 'image/jpeg' });
+    const done64 = await say64('', { location: { lat: 28.61, lng: 77.2 } });
     const final64 = done64.done ? done64 : await say64('skip');
     check('the form completes', final64.done === true);
     // Six fields the customer never typed: firm, address, city, state, PIN
@@ -4894,6 +4952,7 @@ async function main() {
     check('...and the mobile is the number they wrote from', a64.phone === '917355374975');
     const sum64 = cc64.summary(final64.form, t64);
     check('the approver sees the whole form', /CENTRAL WAREHOUSING/.test(sum64) && /33AAACC1206D1ZN \(verified\)/.test(sum64) && /28\.61/.test(sum64));
+    check('...and is not shown a contact phone that is just the same number', /Contact phone/.test(sum64) === false);
     check('...and is told how to answer', /OK WA-/.test(sum64));
 
     // Only a Sales Head may say yes.
@@ -5035,6 +5094,167 @@ async function main() {
   }
 
 
+
+  // ---- 66. what the form must not let through ----
+  // Everything in this section was asked for on 22 Sep after the first
+  // real accounts were opened: a duplicate is refused by the portal at the
+  // create, which is far too late; a photo of a car is not a shop; and the
+  // person typing is not always the person being registered.
+  console.log('\n[66] duplicates, the camera, and opening an account for somebody else');
+  const cc66 = require('../src/core/customerCreate');
+  const gst66 = require('../src/integrations/gst');
+  const portal66 = require('../src/integrations/dealerPortal');
+  const ai66 = require('../src/core/ai');
+  const cfg66 = require('../src/config').creation;
+  const t66 = (en, hi) => hi || en;
+  const FIRM66 = {
+    gstin: '33AAACC1206D1ZN', name: 'CENTRAL WAREHOUSING CORPORATION', legalName: 'CENTRAL WAREHOUSING CORPORATION',
+    status: 'Active', address: 'No.4, North Avenue, Saidapet', city: 'Chennai', state: 'Tamil Nadu', pin: '600015',
+  };
+  const gstWas66 = gst66.lookup;
+  const enabledWas66 = gst66.enabled;
+  const shopWas66 = ai66.readShopPhoto;
+  const teamWas66 = cfg66.team;
+  try {
+    gst66.enabled = () => true;
+    gst66.lookup = async () => FIRM66;
+    ai66.readShopPhoto = async () => null; // no vision model: nobody looked
+
+    // ---- a GSTIN the portal already holds ----
+    // The portal refuses a duplicate at the create - after the customer has
+    // answered everything and a Sales Head has approved it. Asking here
+    // turns a dead end into "send a different one".
+    portal66._setMockDuplicates([{ gstNo: '33AAACC1206D1ZN', name: 'Existing Traders' }]);
+    const CHD = 'sim-create66-dup';
+    cc66.cancel(CHD);
+    cc66.start(CHD, '917355374975', t66);
+    const dup66 = await cc66.answer(CHD, {}, '33AAACC1206D1ZN', t66);
+    check('a GSTIN already on the portal is refused', /pehle se hamare paas registered/i.test(dup66.reply));
+    check('...and says whose it is', /Existing Traders/.test(dup66.reply));
+    check('...and is not kept on the form', cc66.pending(CHD).answers.gstNo === undefined);
+    check('...and the form is still open for another one', Boolean(cc66.pending(CHD)));
+
+    // ---- email: mandatory, and unverifiable ----
+    // There is no route on the portal that takes an email and no email in
+    // the customer list, so it CANNOT be checked. That is recorded rather
+    // than passed off as clear.
+    portal66._setMockDuplicates([]);
+    const CHE = 'sim-create66-email';
+    cc66.cancel(CHE);
+    cc66.start(CHE, '917355374975', t66);
+    await cc66.answer(CHE, {}, '33AAACC1206D1ZN', t66);
+    await cc66.answer(CHE, {}, 'retailer', t66);
+    await cc66.answer(CHE, {}, 'Rakesh Sharma', t66);
+    await cc66.answer(CHE, {}, 'same', t66);
+    const skipped66 = await cc66.answer(CHE, {}, 'skip', t66);
+    check('the email cannot be skipped', /Email/i.test(skipped66.reply) && cc66.pending(CHE).answers.email === undefined);
+    await cc66.answer(CHE, {}, 'shop@example.com', t66);
+    check('...and the approver is told it could not be checked',
+      (cc66.pending(CHE).notChecked || []).includes('email'));
+
+    // ---- a contact number that is not theirs ----
+    const CHC = 'sim-create66-contact';
+    cc66.cancel(CHC);
+    cc66.start(CHC, '917355374975', t66);
+    await cc66.answer(CHC, {}, '33AAACC1206D1ZN', t66);
+    await cc66.answer(CHC, {}, 'retailer', t66);
+    await cc66.answer(CHC, {}, 'Rakesh Sharma', t66);
+    portal66._setMockDuplicates([{ phone: '919876543210', name: 'Someone Else' }]);
+    const cdup66 = await cc66.answer(CHC, {}, '9876543210', t66);
+    check('a contact number already on the portal is refused', /pehle se hamare paas registered/i.test(cdup66.reply));
+    portal66._setMockDuplicates([]);
+    await cc66.answer(CHC, {}, '9811122233', t66);
+    check('...and a free one is taken, with the 91 put on', cc66.pending(CHC).answers.contactPhone === '919811122233');
+
+    // ---- the photograph ----
+    // A selfie is not a shop and a shop with no board cannot be tied to the
+    // name on the GST certificate. Asked once more, then accepted anyway:
+    // an account must not die on a camera angle.
+    const CHP = 'sim-create66-photo';
+    const toPhoto = async (ch) => {
+      cc66.cancel(ch);
+      cc66.start(ch, '917355374975', t66);
+      await cc66.answer(ch, {}, '33AAACC1206D1ZN', t66);
+      await cc66.answer(ch, {}, 'retailer', t66);
+      await cc66.answer(ch, {}, 'Rakesh Sharma', t66);
+      await cc66.answer(ch, {}, 'same', t66);
+      await cc66.answer(ch, {}, 'shop@example.com', t66);
+    };
+    ai66.readShopPhoto = async () => ({ isShop: false, hasBanner: false, bannerText: null, why: 'a person indoors' });
+    await toPhoto(CHP);
+    const notShop = await cc66.answer(CHP, { mediaBase64: 'QUJD', mediaMime: 'image/jpeg' }, '', t66);
+    check('a photo that is not a shop is sent back', /shop ki photo nahi/i.test(notShop.reply));
+    const notShop2 = await cc66.answer(CHP, { mediaBase64: 'QUJD', mediaMime: 'image/jpeg' }, '', t66);
+    check('...but asking twice is enough', /location bhej/i.test(notShop2.reply));
+    check('...and the approver is told what the picture looked like',
+      cc66.pending(CHP).answers.photoNote === 'does not look like a shop');
+
+    ai66.readShopPhoto = async () => ({ isShop: true, hasBanner: false, bannerText: null, why: 'no board' });
+    await toPhoto(CHP);
+    check('a shop with no visible board is sent back',
+      /[Bb]oard nahi dikh raha/.test((await cc66.answer(CHP, { mediaBase64: 'QUJD', mediaMime: 'image/jpeg' }, '', t66)).reply));
+
+    ai66.readShopPhoto = async () => ({ isShop: true, hasBanner: true, bannerText: 'SHARMA AUTO PARTS', why: 'board reads' });
+    await toPhoto(CHP);
+    const good66 = await cc66.answer(CHP, { mediaBase64: 'QUJD', mediaMime: 'image/jpeg' }, '', t66);
+    check('a shop with its board is taken', /location bhej/i.test(good66.reply));
+    check('...and what the board says is kept for the approver',
+      cc66.pending(CHP).answers.bannerText === 'SHARMA AUTO PARTS');
+
+    // ---- the camera answering the question after it ----
+    // A photo taken at the shop often carries the camera's GPS fix. When it
+    // does, asking for a pin as well is asking for something we hold.
+    // (Usually it does NOT: WhatsApp strips EXIF from anything sent as a
+    // photo. It survives when the picture is sent as a document.)
+    const gpsJpeg = makeGpsJpeg(28.6139, 77.209, 'N', 'E').toString('base64');
+    await toPhoto(CHP);
+    const fromExif = await cc66.answer(CHP, { mediaBase64: gpsJpeg, mediaMime: 'image/jpeg' }, '', t66);
+    check('a GPS-tagged photo answers the location too', /[Pp]hoto se hi location/.test(fromExif.reply));
+    const exifAns = (cc66.pending(CHP) || { answers: fromExif.form.answers }).answers;
+    check('...with the fix off the camera', Math.abs(exifAns.lat - 28.6139) < 0.001 && Math.abs(exifAns.lng - 77.209) < 0.001);
+    check('...noted as coming from the photo, not a dropped pin', exifAns.locationFrom === 'photo');
+    check('...and the pin is never asked for', /location bhej/i.test(fromExif.reply) === false);
+
+    // ---- an account for somebody else ----
+    cfg66.team = { 919873261929: 'Shubham' };
+    check('the button and the words both open it',
+      cc66.wantsSomeoneElse('CREATE_FOR_OTHER') && cc66.wantsSomeoneElse('kisi aur ka'));
+    check('...and a part number does not', cc66.wantsSomeoneElse('16510M65L10') === false);
+    check('a colleague on the creation team is known by name', cc66.agentName('919873261929') === 'Shubham');
+    check('...and a customer is not', cc66.agentName('917355374975') === null);
+
+    const CHO = 'sim-create66-other';
+    cc66.cancel(CHO);
+    const openOther = cc66.start(CHO, '919873261929', t66, { forSomeoneElse: true });
+    check('opening one for someone else asks whose it is first', /[Kk]iska account/.test(openOther));
+    portal66._setMockDuplicates([{ phone: '919999888777', name: 'Already Here' }]);
+    check('...and a number already on the portal is refused there too',
+      /pehle se hamare paas registered/i.test((await cc66.answer(CHO, {}, '9999888777', t66)).reply));
+    portal66._setMockDuplicates([]);
+    const afterNum = await cc66.answer(CHO, {}, '9812345678', t66);
+    check('...then it carries on to the GST number', /GST number/i.test(afterNum.reply));
+    const oAns = cc66.pending(CHO).answers;
+    check('...the account belongs to THAT number, not the agent', oAns.phone === '919812345678');
+    check('...and the portal is told which agent opened it', oAns.createdByName === 'Shubham');
+
+    // A customer registering themselves has no agent, and their own name
+    // must not be written into the portal's sales-representative field.
+    const CHS = 'sim-create66-self';
+    cc66.cancel(CHS);
+    cc66.start(CHS, '917355374975', t66);
+    check('a customer registering themselves has no agent on the account',
+      cc66.pending(CHS).answers.createdByName === undefined);
+
+    [CHD, CHE, CHC, CHP, CHO, CHS].forEach((c) => cc66.cancel(c));
+  } finally {
+    gst66.lookup = gstWas66;
+    gst66.enabled = enabledWas66;
+    ai66.readShopPhoto = shopWas66;
+    cfg66.team = teamWas66;
+    portal66._setMockDuplicates([]);
+  }
+
+
   console.log(
     failures === 0
       ? '\n✅ ALL CHECKS PASSED\n'
@@ -5050,3 +5270,35 @@ main().catch((e) => {
   console.error('smoke test crashed:', e);
   process.exit(1);
 });
+
+// A JPEG carrying nothing but an EXIF GPS fix, built rather than checked
+// in, so the EXIF reader is tested against real bytes.
+function rational(n, d) { const b = Buffer.alloc(8); b.writeUInt32BE(n, 0); b.writeUInt32BE(d, 4); return b; }
+function toDms(v) {
+  const d = Math.floor(v), mF = (v - d) * 60, m = Math.floor(mF), s = Math.round((mF - m) * 60 * 100);
+  return Buffer.concat([rational(d, 1), rational(m, 1), rational(s, 100)]);
+}
+function makeGpsJpeg(lat, lng, latRef, lonRef) {
+  const gpsEntries = [
+    [1, 2, 2, Buffer.from(latRef + '\0', 'latin1')],
+    [2, 5, 3, toDms(lat)],
+    [3, 2, 2, Buffer.from(lonRef + '\0', 'latin1')],
+    [4, 5, 3, toDms(lng)],
+  ];
+  const ifd0Off = 8, ifd0Len = 2 + 12 + 4, gpsOff = ifd0Off + ifd0Len;
+  const gpsLen = 2 + gpsEntries.length * 12 + 4;
+  let dataOff = gpsOff + gpsLen; const datas = []; const bufs = [];
+  for (const [tag, type, count, val] of gpsEntries) {
+    const e = Buffer.alloc(12); e.writeUInt16BE(tag, 0); e.writeUInt16BE(type, 2); e.writeUInt32BE(count, 4);
+    if (val.length <= 4) val.copy(e, 8); else { e.writeUInt32BE(dataOff, 8); datas.push(val); dataOff += val.length; }
+    bufs.push(e);
+  }
+  const ifd0 = Buffer.alloc(ifd0Len); ifd0.writeUInt16BE(1, 0);
+  ifd0.writeUInt16BE(0x8825, 2); ifd0.writeUInt16BE(4, 4); ifd0.writeUInt32BE(1, 6); ifd0.writeUInt32BE(gpsOff, 10);
+  const gpsHead = Buffer.alloc(2); gpsHead.writeUInt16BE(gpsEntries.length, 0);
+  const head = Buffer.alloc(8); head.write('MM', 0, 'latin1'); head.writeUInt16BE(42, 2); head.writeUInt32BE(ifd0Off, 4);
+  const tiff = Buffer.concat([head, ifd0, gpsHead, ...bufs, Buffer.alloc(4), ...datas]);
+  const app1 = Buffer.concat([Buffer.from('Exif\0\0', 'latin1'), tiff]);
+  const seg = Buffer.alloc(4); seg[0] = 0xFF; seg[1] = 0xE1; seg.writeUInt16BE(app1.length + 2, 2);
+  return Buffer.concat([Buffer.from([0xFF, 0xD8]), seg, app1, Buffer.from([0xFF, 0xD9])]);
+}

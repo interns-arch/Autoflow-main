@@ -308,16 +308,55 @@ class CustomerBot {
     // unregistered order to trigger it. 21 Sep, live: "Create coustomer"
     // was searched in the catalogue and answered with sixty headlight
     // restorers, because nothing above this line knew what it meant.
-    if (customerCreate.wantsToStart(text)) {
-      const already = await customers.resolve(m.from).catch(() => ({ found: null }));
-      if (already && already.found === true) {
-        store.log(this.key, `${m.from} asked to create an account but already has one (${already.name})`);
-        return reply(
-          t(
-            `You already have an account with us${already.name ? ' — ' + already.name : ''}. Send the part number and quantity.`,
-            `Aapka account already hai${already.name ? ' — ' + already.name : ''}. Part number aur quantity bhej dijiye.`,
-          ),
-        );
+    // The other button on "you already have an account". Only meaningful
+    // when we just asked - "nahi" on its own is an answer to whatever else
+    // is open, and stealing it here would break every other question.
+    if (m.buttonId && customerCreate.declinedCreate(text)) {
+      return reply(t('Theek hai sir. Part number bhejiye, check kar deta hoon.', 'Theek hai sir. Part number bhejiye, check kar deta hoon.'));
+    }
+
+    if (customerCreate.wantsToStart(text) || customerCreate.wantsSomeoneElse(text)) {
+      // A SALES AGENT is never told they already have an account: opening
+      // one for a customer standing at their counter is their job, and the
+      // account goes on the portal under their name.
+      const agent = customerCreate.agentName(m.from);
+      const forElse = customerCreate.wantsSomeoneElse(text);
+
+      if (!agent && !forElse) {
+        const already = await customers.resolve(m.from).catch(() => ({ found: null }));
+        // The portal being down is NOT "no account". 22 Sep, live: the
+        // portal answered HTTP 500 (its connection pool was exhausted) and
+        // every number looked unregistered. Opening a form here would ask a
+        // customer who ALREADY has an account for twelve answers, and the
+        // creation at the end would fail anyway.
+        if (already && already.found === null) {
+          store.log(this.key, `${m.from} asked to open an account but the portal is not answering`);
+          return reply(
+            t(
+              "Our system isn't responding right now — give me a few minutes and ask again.",
+              'System abhi respond nahi kar raha — thodi der baad phir bolieye, turant bana denge.',
+            ),
+          );
+        }
+        if (already && already.found === true) {
+          // They are already a customer, so this is almost always an
+          // account for somebody else — a friend's garage, a second shop.
+          // Saying only "you already have one" ends a conversation that
+          // was about to open an account.
+          store.log(this.key, `${m.from} asked to create an account but already has one (${already.name})`);
+          const msg = t(
+            `You already have an account with us${already.name ? ' — ' + already.name : ''}. Opening one for someone else?`,
+            `Aapka account already hai${already.name ? ' — ' + already.name : ''}. Kisi aur ka account banana hai kya?`,
+          );
+          if (this.transport.sendButtons) {
+            await this.transport.sendButtons(m.from, msg, [
+              { id: 'CREATE_FOR_OTHER', title: 'Kisi aur ka' },
+              { id: 'CREATE_NO', title: 'Nahi, rehne do' },
+            ]);
+            return true;
+          }
+          return reply(msg + t('\n\nReply "kisi aur ka" to open one.', '\n\n"kisi aur ka" likh dijiye to bana dete hain.'));
+        }
       }
       // The portal being down is NOT "no account". 22 Sep, live: the
       // portal answered HTTP 500 (its connection pool was exhausted) and
@@ -333,8 +372,8 @@ class CustomerBot {
           ),
         );
       }
-      store.log(this.key, `${m.from} asked to open an account`);
-      return reply(customerCreate.start(m.chatId, m.from, t));
+      store.log(this.key, `${m.from} asked to open an account${forElse ? ' for someone else' : ''}${agent ? ' (agent: ' + agent + ')' : ''}`);
+      return reply(customerCreate.start(m.chatId, m.from, t, { forSomeoneElse: forElse }));
     }
 
     // A NUMBER PLATE. "DL7CW1692" is a car, not a part — and before this it
@@ -704,8 +743,7 @@ class CustomerBot {
           clarify.ask(m.chatId, p, q);
           return reply(q.text);
         }
-        clarify.clear(m.chatId);
-        return reply(clarify.options(hits.top, m.chatId));
+        return reply(clarify.offer(m.chatId, p, hits.top));
       }
       // narrowed to nothing — the extra word was wrong, back to the last list
       clarify.clear(m.chatId);
@@ -1023,7 +1061,7 @@ class CustomerBot {
               clarify.ask(m.chatId, { base: phrase, qty: 1 }, q);
               return reply(q.text);
             }
-            return reply(clarify.options(hits.top, m.chatId));
+            return reply(clarify.offer(m.chatId, { base: phrase, qty: 1 }, hits.top));
           }
 
           // Nothing in the catalogue. Only a phrase that still looks like a
@@ -2261,7 +2299,7 @@ class CustomerBot {
         clarify.ask(m.chatId, { base: c.asked, qty: c.qty, ref: c.ref, key: c.key }, q);
         askText = q.text;
       } else {
-        askText = clarify.options(c.top, m.chatId);
+        askText = clarify.offer(m.chatId, { base: c.asked, qty: c.qty, ref: c.ref, key: c.key }, c.top);
       }
     }
 
@@ -2437,7 +2475,51 @@ class CustomerBot {
   // Availability question, no quantities yet.
   async answerInquiry(items, m) {
     const t = lang.for(m && m.chatId);
-    const resolved = await availability.resolve(items.map((i) => ({ item: i, qty: 1 })));
+    const chatId = (m && m.chatId) || null;
+
+    // A part named in WORDS is not a part number. The portal's analyze only
+    // understands numbers, so "Maruti Suzuki Swift ka bumper" came back
+    // unidentified and the customer was told "check karke batata hoon" — no
+    // price, no stock, and nobody actually checking. 21 Sep, live: three voice
+    // notes about a Swift bumper in one chat, all answered that way.
+    //
+    // So look the name up in the catalogue first, exactly as an order line
+    // already does (processOrderLines). An inquiry and an order ask the same
+    // question about the same catalogue; only the quantity differs.
+    const lines = [];
+    for (const raw of items) {
+      const item = String(raw || '').trim();
+      if (!item || !availability.isNameQuery(item)) {
+        lines.push({ item, qty: 1 });
+        continue;
+      }
+      let top = [];
+      try {
+        const hits = await availability.byName(vehicle.narrow(chatId, item));
+        top = (hits && hits.top) || [];
+      } catch (e) {
+        store.log(this.key, `inquiry: catalogue lookup failed for "${item}": ${String((e && e.message) || e).slice(0, 80)}`);
+      }
+      if (top.length === 1) {
+        store.log(this.key, `"${item}" -> ${top[0].partNo} by name (only match)`);
+        lines.push({ item: top[0].partNo, qty: 1, requested: item });
+        continue;
+      }
+      if (top.length > 1 && chatId) {
+        // Several parts carry that name — front or rear, which car. Ask the
+        // way the counter would rather than quoting one of them at random.
+        store.log(this.key, `"${item}" -> ${top.length} catalogue matches; asking which`);
+        const q = clarify.nextQuestion(top, [], chatId);
+        if (q) {
+          clarify.ask(chatId, { base: item, qty: 1 }, q);
+          return q.text;
+        }
+        return clarify.offer(chatId, { base: item, qty: 1 }, top);
+      }
+      lines.push({ item, qty: 1 });
+    }
+
+    const resolved = await availability.resolve(lines);
     if (m) {
       inquiries.recordMany(resolved, { customer: m.from, chatId: m.chatId });
       focus.remember(m.chatId, resolved);

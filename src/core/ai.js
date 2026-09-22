@@ -1102,13 +1102,83 @@ async function geminiOrderImage(base64, mediaType) {
   }
 }
 
+
+// IS THIS A SHOP, AND DOES IT HAVE A BOARD?
+//
+// The form asks for "shop ke saamne ki photo". What arrives is sometimes a
+// selfie, sometimes the inside of a boot, sometimes a screenshot — and the
+// approver then has to open every one to find out. The signboard is the
+// point: it is what ties the photograph to the firm name on the GST
+// certificate, and an approver checking an account reads it first.
+//
+// Returns { isShop, hasBanner, bannerText, why } or null when there is no
+// vision model configured. NULL MEANS "NOBODY LOOKED" — never "it is fine"
+// and never "it is wrong". The caller must not refuse a photo on a null.
+const SHOP_PHOTO_PROMPT = [
+  'You are looking at a photograph sent by a shop owner to open a trade account.',
+  'Answer ONLY with JSON, no prose:',
+  '{"isShop": true|false, "hasBanner": true|false, "bannerText": "<text on the signboard, or empty>", "why": "<six words>"}',
+  '',
+  'isShop: true if this shows a shop, garage, workshop or business premises —',
+  '  inside or outside. False for a selfie with no premises, a screenshot, a',
+  '  document, a car on its own, a part on its own, or a plain room.',
+  'hasBanner: true if a signboard, banner, hoarding or painted shop name is',
+  '  visible AND readable. A blank awning is not a banner.',
+  'bannerText: exactly what the board says, if you can read it. Do not guess.',
+].join('\n');
+
+async function readShopPhoto(base64, mediaType) {
+  const g = config.gemini;
+  if (!g.apiKey || !base64) return null;
+  try {
+    const url =
+      'https://generativelanguage.googleapis.com/v1beta/models/' +
+      encodeURIComponent(g.visionModel) +
+      ':generateContent';
+    // Same retry rule as the order reader: 503 means "busy, ask again",
+    // 429 means a spent quota and is not worth three attempts.
+    const RETRY_ON = new Set([500, 502, 503, 504]);
+    let res = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt) await new Promise((r) => setTimeout(r, 1000 * attempt));
+      res = await fetch(url + '?key=' + encodeURIComponent(g.apiKey), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: SHOP_PHOTO_PROMPT }, { inline_data: { mime_type: mediaType || 'image/jpeg', data: base64 } }] }],
+        }),
+        signal: AbortSignal.timeout(g.timeoutMs),
+      });
+      if (res.ok || !RETRY_ON.has(res.status)) break;
+    }
+    if (!res || !res.ok) throw new Error('HTTP ' + (res && res.status));
+    const data = await res.json();
+    const text = (((data.candidates || [])[0] || {}).content?.parts || []).map((p) => p.text || '').join('');
+    const json = text.match(/\{[\s\S]*\}/);
+    if (!json) throw new Error('no JSON in the reply');
+    const r = JSON.parse(json[0]);
+    const out = {
+      isShop: r.isShop === true,
+      hasBanner: r.hasBanner === true,
+      bannerText: String(r.bannerText || '').trim().slice(0, 80) || null,
+      why: String(r.why || '').trim().slice(0, 60) || null,
+    };
+    store.log('ai', `shop photo: shop=${out.isShop} banner=${out.hasBanner}${out.bannerText ? ' "' + out.bannerText + '"' : ''}`);
+    return out;
+  } catch (e) {
+    // A vision call that failed must not stop an account being opened.
+    store.log('ai', 'shop photo check failed: ' + String((e && e.message) || e).slice(0, 120));
+    return null;
+  }
+}
+
 module.exports = {
   stripNoPrefix,
   normalizeOrderText,
   // What the gate chain decided is noted for the shadow log (pipeline/shadow).
   // The result is returned untouched.
   parseCustomerMessage: (...args) => parseCustomerMessage(...args).then((r) => require('../pipeline/shadow').noteGate(r)),
-  parseVendorStock, parseOrderImage, parseLinesBlock, matchCatalog, CONFIRM_RE, partNumberIn,
+  parseVendorStock, parseOrderImage, parseLinesBlock, readShopPhoto, matchCatalog, CONFIRM_RE, partNumberIn,
   // why the last photo could not be read - written into the chat as a note
   imageNote,
   // exported for tests

@@ -55,9 +55,27 @@ const QUIT = /^(cancel|stop|rehne do|rhne do|chhodo|chodo|baad me karenge|baad m
 // it, and the customer is shown what was found before it is used.
 const FIELDS = [
   {
+    // ONLY when someone is opening an account for a firm that is not
+    // theirs — a sales agent at a counter, or a customer who already has
+    // an account and is registering a friend. Everyone else is writing
+    // from the number being registered, so this is skipped.
+    key: 'phoneFor',
+    req: true,
+    type: 'phone',
+    when: (form) => form.forSomeoneElse === true,
+    ask: [
+      'Whose account is this? Send their WhatsApp number.',
+      'Kiska account banana hai — unka WhatsApp number bhejiye.',
+    ],
+  },
+  {
     key: 'gstNo',
     req: true,
     type: 'gst',
+    // A Sales Head has already seen this firm cannot produce a verified
+    // GSTIN and said to carry on. Asking again would just repeat the
+    // three failures that got it escalated.
+    when: (form) => form.gstWaived !== true,
     // No "skip". A verified GSTIN is the condition for opening an account
     // over WhatsApp at all: it is the only thing in this form that proves
     // the firm exists and that the person typing is not inventing one. The
@@ -82,6 +100,18 @@ const FIELDS = [
     ask: ['Contact person ka naam?', 'Contact person ka naam?'],
   },
   {
+    key: 'contactPhone',
+    req: true,
+    type: 'phone',
+    // Usually the number they are typing from, which is why "same" is an
+    // answer. Often it is not: the owner registers, the manager answers
+    // the phone. The portal has no box for it, so it travels in remarks.
+    ask: [
+      'Contact person ka phone number? (agar yahi number hai to "same" likh dijiye)',
+      'Contact person ka phone number? (agar yahi number hai to "same" likh dijiye)',
+    ],
+  },
+  {
     key: 'panNo',
     req: false,
     // Asked only if the GSTIN somehow did not supply it. Characters 3-12 of
@@ -93,9 +123,12 @@ const FIELDS = [
   },
   {
     key: 'email',
-    req: false,
-    ask: ['Email address? (optional)', 'Email address? (optional)'],
-    check: (v) => (EMAIL_RE.test(v) ? null : 'Email theek nahi lag raha. Dobara bhejiye ya "skip".'),
+    // NOT optional. The portal sends every invoice and statement to it, and
+    // an account opened without one has no way to be billed.
+    req: true,
+    ask: ['Email address?', 'Email address? (invoice isi par jayega)'],
+    check: (v) => (EMAIL_RE.test(v) ? null : 'Email theek nahi lag raha. Dobara bhejiye.'),
+    clean: (v) => v.trim().toLowerCase(),
   },
   {
     key: 'address',
@@ -111,24 +144,31 @@ const FIELDS = [
     check: (v) => (PIN_RE.test(v.replace(/\s/g, '')) ? null : 'PIN 6 digit ka hota hai. Dobara bhejiye.'),
     clean: (v) => v.replace(/\s/g, ''),
   },
-  {
-    key: 'location',
-    req: true,
-    type: 'location',
-    // Typing "28.6139" by hand is how a shop ends up in the sea. WhatsApp's
-    // own location share is one tap and exact.
-    ask: [
-      'Shop ki location bhej dijiye — attach (📎) → Location → Send your current location.',
-      'Shop ki location bhej dijiye — attach (📎) → Location → Send your current location.',
-    ],
-  },
+  // THE PHOTO IS ASKED FOR FIRST, because it may answer the question
+  // after it. A picture taken at the shop often carries the camera's own
+  // GPS fix, and when it does there is no reason to ask for a pin as well.
   {
     key: 'shopPhoto',
     req: true,
     type: 'photo',
     ask: [
-      'Shop ke saamne ki photo bhejiye, jisme owner bhi dikhein.',
-      'Shop ke saamne ki photo bhejiye, jisme owner bhi dikhein.',
+      'Shop ke saamne ki photo bhejiye — board/banner dikhna chahiye.',
+      'Shop ke saamne ki photo bhejiye — shop ka board ya banner dikhna chahiye.',
+    ],
+  },
+  {
+    key: 'location',
+    req: true,
+    type: 'location',
+    // The photo before this one may have carried a GPS fix. If it did,
+    // the answer is already on the form under lat/lng and asking for a
+    // pin is asking for something we are holding.
+    when: (form) => form.answers.lat === undefined,
+    // Typing "28.6139" by hand is how a shop ends up in the sea. WhatsApp's
+    // own location share is one tap and exact.
+    ask: [
+      'Shop ki location bhej dijiye — attach (📎) → Location → Send your current location.',
+      'Shop ki location bhej dijiye — attach (📎) → Location → Send your current location.',
     ],
   },
   { key: 'remarks', req: false, ask: ['Aur kuch batana hai? (optional)', 'Aur kuch batana hai? (optional)'] },
@@ -164,6 +204,28 @@ const START_RE = new RegExp(
 // request to open one. "Account balance", "khata dekho", a ledger.
 const NOT_START_RE = /\b(balance|statement|ledger|bakaya|baaki|outstanding|bill|invoice|payment|due|kitna|number|no\.?)\b/i;
 
+// THE BUTTON, and the words for anyone whose transport has no buttons or
+// who simply types. "Kisi aur ka" is the phrase the button is labelled
+// with, so a customer who reads the label and types it lands here too.
+const SOMEONE_ELSE_RE =
+  /^(CREATE_FOR_OTHER|kisi\s*aur\s*(ka|ke|ki)?( account)?( banana hai)?|kisi\s*or\s*ka|someone\s*else|for\s*someone\s*else|doosre\s*ka|dusre\s*ka)$/i;
+
+function wantsSomeoneElse(text) {
+  return SOMEONE_ELSE_RE.test(String(text || '').trim());
+}
+
+// The button that says no. Nothing to do but say fine.
+function declinedCreate(text) {
+  return /^(CREATE_NO|nahi,? rehne do|rehne do|nahi)$/i.test(String(text || '').trim());
+}
+
+// A colleague on the creation team, by name. An account they open goes on
+// the portal as theirs — and they are never told "you already have an
+// account", because the one being opened is not theirs.
+function agentName(phone) {
+  return config.creation.team[store.normPhone(phone)] || null;
+}
+
 function wantsToStart(text) {
   const t = String(text || '').trim();
   if (!t || t.length > 90) return false;
@@ -188,26 +250,53 @@ function fieldAt(i) {
 
 // Start the form. `by` is whoever is filling it in — a salesman on the
 // customer's behalf, or the customer themselves.
-function start(chatId, phone, t) {
+//
+// `forSomeoneElse` means the account being opened is NOT the number this
+// is being typed from: a sales agent standing at a counter, or a customer
+// who already has an account registering someone they know. The first
+// question then becomes whose number it is.
+function start(chatId, phone, t, opts) {
   sweep();
   const filler = store.normPhone(phone);
+  const forSomeoneElse = Boolean(opts && opts.forSomeoneElse);
+  // A number on the creation team is a colleague filling this in; anyone
+  // else is the customer registering themselves. Recorded because the
+  // approver needs to know which they are reading — and because the portal
+  // keeps it as the sales representative on the account.
+  const agent = config.creation.team[filler] || null;
   const form = {
     at: Date.now(),
     chatId,
     phone: filler,
-    // A number on the creation team is a colleague filling this in; anyone
-    // else is the customer registering themselves. Recorded because the
-    // approver needs to know which they are reading.
-    byName: config.creation.team[filler] || null,
+    byName: agent,
+    forSomeoneElse,
     idx: 0,
-    answers: { phone: filler },
+    answers: {
+      // Their own number, unless they are opening it for somebody else —
+      // in which case the first question asks whose it is.
+      ...(forSomeoneElse ? {} : { phone: filler }),
+      // WHO OPENED IT. Anik, 12 Sep, about sales orders: "baad mein main
+      // dekh paun kis agent ne kitna kiya". The same question gets asked
+      // about accounts. A customer registering themselves has no agent, and
+      // the field is left off rather than filled in with their own name.
+      ...(agent ? { createdByName: agent, createdByPhone: filler } : {}),
+    },
   };
+  // Not an answer to a question — it decides which questions there are.
+  if (forSomeoneElse) form.answers.openedFor = 'someone else';
   open.set(chatId, form);
-  store.log('create', `${chatId}: customer form started by ${form.byName || filler}`);
-  return t(
-    `Account banane ke liye kuch details chahiye — ek ek karke poochta hoon.\n\n${FIELDS[0].ask[1]}`,
-    `Account banane ke liye kuch details chahiye — ek ek karke poochta hoon.\n\n${FIELDS[0].ask[1]}`,
-  );
+  store.log('create', chatId + ': customer form started by ' + (agent || filler) + (forSomeoneElse ? ' FOR someone else' : ''));
+
+  // The first question is not always FIELDS[0]: "whose account is this"
+  // only exists when the form is being filled in for somebody else, and
+  // idx has to point at whatever is actually being asked or the answer is
+  // read as the answer to a question nobody saw.
+  form.idx = FIELDS.findIndex((f) => !f.when || f.when(form));
+  const first = FIELDS[form.idx];
+  const lead = forSomeoneElse
+    ? 'Theek hai — unka account bana dete hain. Kuch details chahiye, ek ek karke poochta hoon.'
+    : 'Account banane ke liye kuch details chahiye — ek ek karke poochta hoon.';
+  return t(lead + '\n\n' + first.ask[1], lead + '\n\n' + first.ask[1]);
 }
 
 // One answer. `m` is the whole message, so a photo or a dropped pin can be
@@ -271,22 +360,123 @@ async function answer(chatId, m, text, t) {
   if (field.type === 'photo') {
     if (!m || !m.mediaBase64 || !/^image\//.test(m.mediaMime || '')) {
       return {
-        reply: t('Photo bhejiye sir — shop ke saamne ki, owner ke saath.', 'Photo bhejiye sir — shop ke saamne ki, owner ke saath.'),
+        reply: t('Photo bhejiye sir — shop ke saamne ki, board dikhna chahiye.', 'Photo bhejiye sir — shop ke saamne ki, board dikhna chahiye.'),
         done: false,
         form,
       };
     }
+
+    // IS IT ACTUALLY A SHOP, AND IS THE BOARD IN IT?
+    //
+    // The board is the point: it is what ties the photograph to the firm
+    // name on the GST certificate, and it is the first thing an approver
+    // looks for. A selfie or a picture of a part gets one honest retry.
+    //
+    // A model that could not be reached says NOTHING, and nothing is not a
+    // refusal — the photo is accepted and the approver decides, exactly as
+    // before any of this existed.
+    const look = await require('./ai').readShopPhoto(m.mediaBase64, m.mediaMime);
+    if (look && !look.isShop) {
+      form.photoTries = (form.photoTries || 0) + 1;
+      if (form.photoTries < 2) {
+        return {
+          reply: t(
+            'That does not look like a shop. Please send a photo of the shop front, with the signboard visible.',
+            'Ye shop ki photo nahi lag rahi. Shop ke saamne ki photo bhejiye, jisme board dikhe.',
+          ),
+          done: false,
+          form,
+        };
+      }
+      // Asked twice is enough. Some shops genuinely have no front worth
+      // photographing, and an account must not die on a camera angle.
+      form.answers.photoNote = 'does not look like a shop';
+    } else if (look && look.isShop && !look.hasBanner) {
+      form.photoTries = (form.photoTries || 0) + 1;
+      if (form.photoTries < 2) {
+        return {
+          reply: t(
+            'I cannot see the signboard. One more please, with the shop name board in the frame.',
+            'Board nahi dikh raha. Ek aur bhejiye — shop ke naam wala board frame mein aa jaye.',
+          ),
+          done: false,
+          form,
+        };
+      }
+      form.answers.photoNote = 'no signboard visible';
+    }
+    if (look && look.bannerText) form.answers.bannerText = look.bannerText;
+
     // The bytes are NOT kept in state.json: it is rewritten whole on every
     // save and a photo in it would be copied on every write. chatLog already
     // stored this image on disk when it arrived; the approver is sent the
     // picture itself, which is what they actually look at.
     form.answers.shopPhoto = { mime: m.mediaMime, bytes: m.mediaBase64.length };
     form._photo = m.mediaBase64;
+
+    // THE CAMERA MAY HAVE ANSWERED THE NEXT QUESTION ALREADY. A photo taken
+    // at the shop often carries a GPS fix, and when it does, asking for a
+    // pin is asking for something we are holding.
+    //
+    // Usually it does not: WhatsApp strips EXIF from anything sent as a
+    // photo. It survives when the picture is sent as a DOCUMENT. So this
+    // fires sometimes and the pin is still asked for the rest of the time.
+    const fix = require('./exif').gpsFrom(m.mediaBase64);
+    if (fix && form.answers.lat === undefined) {
+      form.answers.lat = fix.lat;
+      form.answers.lng = fix.lng;
+      form.answers.locationFrom = 'photo';
+      store.log('create', `${form.chatId}: location read from the photo (${fix.lat.toFixed(5)}, ${fix.lng.toFixed(5)})`);
+      const step = advance(form, t);
+      const said = t(
+        'Got it — I took the location from the photo itself.\n\n',
+        'Photo se hi location mil gayi — alag se bhejne ki zarurat nahi.\n\n',
+      );
+      return step.done ? step : { ...step, reply: said + step.reply };
+    }
     return advance(form, t);
   }
 
   if (!said) {
     return { reply: t(field.ask[1], field.ask[1]), done: false, form };
+  }
+
+  // THE CONTACT PERSON'S PHONE. Usually the number they are typing from,
+  // which is why "same" is an answer worth having — but often it is the
+  // manager's, not the owner's, so it cannot just be assumed.
+  if (field.type === 'phone') {
+    const same = /^(same|wahi|yahi|yeh hi|ye hi|yahi number|same number|wahi number)$/i.test(said);
+    const digits = same ? form.answers.phone : String(said).replace(/[^0-9]/g, '');
+    // 10 local digits, or 12 with the 91. Anything else is a typo, and a
+    // typo here is a number nobody can ring.
+    const norm = digits.length === 10 ? '91' + digits : digits;
+    if (!/^91[6-9][0-9]{9}$/.test(norm)) {
+      return {
+        reply: t(
+          'That does not look like a mobile number. Send 10 digits, or "same" for this one.',
+          'Ye mobile number nahi lag raha. 10 digit bhejiye, ya "same" likh dijiye.',
+        ),
+        done: false,
+        form,
+      };
+    }
+    // The first field, when an agent is opening this for someone else,
+    // sets the account's OWN number — not a contact number.
+    if (field.key === 'phoneFor') {
+      const taken = await refuseIfTaken(form, 'phone', norm, t);
+      if (taken) return taken;
+      form.answers.phone = norm;
+      return advance(form, t);
+    }
+
+    form.answers.contactPhone = norm;
+    // Only worth checking when it is NOT the number they are writing from:
+    // that one was looked up before the form ever opened.
+    if (norm !== form.answers.phone) {
+      const taken = await refuseIfTaken(form, 'contactPhone', norm, t);
+      if (taken) return taken;
+    }
+    return advance(form, t);
   }
   if (field.check) {
     const problem = field.check(said);
@@ -296,6 +486,13 @@ async function answer(chatId, m, text, t) {
 
   // THE GSTIN FILLS THE FORM IN. Five questions answered by one.
   if (field.type === 'gst') return fillFromGst(form, form.answers.gstNo, t);
+
+  // An email the portal already has will be refused at the create. Better
+  // here, where the customer can simply give another one.
+  if (field.key === 'email') {
+    const taken = await refuseIfTaken(form, 'email', form.answers.email, t);
+    if (taken) return taken;
+  }
   return advance(form, t);
 }
 
@@ -359,6 +556,54 @@ function gstFail(form, why, message, t) {
   };
 }
 
+// THE PORTAL WILL NOT HOLD IT TWICE.
+//
+// Asked while the customer is still here to answer, rather than at the
+// create — which happens after they have answered everything and a Sales
+// Head has approved it, and where the only thing left to do is apologise.
+//
+// A check that could NOT be made is not a pass: it is recorded on the form
+// so the approver reads "email not checked" instead of assuming it was.
+const DUP_LABEL = { gstNo: 'GST number', email: 'email', contactPhone: 'number', phone: 'number' };
+
+async function refuseIfTaken(form, field, value, t) {
+  const portal = require('../integrations/dealerPortal');
+  let r;
+  try {
+    // findDuplicate asks the portal, and the portal only knows 'phone' —
+    // a contact number is looked up exactly like any other mobile.
+    const asks = field === 'contactPhone' ? 'phone' : field;
+    r = await portal.findDuplicate({ [asks]: value });
+  } catch (e) {
+    store.log('create', form.chatId + ': duplicate check threw — ' + String((e && e.message) || e).slice(0, 80));
+    return null;
+  }
+
+  const note = (k) => {
+    form.notChecked = form.notChecked || [];
+    if (!form.notChecked.includes(k)) form.notChecked.push(k);
+  };
+  for (const u of (r && r.unchecked) || []) note(u);
+
+  if (!r || r.dup !== true) {
+    if (r && r.dup === null) note(field);
+    return null;
+  }
+
+  const what = DUP_LABEL[field] || field;
+  const whose = r.name ? ' (' + r.name + ')' : '';
+  delete form.answers[field];
+  store.log('create', form.chatId + ': ' + field + ' ' + value + ' is already on the portal' + whose);
+  return {
+    reply: t(
+      'That ' + what + ' is already registered with us' + whose + '. Please send a different one.',
+      'Ye ' + what + ' pehle se hamare paas registered hai' + whose + '. Koi doosra bhejiye.',
+    ),
+    done: false,
+    form,
+  };
+}
+
 async function fillFromGst(form, gstin, t) {
   const gst = require('../integrations/gst');
   form.answers._lastGst = gstin;
@@ -393,8 +638,17 @@ async function fillFromGst(form, gstin, t) {
     return escalate(form, `status:${firm.status}`, t);
   }
 
-  // VERIFIED. Everything the register knows is filled in, and only what it
-  // cannot know is still asked.
+  // VERIFIED — but is this firm already a customer? A GSTIN the portal
+  // already holds will be refused at the create, so it is asked about
+  // here, where the customer can still say "oh, use the other one".
+  const taken = await refuseIfTaken(form, 'gstNo', firm.gstin || gstin, t);
+  if (taken) {
+    open.set(form.chatId, form);
+    return taken;
+  }
+
+  // Everything the register knows is filled in, and only what it cannot
+  // know is still asked.
   const a = form.answers;
   delete a._lastGst;
   delete a._firm;
@@ -431,7 +685,11 @@ function advance(form, t) {
   form.idx += 1;
   // Skip anything the GSTIN already answered. Asking a customer to type a
   // city we just read off the GST register is how a form gets abandoned.
-  while (fieldAt(form.idx) && form.answers[fieldAt(form.idx).key] !== undefined && fieldAt(form.idx).key !== 'remarks') {
+  while (
+    fieldAt(form.idx) &&
+    ((form.answers[fieldAt(form.idx).key] !== undefined && fieldAt(form.idx).key !== 'remarks') ||
+      (fieldAt(form.idx).when && !fieldAt(form.idx).when(form)))
+  ) {
     form.idx += 1;
   }
   const next = fieldAt(form.idx);
@@ -488,10 +746,10 @@ function resumeWithoutGst(req, t) {
     gstWaived: true,
     answers: { phone: req.answers.phone, gstVerified: false, gstWaiver: req.answers.requestId },
   };
+  form.idx = FIELDS.findIndex((f) => !f.when || f.when(form));
   open.set(req.chatId, form);
-  store.log('create', `${req.chatId}: GST waived on ${req.answers.requestId} — form reopened`);
-  const step = advance(form, t);
-  return step.reply;
+  store.log('create', req.chatId + ': GST waived on ' + req.answers.requestId + ' — form reopened');
+  return t(FIELDS[form.idx].ask[1], FIELDS[form.idx].ask[1]);
 }
 
 // What the approver reads. Every field, in the order of the paper form, so
@@ -508,6 +766,7 @@ function summary(form, t) {
     line('Business type', a.businessType),
     line('Contact', a.contactPerson),
     line('Mobile', a.phone),
+    a.contactPhone && a.contactPhone !== a.phone ? 'Contact phone: ' + a.contactPhone : null,
     line('GSTIN', a.gstNo ? `${a.gstNo}${a.gstVerified ? ' (verified)' : ''}` : null),
     a.gstVerified === false ? `GSTIN: NOT VERIFIED — waived on ${a.gstWaiver}` : null,
     line('Constitution', a.constitution),
@@ -519,6 +778,14 @@ function summary(form, t) {
     line('State', a.state),
     line('PIN', a.pin),
     a.lat ? `Location: ${a.lat}, ${a.lng}` : null,
+    '',
+    a.bannerText ? 'Board reads: ' + a.bannerText : null,
+    a.photoNote ? 'Photo: ' + a.photoNote : null,
+    a.locationFrom === 'photo' ? 'Location: read from the photo EXIF' : null,
+    form.notChecked && form.notChecked.length
+      ? 'NOT checked against the portal: ' + form.notChecked.join(', ')
+      : null,
+    a.createdByName ? 'Opened by: ' + a.createdByName + (a.openedFor ? ' (for ' + a.openedFor + ')' : '') : null,
     '',
     line('Credit days', a.creditDays),
     line('Credit limit', a.creditLimit),
@@ -564,6 +831,9 @@ function unpark(requestId) {
 
 module.exports = {
   wantsToStart,
+  wantsSomeoneElse,
+  declinedCreate,
+  agentName,
   start,
   answer,
   pending,

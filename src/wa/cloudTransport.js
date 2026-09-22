@@ -74,6 +74,37 @@ class CloudTransport {
     return id;
   }
 
+  // REPLY BUTTONS. Up to three, each with an id we get back when it is
+  // tapped — the customer taps instead of typing, and we read an exact
+  // string instead of guessing at "haan ok kardo".
+  //
+  // Cloud API only. The linked (QR) transport cannot send these at all, so
+  // the base class falls back to writing the choices out as text and the
+  // caller must accept either — see transport.js.
+  async sendButtons(number, text, buttons) {
+    const to = store.normPhone(number);
+    const three = (buttons || []).slice(0, 3).map((b) => ({
+      type: 'reply',
+      // 20 characters is the Cloud API's limit on a button title; a longer
+      // one is rejected for the whole message, not trimmed.
+      reply: { id: String(b.id).slice(0, 256), title: String(b.title).slice(0, 20) },
+    }));
+    if (!three.length) return this.sendText(number, text);
+    const data = await this._post(`${config.cloud.phoneNumberId}/messages`, {
+      messaging_product: 'whatsapp',
+      to,
+      type: 'interactive',
+      interactive: {
+        type: 'button',
+        // 1024 characters on the body of an interactive message.
+        body: { text: String(text).slice(0, 1024) },
+        action: { buttons: three },
+      },
+    });
+    store.log(this.botKey, `send -> ${to} [cloud, ${three.length} button(s)]: ${String(text).slice(0, 100).replace(/\n/g, ' | ')}`);
+    return (data && data.messages && data.messages[0] && data.messages[0].id) || null;
+  }
+
   // Send a FILE. Two steps: upload the bytes to get a media id, then send a
   // message referencing it. A 71-line order does not belong in a chat bubble —
   // the customer sent a spreadsheet and can only check our answer against
@@ -341,7 +372,24 @@ class CloudTransport {
                 (msg.text && msg.text.body) ||
                 (msg.image && msg.image.caption) ||
                 (msg.document && msg.document.caption) ||
+                // A TAPPED BUTTON. The id is ours - we set it when the
+                // buttons were sent - and the title is what the customer
+                // saw. The id becomes the body so handlers read an exact
+                // string instead of parsing a label. A customer may always
+                // ignore the buttons and type instead, so nothing may
+                // depend on the tap having happened.
+                (msg.interactive &&
+                  msg.interactive.button_reply &&
+                  (msg.interactive.button_reply.id || msg.interactive.button_reply.title)) ||
+                (msg.interactive && msg.interactive.list_reply && msg.interactive.list_reply.id) ||
+                (msg.button && (msg.button.payload || msg.button.text)) ||
                 '',
+              // Kept apart from the body so a handler can tell a TAP from
+              // somebody typing the same words.
+              buttonId:
+                (msg.interactive && msg.interactive.button_reply && msg.interactive.button_reply.id) ||
+                (msg.interactive && msg.interactive.list_reply && msg.interactive.list_reply.id) ||
+                null,
               hasMedia: Boolean(msg.image || msg.document),
               mediaType: msg.type,
               fileName: (msg.document && msg.document.filename) || '',
