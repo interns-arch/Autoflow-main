@@ -281,6 +281,7 @@ async function priceList(lines, who, t) {
   const kinds = new Set();
   const out = rows.map((l, i) => {
     const qty = Math.max(1, Number(l.qty) || 1);
+    const q = qty + (l.unit === 'box' ? ' box' : '');
     const p = got.get(norm(l.partNo));
     const note =
       l.source === 'unavailable' ? t(' (on order)', ' (on order)')
@@ -288,18 +289,20 @@ async function priceList(lines, who, t) {
           : '';
     if (!p) {
       complete = false;
-      return `${i + 1}. ${l.partNo} x${qty} - ${t('price to follow', 'price confirm karke')}${note}`;
+      return `${i + 1}. ${l.partNo} x${q} - ${t('price to follow', 'price confirm karke')}${note}`;
     }
     const unit = Number(p.rate || p.mrp);
     kinds.add(p.rate ? 'net' : 'mrp');
     total += unit * qty;
-    return `${i + 1}. ${l.partNo} x${qty} - ${priceText(p, t)} = ₹${money(unit * qty)}${note}`;
+    return `${i + 1}. ${l.partNo} x${q} - ${priceText(p, t)} = ₹${money(unit * qty)}${note}`;
   });
   // A total only when every line is priced the same way - see render().
-  const pcs = rows.reduce((n, l) => n + Math.max(1, Number(l.qty) || 1), 0);
+  // Pieces and boxes are counted apart: a box is one box, whatever is in it.
+  const count = (box) => rows.filter((l) => (l.unit === 'box') === box).reduce((n, l) => n + Math.max(1, Number(l.qty) || 1), 0);
+  const what = [count(false) ? count(false) + ' pcs' : '', count(true) ? count(true) + ' box' : ''].filter(Boolean).join(' + ');
   let foot = '';
   if (complete && kinds.size === 1 && total > 0) {
-    foot = '\n\n' + (kinds.has('net') ? t(`Total (${pcs} pcs): ₹`, `${pcs} pcs ka total: ₹`) : t(`Total at MRP (${pcs} pcs): ₹`, `${pcs} pcs ka total (MRP): ₹`)) + money(total);
+    foot = '\n\n' + (kinds.has('net') ? t(`Total (${what}): ₹`, `Total (${what}): ₹`) : t(`Total at MRP (${what}): ₹`, `Total MRP (${what}): ₹`)) + money(total);
   }
   return out.join('\n') + foot;
 }

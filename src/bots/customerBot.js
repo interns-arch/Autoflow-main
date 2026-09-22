@@ -105,6 +105,21 @@ const spokenCar = require('../core/chatState').slot('spokenCar');
 // match on the portal. chatId -> { at, queue, done, total, ctx }
 const nearAsk = require('../core/chatState').slot('nearAsk');
 const NEAR_MAX_MS = 3 * 60 * 60 * 1000;
+// "5 pcs" is five pieces. "2 box" is two boxes, however many each holds - a
+// box (pkt, packet, dabba) counts as one (founder, 22 Sep).
+const BOX_RE = /\b(box|boxes|bx|pkt|pkts|packet|packets|pack|packs|dabba|dabbe|dibba|dibbe)\b/i;
+function unitFor(text, asked) {
+  const want = String(asked || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const line = String(text || '')
+    .split(/\n/)
+    .find((l) => l.toUpperCase().replace(/[^A-Z0-9]/g, '').includes(want));
+  return line && BOX_RE.test(line) ? 'box' : 'pcs';
+}
+// 71761M67LA05PK -> 5. A catalogue number ending in <n>PK is a pack of n.
+function packOf(partNo) {
+  const m = /(\d{1,2})PK$/i.exec(String(partNo || ''));
+  return m ? Number(m[1]) : 0;
+}
 const NEAR_YES = /^(haan+|han+|ha+|hn|yes+|y|ok+|okay|ji|ji haan|sahi|sahi hai|theek|thik|theek hai|chalega|done|haan ji|yes please)\b.{0,15}$/i;
 const NEAR_NO = /^(nahi+|nahin|nhi|nai|no+|n|na|mat|nahi chahiye|no thanks)\b.{0,15}$/i;
 function withSpokenCar(chatId, item) {
@@ -1967,11 +1982,14 @@ class CustomerBot {
     }
     const stock = Number(q.available) > 0 ? t('in stock', 'stock hai') : t('on order', 'order pe');
     const n = st.done + 1;
+    const pack = packOf(q.partNo);
+    const packNote = pack ? t(` (pack of ${pack})`, ` (${pack} ka pack)`) : '';
+    const unit = q.unit === 'box' ? 'box' : 'pcs';
     const body =
       `(${n}/${st.total}) ${t(`${q.asked} did not match exactly. Closest part:`, `${q.asked} exact nahi mila. Milta-julta part:`)}\n` +
-      `*${q.partNo}*${q.name ? ' — ' + q.name : ''}\n` +
+      `*${q.partNo}*${packNote}${q.name ? ' — ' + q.name : ''}\n` +
       `${price ? price + ' · ' : ''}${stock}\n\n` +
-      t(`${q.qty} pcs of this one?`, `Yahi chahiye, ${q.qty} pcs?`);
+      t(`${q.qty} ${unit} of this one?`, `Yahi chahiye, ${q.qty} ${unit}?`);
     const text = lead ? lead + '\n\n' + body : body;
     const group = String(m.chatId || '').endsWith('@g.us') || m.isGroup;
     if (this.transport.sendButtons && !group) {
@@ -2001,8 +2019,9 @@ class CustomerBot {
       if (line && line.source !== 'unidentified' && line.source !== 'unknown') {
         const order = orders.getOrCreateDraft(m.chatId, m.from);
         if (st.ctx) order.portalCustomer = st.ctx;
-        orders.addLines(order, [{ ...line, requested: q.asked }]);
-        lead = t(`Added ${q.partNo} x${q.qty}.`, `${q.partNo} x${q.qty} order mein daal diya.`);
+        const unit = q.unit === 'box' ? 'box' : 'pcs';
+        orders.addLines(order, [{ ...line, requested: q.asked, unit }]);
+        lead = t(`Added ${q.partNo} x${q.qty} ${unit}.`, `${q.partNo} x${q.qty} ${unit} order mein daal diya.`);
       } else {
         lead = t(`Sorry, ${q.partNo} could not be added right now.`, `Sorry, ${q.partNo} abhi add nahi ho paya.`);
       }
@@ -2026,7 +2045,7 @@ class CustomerBot {
     if (!order || !order.lines.length) {
       return reply((lead ? lead + '\n\n' : '') + t('Nothing is in the order yet.', 'Order mein abhi koi part nahi hai.'));
     }
-    const lines = order.lines.map((l) => ({ partNo: l.partNo || l.item, qty: l.qty, available: l.available, source: l.source }));
+    const lines = order.lines.map((l) => ({ partNo: l.partNo || l.item, qty: l.qty, unit: l.unit, available: l.available, source: l.source }));
     const list = await rates.priceList(lines, { ctx: st.ctx }, t).catch(() => '');
     const text =
       (lead ? lead + '\n\n' : '') +
@@ -2687,7 +2706,7 @@ class CustomerBot {
       for (const u of numbered) {
         const asked = u.requested || u.partNo || u.item;
         const c = close.get(asked);
-        if (c) nearQueue.push({ asked, qty: u.qtyMissing ? 1 : u.qty || 1, ref: u.ref || null, key: u.key || null, partNo: c.partNo, name: c.name, available: c.available });
+        if (c) nearQueue.push({ asked, qty: u.qtyMissing ? 1 : u.qty || 1, unit: unitFor(m.body, asked), ref: u.ref || null, key: u.key || null, partNo: c.partNo, name: c.name, available: c.available });
         else noMatch.push(asked);
       }
       unknown = unknown.filter((u) => !isNumber(u));

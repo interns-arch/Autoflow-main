@@ -2315,7 +2315,16 @@ async function main() {
   check('"nahi" says sorry, not available', /Sorry, 71791m85S00 available nahi hai/i.test(near20c.said));
   check('...and the last answer brings the whole order priced, with pieces', /16510M65L10 x2/.test(near20c.said) && /71761M67LA05PK x4/.test(near20c.said) && /total/i.test(near20c.said) && /confirm/i.test(near20c.said));
   check('...with the refused part left out', !orders.findDraft('sim-919000000210').lines.some((l) => /71791M85S0/.test(l.partNo || l.item)));
+  check('a pack part says so in the question', /71761M67LA05PK\* \(5 ka pack\)|71761M67LA05PK\* \(pack of 5\)/.test(near20.said) && /4 pcs/.test(near20.said));
   orders.clearDraft && orders.clearDraft('sim-919000000210');
+
+  // "2 box" is two boxes, whatever each holds; "4 pcs" is four pieces.
+  const box20 = await rate20('919000000291', '71791m85S00 2 box');
+  check('"2 box" is asked about as 2 box', /Yahi chahiye, 2 box\?|2 box of this one\?/.test(box20.said) && /\(5 ka pack\)|\(pack of 5\)/.test(box20.said));
+  const box20b = await rate20('919000000291', 'haan');
+  check('...ordered as 2 box', (orders.findDraft('sim-919000000291').lines[0] || {}).unit === 'box' && orders.findDraft('sim-919000000291').lines[0].qty === 2);
+  check('...and the priced list says box, not pcs', /71791M85S005PK x2 box/.test(box20b.said) && /Total[^\n]*2 box/.test(box20b.said) && !/2 pcs/.test(box20b.said));
+  orders.clearDraft && orders.clearDraft('sim-919000000291');
   portal.searchByName = realSearch20;
 
   // ---- 21. A salesman ordering FOR a customer ----
