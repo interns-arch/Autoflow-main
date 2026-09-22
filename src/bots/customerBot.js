@@ -93,6 +93,7 @@ const quotable = require('../core/chatState').slot('quotable');
 // The priced short list a rate question was answered with, so "2" picks from
 // it. chatId -> { base, parts: [{ partNo, name }], at }
 const rateOptions = require('../core/chatState').slot('rateOptions');
+const discountSetup = require('../core/discountSetup');
 // The car a customer last NAMED in words, for the half hour after. "Swift
 // Dzire bumper price", then "mera gaadi 2018 model hai, kaun sa rear bumper"
 // - the second never says the car again, and searching "rear bumper" alone
@@ -326,6 +327,14 @@ class CustomerBot {
       if (step) return reply(step.reply);
     }
 
+    // THE AGENT SETTING UP THE NEW ACCOUNT'S DISCOUNT. Checked before media
+    // and the order parser: "12" here is a percentage, not a quantity.
+    if (discountSetup.pending(m.chatId)) {
+      const said = String(m.body || '').trim();
+      const done = await this.answerDiscount(m, said, reply, t);
+      if (done) return done;
+    }
+
     // Voice, PDF, spreadsheet, photo (pipeline/media). A message that is none
     // of those comes back as NOT_MEDIA and carries on below as text.
     const media = await handleMedia(this, m, reply, t);
@@ -343,6 +352,7 @@ class CustomerBot {
     {
       const decision = customerCreate.readDecision(text);
       if (decision && customerCreate.isApprover(m.from)) {
+        if (/^DSC-/.test(decision.requestId)) return this.decideDiscount(m, decision, reply, t);
         return this.decideNewCustomer(m, decision, reply, t);
       }
       if (decision) {
@@ -415,6 +425,13 @@ class CustomerBot {
       }
       store.log(this.key, `${m.from} asked to open an account${forElse ? ' for someone else' : ''}${agent ? ' (agent: ' + agent + ')' : ''}`);
       return reply(customerCreate.start(m.chatId, m.from, t, { forSomeoneElse: forElse }));
+    }
+
+    // AN EXISTING CUSTOMER'S DISCOUNT, CHANGED. Asked for in words; the
+    // change goes to the Sales Head before the portal is touched.
+    if (discountSetup.CHANGE_RE.test(text) && !discountSetup.pending(m.chatId)) {
+      store.log(this.key, `${m.from} asked to change a discount: "${text.slice(0, 60)}"`);
+      return this.startDiscountChange(m, text, reply, t);
     }
 
     // A NUMBER PLATE. "DL7CW1692" is a car, not a part — and before this it
@@ -762,9 +779,11 @@ class CustomerBot {
       const offered = rateOptions.get(m.chatId);
       if (offered && Date.now() - offered.at > 30 * 60 * 1000) rateOptions.delete(m.chatId);
       else if (offered) {
-        const n = /^(\d{1,2})\s*[.)]?$/.exec(text);
+        const n = /^(\d{1,3})\s*(?:[.)]|inch|inches|"|no|number)?\s*$/i.exec(text);
         const byNo = offered.parts.find((o) => rates.norm(o.partNo) === rates.norm(text));
-        const pick = byNo || (n ? offered.parts[Number(n[1]) - 1] : null);
+        // A range is picked by its size ("16"), a list by its line ("2").
+        const byKey = n ? offered.parts.find((o) => o.key && o.key === String(Number(n[1]))) : null;
+        const pick = byNo || byKey || (n ? offered.parts[Number(n[1]) - 1] : null);
         if (pick) {
           rateOptions.delete(m.chatId);
           clarify.clear(m.chatId);
@@ -2199,12 +2218,17 @@ class CustomerBot {
       }
     }
     store.log(this.key, `${form.answers.requestId} sent to ${approvers.length} approver(s)`);
-    return reply(
+    await reply(
       t(
         `Thank you — sent for approval (${form.answers.requestId}). You will hear as soon as it is open.`,
         `Shukriya — approval ke liye bhej diya (${form.answers.requestId}). Account khulte hi bata dunga.`,
       ),
     );
+    // An AGENT opened it: their customer's discount is theirs to set up, now,
+    // while the approval runs. A customer registering themselves is not asked
+    // to name their own discount.
+    if (form.byName) return this.startDiscountSetup(m, form, t);
+    return true;
   }
 
 
@@ -2267,6 +2291,7 @@ class CustomerBot {
 
     if (!decision.yes) {
       customerCreate.unpark(decision.requestId);
+      for (const r of discountSetup.forAccount(decision.requestId)) discountSetup.drop(r.id);
       store.log(this.key, `${decision.requestId} rejected by ${who}`);
       await this.transport.sendText(
         req.answers.phone,
@@ -2296,6 +2321,27 @@ class CustomerBot {
           `Aapka account khul gaya hai. Part number aur quantity bhejiye, order laga deta hoon.`,
         ),
       );
+      // The agent's discount rules, now that there is an account to hang
+      // them on: those already approved are created; the rest are created
+      // when their own OK comes.
+      const waiting = discountSetup.forAccount(decision.requestId);
+      if (waiting.length) {
+        const lines = [];
+        for (const r of waiting) {
+          if (r.status !== 'approved') {
+            lines.push(`⏳ ${r.rule.ruleName} — ${t('waiting for its own approval', 'approval ka wait')} (${r.id})`);
+            continue;
+          }
+          const made = await this.createDiscountFor(r);
+          if (made.ok) discountSetup.drop(r.id);
+          lines.push(made.ok ? '✅ ' + made.name : `⚠️ ${made.name} — ${made.why}`);
+        }
+        try {
+          await this.transport.sendToChat(req.chatId, t(`${req.answers.name} is approved. Discount rules:\n${lines.join('\n')}`, `${req.answers.name} approve ho gaya. Discount rules:\n${lines.join('\n')}`));
+        } catch (e) {
+          /* the rules exist either way */
+        }
+      }
       for (const phone of Object.keys(config.creation.notify)) {
         if (store.normPhone(phone) === store.normPhone(m.from)) continue;
         try {
@@ -2367,8 +2413,8 @@ class CustomerBot {
   // and let them pick by number, part number, or by saying which car ("2nd
   // gen", "2019"). A question with no prices ("Kaunsa? Front Side / Front")
   // answers nothing they asked.
-  async offerPriced(m, state, top, total, reply, t) {
-    const shown = top.slice(0, 5);
+  async offerPriced(m, state, top, total, reply, t, limit = 5) {
+    const shown = top.slice(0, limit);
     const onBehalf = route.onBehalfOf(m);
     const rateCtx = onBehalf || (await customers.resolve(m.from).catch(() => null));
     const priced = await rates.prices(shown.map((x) => x.partNo), { ctx: rateCtx && rateCtx.found ? rateCtx : null });
@@ -2389,7 +2435,7 @@ class CustomerBot {
       base: state.base,
       parts: shown.map((x) => {
         const p = priced.get(rates.norm(x.partNo));
-        return { partNo: x.partNo, name: x.name, price: p ? rates.priceText(p, t) : null };
+        return { partNo: x.partNo, name: x.name, price: p ? rates.priceText(p, t) : null, key: x.key || null };
       }),
       at: Date.now(),
     });
@@ -2464,6 +2510,497 @@ class CustomerBot {
         .filter(Boolean)
         .join('\n\n'),
     );
+  }
+
+  // ---- discount rules (core/discountSetup) ----
+  //
+  // Set up by the agent for a new account, or changed for one that exists -
+  // and in every case approved by the Sales Head ("OK DSC-…") before the
+  // portal is touched (founder, 22 Sep). A part-wise rule is set by the
+  // lowest price the part may be sold at: the portal's MRP is shown, the
+  // price is asked, and the percentage is worked out from the two.
+  async askDiscount(m, text, buttons, t) {
+    const group = String(m.chatId || '').endsWith('@g.us') || m.isGroup;
+    if (buttons && this.transport.sendButtons && !group) {
+      try {
+        const id = await this.transport.sendButtons(m.from, text, buttons);
+        conversation.record(m.chatId, 'us', text);
+        rememberMsg(m.chatId, id, 'us', text);
+        return true;
+      } catch (e) {
+        store.log(this.key, 'discount buttons failed, sending text: ' + String((e && e.message) || e).slice(0, 80));
+      }
+    }
+    const out = buttons ? text + '\n\n' + buttons.map((b) => '• ' + b.title).join('\n') : text;
+    const id = await this.transport.sendToChat(m.chatId, out);
+    conversation.record(m.chatId, 'us', out);
+    rememberMsg(m.chatId, id, 'us', out);
+    return true;
+  }
+
+  discountTypeButtons(t) {
+    return [
+      { id: 'DSC_BRAND', title: t('Brand wise', 'Brand wise') },
+      { id: 'DSC_PART', title: t('Part wise', 'Part wise') },
+      { id: 'DSC_LATER', title: t('Not now', 'Abhi nahi') },
+    ];
+  }
+
+  async toApprovers(text) {
+    let sent = 0;
+    for (const phone of Object.keys(config.creation.approvers)) {
+      try {
+        await this.transport.sendText(phone, text);
+        sent++;
+      } catch (e) {
+        store.log(this.key, `could not reach approver ${phone}: ${String((e && e.message) || e).slice(0, 90)}`);
+      }
+    }
+    return sent;
+  }
+
+  // A NEW ACCOUNT, just sent for approval: its agent sets the discount now.
+  async startDiscountSetup(m, form, t) {
+    discountSetup.save(m.chatId, {
+      mode: 'new',
+      accountRequestId: form.answers.requestId,
+      phone: form.answers.phone,
+      customer: form.answers.name || form.answers.phone,
+      setBy: form.byName,
+      step: 'type',
+      draft: {},
+      count: 0,
+    });
+    store.log(this.key, `${form.answers.requestId}: asking ${form.byName} for the discount rule`);
+    return this.askDiscount(
+      m,
+      t(
+        `Now the discount for ${form.answers.name || 'this customer'}. Brand-wise or part-wise? It is sent for approval, and starts the day it is approved.`,
+        `Ab ${form.answers.name || 'is customer'} ka discount rule set kar lete hain. Brand wise ya Part wise? Approval ke baad lagu hoga.`,
+      ),
+      this.discountTypeButtons(t),
+      t,
+    );
+  }
+
+  // AN EXISTING CUSTOMER'S DISCOUNT, changed. The customer asks for their own;
+  // an agent or the desk says whose.
+  async startDiscountChange(m, text, reply, t) {
+    const agent = customerCreate.agentName(m.from);
+    const staff = Boolean(agent) || salesOrder.isSalesPerson(m.from) || this.isOwnTeam(m);
+    const st = { mode: 'change', step: 'customer', draft: {}, count: 0, setBy: staff ? agent || m.profileName || m.from : 'customer (' + m.from + ')' };
+    if (!staff) {
+      const me = await customers.resolve(m.from).catch(() => null);
+      if (!me || !me.found) {
+        return reply(t('Your number is not on our system yet, so there is no discount to change.', 'Aapka number abhi system mein nahi hai, isliye discount change nahi ho sakta.'));
+      }
+      st.dealerId = me.buyerId;
+      st.customer = me.name;
+      return this.showDiscountRules(m, st, reply, t);
+    }
+    const picked = salesOrder.activeCustomer(m.chatId);
+    if (picked && picked.buyerId) {
+      st.dealerId = picked.buyerId;
+      st.customer = picked.name;
+      return this.showDiscountRules(m, st, reply, t);
+    }
+    discountSetup.save(m.chatId, st);
+    return reply(t('Whose discount? Send the customer name.', 'Kis customer ka discount? Customer ka naam bhejiye.'));
+  }
+
+  async showDiscountRules(m, st, reply, t) {
+    let rules = [];
+    try {
+      rules = (await portal.listDiscountRules()).filter((r) => Number(r.dealer_id) === Number(st.dealerId) && r.is_active !== false);
+    } catch (e) {
+      store.log(this.key, 'discount rules could not be read: ' + String((e && e.message) || e).slice(0, 80));
+    }
+    st.rules = rules.slice(0, 9).map((r) => ({
+      id: r.rule_id || r.id,
+      name: r.rule_name,
+      type: r.rule_type,
+      brand: r.brand,
+      partNo: r.part_no,
+      value: Number(r.discount_value),
+      mode: r.discount_mode,
+    }));
+    if (!st.rules.length) {
+      st.step = 'type';
+      discountSetup.save(m.chatId, st);
+      return this.askDiscount(
+        m,
+        t(`${st.customer} has no discount rule yet. A new one — brand-wise or part-wise?`, `${st.customer} ka abhi koi discount rule nahi hai. Naya rule — Brand wise ya Part wise?`),
+        this.discountTypeButtons(t),
+        t,
+      );
+    }
+    st.step = 'pickRule';
+    discountSetup.save(m.chatId, st);
+    const list = st.rules
+      .map((r, i) => `${i + 1}. ${r.name || r.brand || r.partNo || 'All parts'} — ${r.value}${String(r.mode).toUpperCase() === 'FLAT' ? ' (flat ₹)' : '%'}`)
+      .join('\n');
+    return reply(
+      t(
+        `${st.customer}'s discount rules:\n${list}\n\nWhich one to change? Send its number — or "new" for a new rule.`,
+        `${st.customer} ke discount rules:\n${list}\n\nKaunsa change karna hai? Number bhejiye — ya naye rule ke liye "naya".`,
+      ),
+    );
+  }
+
+  // The portal's MRP for a part, for the price question.
+  async mrpOf(partNo, dealerId) {
+    try {
+      const got = await rates.prices([partNo], { ctx: dealerId ? { buyerId: dealerId } : null });
+      const p = got.get(rates.norm(partNo));
+      return p && p.mrp ? Number(p.mrp) : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  async answerDiscount(m, said, reply, t) {
+    const st = discountSetup.get(m.chatId);
+    const d = st.draft;
+    const money = discountSetup.money;
+    const next = (step, text, buttons) => {
+      st.step = step;
+      discountSetup.save(m.chatId, st);
+      return this.askDiscount(m, text, buttons, t);
+    };
+    const skipHint = t(' ("skip" if none)', ' (nahi hai to "skip")');
+
+    if (discountSetup.LATER.test(said) || m.buttonId === 'DSC_LATER') {
+      discountSetup.cancel(m.chatId);
+      store.log(this.key, `discount setup left (${st.count} rule(s) sent for approval)`);
+      return reply(
+        st.count
+          ? t(`Done — ${st.count} discount rule(s) are with the Sales Head for approval.`, `Theek hai — ${st.count} discount rule approval ke liye bhej diye hain.`)
+          : t('No discount rule, then. It can be set later.', 'Theek hai, koi discount rule nahi. Baad mein set ho sakta hai.'),
+      );
+    }
+    // A price question or a part order in the middle is not an answer here.
+    if (!m.buttonId && /\b(kitne|kitna|rate|stock|hai kya)\b|\?\s*$/i.test(said) && !['confirm', 'confirmChange'].includes(st.step)) return null;
+
+    // The request, filed and sent to the Sales Head.
+    const submit = async (type, extra) => {
+      const req = discountSetup.file({
+        type,
+        rule: { ...d },
+        customer: st.customer,
+        dealerId: st.dealerId || null,
+        accountRequestId: st.accountRequestId || null,
+        phone: st.phone || null,
+        by: st.setBy,
+        chatId: m.chatId,
+        ...extra,
+      });
+      await this.toApprovers(discountSetup.approvalText(req));
+      store.log(this.key, `${req.id}: discount ${type} for ${st.customer} sent for approval (${d.target || ''} ${d.value}%)`);
+      return req;
+    };
+
+    switch (st.step) {
+      // ---- whose (agent or desk changing a customer's discount) ----
+      case 'customer': {
+        const n = /^(\d{1,2})[.)]?$/.exec(said);
+        let row = n && st.candidates ? st.candidates[Number(n[1]) - 1] : null;
+        if (!row) {
+          const found = await salesOrder.findCustomers(said).catch(() => ({ top: [] }));
+          const top = found.top || [];
+          if (!top.length) return next('customer', t(`No customer called "${said}". Send the name again.`, `"${said}" naam ka customer nahi mila. Naam dobara bhejiye.`));
+          if (top.length > 1) {
+            st.candidates = top.slice(0, 6).map((r) => ({ id: r.id, name: r.name, label: salesOrder.label(r) }));
+            return next('customer', t('Which one?', 'Kaunsa?') + '\n' + st.candidates.map((c, i) => `${i + 1}. ${c.label}`).join('\n'));
+          }
+          row = { id: top[0].id, name: top[0].name };
+        }
+        st.dealerId = row.id;
+        st.customer = row.name;
+        delete st.candidates;
+        return this.showDiscountRules(m, st, reply, t);
+      }
+      // ---- which rule ----
+      case 'pickRule': {
+        if (/^(naya|new|nayi|add)\b/i.test(said)) {
+          return next('type', t('A new rule — brand-wise or part-wise?', 'Naya rule — Brand wise ya Part wise?'), this.discountTypeButtons(t));
+        }
+        const n = discountSetup.readNumber(said);
+        const rule = n ? st.rules[n - 1] : null;
+        if (!rule) return next('pickRule', t(`Send a number from 1 to ${st.rules.length}, or "new".`, `1 se ${st.rules.length} tak number bhejiye, ya "naya".`));
+        if (String(rule.mode).toUpperCase() === 'FLAT') {
+          discountSetup.cancel(m.chatId);
+          return reply(t('That is a flat-amount rule; please change it on the portal.', 'Ye flat amount wala rule hai — ise portal pe change kijiye.'));
+        }
+        st.rule = rule;
+        d.kind = rule.type === 'ITEM' ? 'part' : rule.type === 'BRAND' ? 'brand' : 'dealer';
+        d.target = rule.partNo || rule.brand || 'ALL PARTS';
+        if (d.kind === 'part') {
+          const mrp = await this.mrpOf(rule.partNo, st.dealerId);
+          if (mrp) {
+            d.mrp = mrp;
+            return next(
+              'changePrice',
+              t(
+                `${rule.partNo} — MRP ${money(mrp)}. Now ${rule.value}% off: sells at ${money(discountSetup.priceAt(mrp, rule.value))}.\nNew lowest sale price (₹)?`,
+                `${rule.partNo} — MRP ${money(mrp)}. Abhi ${rule.value}% discount: ${money(discountSetup.priceAt(mrp, rule.value))} mein bikta hai.\nNaya minimum sale price (₹)?`,
+              ),
+            );
+          }
+        }
+        return next('changeValue', t(`Now ${rule.value}%. New discount %?`, `Abhi ${rule.value}% hai. Naya discount %?`));
+      }
+      case 'changePrice': {
+        const price = discountSetup.readNumber(said);
+        const pct = discountSetup.pctFromPrice(d.mrp, price);
+        if (pct === null) return next('changePrice', t(`A price below the MRP (${money(d.mrp)}), in ₹.`, `MRP (${money(d.mrp)}) se kam price, ₹ mein.`));
+        d.value = pct;
+        d.minPrice = price;
+        return next(
+          'confirmChange',
+          t(
+            `${st.rule.name || d.target}: ${st.rule.value}% → ${pct}% (sells at ${money(price)} against MRP ${money(d.mrp)}). Send for approval?`,
+            `${st.rule.name || d.target}: ${st.rule.value}% → ${pct}% (${money(price)} mein, MRP ${money(d.mrp)}). Approval ke liye bhejun?`,
+          ),
+          [{ id: 'DSC_YES', title: t('Yes', 'Haan') }, { id: 'DSC_NO', title: t('No', 'Nahi') }],
+        );
+      }
+      case 'changeValue': {
+        const v = discountSetup.readNumber(said);
+        if (v === null || v <= 0 || v >= 100) return next('changeValue', t('Send the discount as a percentage, like 12.', 'Discount % mein bhejiye, jaise 12.'));
+        d.value = v;
+        return next(
+          'confirmChange',
+          t(`${st.rule.name || d.target}: ${st.rule.value}% → ${v}%. Send for approval?`, `${st.rule.name || d.target}: ${st.rule.value}% → ${v}%. Approval ke liye bhejun?`),
+          [{ id: 'DSC_YES', title: t('Yes', 'Haan') }, { id: 'DSC_NO', title: t('No', 'Nahi') }],
+        );
+      }
+      case 'confirmChange': {
+        discountSetup.cancel(m.chatId);
+        if (!discountSetup.YES.test(said) && m.buttonId !== 'DSC_YES') {
+          return reply(t('Not sent. Nothing was changed.', 'Theek hai, nahi bheja. Kuch change nahi hua.'));
+        }
+        const req = await submit('change', { ruleId: st.rule.id, oldValue: st.rule.value, oldName: st.rule.name });
+        return reply(
+          t(
+            `Sent to the Sales Head for approval (${req.id}). The discount changes on the portal only once it is approved.`,
+            `Approval ke liye bhej diya (${req.id}). Approve hote hi portal pe discount update ho jayega.`,
+          ),
+        );
+      }
+
+      // ---- a new rule ----
+      case 'type': {
+        const brand = m.buttonId === 'DSC_BRAND' || /^brand/i.test(said);
+        const part = m.buttonId === 'DSC_PART' || /^part|^item/i.test(said);
+        if (!brand && !part) return next('type', t('Brand-wise or part-wise?', 'Brand wise ya Part wise?'), this.discountTypeButtons(t));
+        d.kind = brand ? 'brand' : 'part';
+        return next('target', brand ? t('Which brand?', 'Kaunsa brand?') : t('Which part number?', 'Kaunsa part number?'));
+      }
+      case 'target': {
+        if (!said) return next('target', d.kind === 'brand' ? t('Which brand?', 'Kaunsa brand?') : t('Which part number?', 'Kaunsa part number?'));
+        if (d.kind === 'brand') {
+          // As the portal writes it: "cartrend" is CARTRENDS there.
+          let brands = [];
+          try {
+            brands = await portal.listBrands(said);
+          } catch (e) {
+            store.log(this.key, 'brand list failed: ' + String((e && e.message) || e).slice(0, 80));
+          }
+          const exact = brands.find((b) => b.toLowerCase() === said.toLowerCase());
+          const pick = exact || (brands.length === 1 ? brands[0] : null);
+          if (!pick && brands.length > 1) {
+            return next('target', t(`Which of these? ${brands.slice(0, 8).join(' / ')}`, `Inme se kaunsa? ${brands.slice(0, 8).join(' / ')}`));
+          }
+          if (!pick) return next('target', t(`"${said}" is not a brand on the portal. Send the brand name again.`, `"${said}" portal pe brand nahi mila. Brand ka naam dobara bhejiye.`));
+          d.target = pick;
+          return next('value', t(`${d.target} — how much discount, in %?`, `${d.target} — kitna discount (%)?`));
+        }
+        const pn = ai.partNumberIn(said) || said.trim();
+        const [line] = await availability.resolve([{ item: pn, qty: 1 }]).catch(() => []);
+        if (!line || line.source === 'unidentified' || line.source === 'unknown') {
+          return next('target', t(`${pn} is not on the portal. Send the part number again.`, `${pn} portal pe nahi mila. Part number dobara bhejiye.`));
+        }
+        d.target = line.partNo || pn;
+        // The price it may be sold at, against the portal's own MRP.
+        const mrp = await this.mrpOf(d.target, st.dealerId);
+        if (mrp) {
+          d.mrp = mrp;
+          return next('price', t(`${d.target} — MRP ${money(mrp)}. Lowest price to sell it at (₹)?`, `${d.target} — MRP ${money(mrp)}. Minimum kitne mein bechna hai (₹)?`));
+        }
+        return next('value', t(`${d.target} — the portal has no MRP for it. How much discount, in %?`, `${d.target} — portal pe MRP nahi mila. Kitna discount (%)?`));
+      }
+      case 'price': {
+        const price = discountSetup.readNumber(said);
+        const pct = discountSetup.pctFromPrice(d.mrp, price);
+        if (pct === null) return next('price', t(`A price below the MRP (${money(d.mrp)}), in ₹.`, `MRP (${money(d.mrp)}) se kam price, ₹ mein.`));
+        d.value = pct;
+        d.minPrice = price;
+        return next(
+          'minQty',
+          t(`${money(price)} against MRP ${money(d.mrp)} is ${pct}% off.\nMinimum quantity? (default 1 — "skip")`, `${money(price)} / MRP ${money(d.mrp)} = ${pct}% discount.\nMinimum quantity? (default 1 — "skip" likh dijiye)`),
+        );
+      }
+      case 'value': {
+        const v = discountSetup.readNumber(said);
+        if (v === null || v <= 0 || v >= 100) return next('value', t('Send the discount as a percentage, like 12.', 'Discount % mein bhejiye, jaise 12.'));
+        d.value = v;
+        return next('minQty', t('Minimum quantity? (default 1 — "skip")', 'Minimum quantity? (default 1 — "skip" likh dijiye)'));
+      }
+      case 'minQty': {
+        const v = discountSetup.SKIP.test(said) ? 1 : discountSetup.readNumber(said);
+        if (!v || v < 1) return next('minQty', t('Minimum quantity as a number, or "skip" for 1.', 'Minimum quantity number mein, ya 1 ke liye "skip".'));
+        d.minQty = Math.round(v);
+        return next('maxQty', t('Maximum quantity?', 'Maximum quantity?') + skipHint);
+      }
+      case 'maxQty': {
+        const v = discountSetup.SKIP.test(said) ? null : discountSetup.readNumber(said);
+        if (!discountSetup.SKIP.test(said) && (!v || v < d.minQty)) return next('maxQty', t(`A number of at least ${d.minQty}, or "skip".`, `Kam se kam ${d.minQty}, ya "skip".`));
+        d.maxQty = v ? Math.round(v) : null;
+        return next('minAmount', t('Minimum amount (₹)?', 'Minimum amount (₹)?') + skipHint);
+      }
+      case 'minAmount': {
+        const v = discountSetup.SKIP.test(said) ? null : discountSetup.readNumber(said);
+        if (!discountSetup.SKIP.test(said) && !v) return next('minAmount', t('An amount in ₹, or "skip".', 'Amount ₹ mein, ya "skip".'));
+        d.minAmount = v || null;
+        return next('maxAmount', t('Maximum amount (₹)?', 'Maximum amount (₹)?') + skipHint);
+      }
+      case 'maxAmount': {
+        const v = discountSetup.SKIP.test(said) ? null : discountSetup.readNumber(said);
+        if (!discountSetup.SKIP.test(said) && (!v || (d.minAmount && v < d.minAmount))) return next('maxAmount', t('An amount in ₹ above the minimum, or "skip".', 'Minimum se zyada amount ₹ mein, ya "skip".'));
+        d.maxAmount = v || null;
+        return next('duration', t('For how long? (e.g. 30 days, 3 months, 1 year, or "always")', 'Kitne time ke liye? (jaise 30 din, 3 mahine, 1 saal, ya "hamesha")'));
+      }
+      case 'duration': {
+        const dur = discountSetup.readDuration(said);
+        if (dur === undefined) return next('duration', t('Like 30 days, 3 months, 1 year — or "always".', 'Jaise 30 din, 3 mahine, 1 saal — ya "hamesha".'));
+        d.days = dur.days;
+        d.durationLabel = dur.label;
+        d.ruleName = discountSetup.ruleName(st.customer, d.target, d.value);
+        const priced = d.mrp ? `\nMRP ${money(d.mrp)} → ${money(discountSetup.priceAt(d.mrp, d.value))}` : '';
+        return next('confirm', discountSetup.describe(d, t) + priced + '\n\n' + t('Send this rule for approval?', 'Ye rule approval ke liye bhejun?'), [
+          { id: 'DSC_YES', title: t('Yes', 'Haan') },
+          { id: 'DSC_NO', title: t('No, start again', 'Nahi, dobara') },
+        ]);
+      }
+      case 'confirm': {
+        if (discountSetup.NO.test(said) || m.buttonId === 'DSC_NO') {
+          st.draft = {};
+          return next('type', t('Again, then — brand-wise or part-wise?', 'Theek hai, dobara — Brand wise ya Part wise?'), this.discountTypeButtons(t));
+        }
+        if (!discountSetup.YES.test(said) && m.buttonId !== 'DSC_YES') {
+          return next('confirm', t('Send this rule for approval? Yes or no.', 'Ye rule approval ke liye bhejun? Haan ya Nahi.'), [
+            { id: 'DSC_YES', title: t('Yes', 'Haan') },
+            { id: 'DSC_NO', title: t('No, start again', 'Nahi, dobara') },
+          ]);
+        }
+        const req = await submit('new', {});
+        st.count += 1;
+        st.draft = {};
+        return next('more', t(`Sent for approval (${req.id}): ${d.ruleName}. Another rule for this customer?`, `Approval ke liye bhej diya (${req.id}): ${d.ruleName}. Is customer ke liye aur rule?`), [
+          { id: 'DSC_MORE_YES', title: t('Add another', 'Aur add karo') },
+          { id: 'DSC_MORE_NO', title: t('Done', 'Bas itna') },
+        ]);
+      }
+      case 'more': {
+        if (discountSetup.YES.test(said) || m.buttonId === 'DSC_MORE_YES') {
+          return next('type', t('Brand-wise or part-wise?', 'Brand wise ya Part wise?'), this.discountTypeButtons(t));
+        }
+        discountSetup.cancel(m.chatId);
+        return reply(
+          t(
+            `Done — ${st.count} discount rule(s) sent to the Sales Head. Each is created on the portal once approved${st.accountRequestId ? ' and the account is open' : ''}.`,
+            `Ho gaya — ${st.count} discount rule approval ke liye bhej diye. Approve hote hi${st.accountRequestId ? ' (aur account khulte hi)' : ''} portal pe ban jayenge.`,
+          ),
+        );
+      }
+      default:
+        discountSetup.cancel(m.chatId);
+        return null;
+    }
+  }
+
+  // One approved rule, created on the portal against the customer as the
+  // portal has them - looked up by phone for an account that was new.
+  async createDiscountFor(req) {
+    let dealerId = req.dealerId;
+    let name = req.customer;
+    if (!dealerId && req.phone) {
+      try {
+        const c = await portal.lookupCustomer(req.phone);
+        if (c && c.found) {
+          dealerId = c.buyerId;
+          name = c.name || name;
+        }
+      } catch (e) {
+        store.log(this.key, 'discount: customer lookup failed: ' + String((e && e.message) || e).slice(0, 80));
+      }
+    }
+    if (!dealerId) return { ok: false, name: req.rule.ruleName, why: 'customer not found on the portal yet' };
+    const body = discountSetup.toPortal({ ...req.rule, requestId: req.id, setBy: req.by }, dealerId, name);
+    try {
+      await portal.createDiscountRule(body);
+      return { ok: true, name: body.rule_name };
+    } catch (e) {
+      return { ok: false, name: body.rule_name, why: String((e && e.message) || e).slice(0, 100) };
+    }
+  }
+
+  // "OK DSC-7F3K" / "NO DSC-7F3K" from the Sales Head.
+  async decideDiscount(m, decision, reply, t) {
+    const req = discountSetup.find(decision.requestId);
+    if (!req) return reply(t(`${decision.requestId} not found — it may already be done.`, `${decision.requestId} nahi mila — shayad pehle hi ho chuka hai.`));
+    const who = customerCreate.approverName(m.from);
+    const what = req.type === 'change' ? `${req.customer}: ${req.oldValue}% → ${req.rule.value}%` : `${req.rule.ruleName || req.customer}`;
+    const tell = async (text) => {
+      if (!req.chatId) return;
+      try {
+        await this.transport.sendToChat(req.chatId, text);
+      } catch (e) {
+        /* the decision stands either way */
+      }
+    };
+
+    if (!decision.yes) {
+      discountSetup.drop(req.id);
+      store.log(this.key, `${req.id} (discount) rejected by ${who}`);
+      await tell(t(`Discount request ${req.id} (${what}) was not approved.`, `Discount request ${req.id} (${what}) approve nahi hua.`));
+      return reply(t(`Rejected ${req.id}. ${req.by || 'They'} was told.`, `${req.id} reject kar diya. ${req.by || 'Unko'} bata diya.`));
+    }
+
+    if (req.type === 'change') {
+      try {
+        await portal.updateDiscountRule(req.ruleId, {
+          discount_value: req.rule.value,
+          rule_name: discountSetup.ruleName(req.customer, req.rule.target, req.rule.value),
+        });
+      } catch (e) {
+        const why = String((e && e.message) || e).slice(0, 120);
+        store.log(this.key, `${req.id} discount update FAILED: ${why}`);
+        return reply(t(`Could not update it: ${why}\nThe request is still here — try *OK ${req.id}* again.`, `Update nahi ho paya: ${why}\nRequest abhi bhi hai — dobara *OK ${req.id}* bhejiye.`));
+      }
+      discountSetup.drop(req.id);
+      store.log(this.key, `${req.id} approved by ${who} — rule ${req.ruleId} now ${req.rule.value}%`);
+      await tell(t(`✅ Approved: ${what}. Updated on the portal.`, `✅ Approve ho gaya: ${what}. Portal pe update kar diya.`));
+      return reply(t(`Done — ${what}.`, `Ho gaya — ${what}.`));
+    }
+
+    // A new rule for an account that is itself still waiting: approved now,
+    // created the moment the account is.
+    if (req.accountRequestId && customerCreate.parked(req.accountRequestId)) {
+      req.status = 'approved';
+      discountSetup.requests.set(req.id, req);
+      store.log(this.key, `${req.id} approved by ${who} — waits for account ${req.accountRequestId}`);
+      return reply(t(`Approved. It is created as soon as ${req.accountRequestId} is approved.`, `Approve ho gaya. ${req.accountRequestId} approve hote hi portal pe ban jayega.`));
+    }
+    const made = await this.createDiscountFor(req);
+    if (!made.ok) {
+      store.log(this.key, `${req.id} discount create FAILED: ${made.why}`);
+      return reply(t(`Could not create it: ${made.why}\nTry *OK ${req.id}* again.`, `Nahi ban paya: ${made.why}\nDobara *OK ${req.id}* bhejiye.`));
+    }
+    discountSetup.drop(req.id);
+    store.log(this.key, `${req.id} approved by ${who} — created ${made.name}`);
+    await tell(t(`✅ Discount rule approved and created: ${made.name}`, `✅ Discount rule approve ho gaya, portal pe ban gaya: ${made.name}`));
+    return reply(t(`Done — ${made.name}.`, `Ho gaya — ${made.name}.`));
   }
 
   whereWeAre(m, t, { unclear = false } = {}) {

@@ -596,6 +596,96 @@ function asksOnlyFor(e) {
   return Boolean(bot && typeof bot.inquiryOnly === 'function' && bot.inquiryOnly(phone, e && e.chatId));
 }
 
+// THE HELPER'S WORDS ARE AN INSTRUCTION TO THE BOT (founder, 22 Sep), never
+// a message to forward. Read them for part numbers - one, or a whole range
+// ("12 inch: CTWBSI26P-12INCH, 14 inch: ...") - learn them, find each on the
+// portal, and answer the customer from the portal. Words with no part number
+// in them become a short reply for the customer, never the instruction itself.
+async function teachFromWords(e, id, words, { learn }) {
+  const teachings = require('./teachings');
+  const t = lang.for(e.chatId);
+  const send = (text) => e.customerBot.transport.sendToChat(e.chatId, text);
+  const r = await teachings.read(words, e.item);
+  const onPortal = await teachings.onPortal(r.partNos || []);
+  const spelled = (p) => (onPortal.get(teachings.normPn(p)) || {}).partNo || p;
+  const missing = (r.partNos || []).filter((p) => !onPortal.has(teachings.normPn(p)));
+  // A portal spelling with a space in it ("CTWBSI26P-16 Inch") is cut at the
+  // space by the part-number reader and never found. Learned as itself - and
+  // under the helper's spelling - it goes to the portal exactly as written.
+  for (const p of r.partNos || []) {
+    const exact = (onPortal.get(teachings.normPn(p)) || {}).partNo;
+    if (exact && /\s/.test(exact)) {
+      knowledge.learnAlias(exact, exact, 'portal');
+      knowledge.learnAlias(p, exact, 'portal');
+    }
+  }
+
+  // A RANGE: learned whole, in the portal's spelling.
+  let family = null;
+  if (learn && r.subject && r.variants.length >= 2) {
+    family = knowledge.learnFamily(r.subject, r.variants.map((v) => ({ ...v, partNo: spelled(v.partNo) })), 'helper');
+  }
+
+  // Which one THIS customer asked for.
+  let pick = null;
+  if (r.variants.length >= 2) {
+    const fam = learn ? knowledge.familyFor(e.item) : null;
+    const nums = new Set((String(e.item).match(/\b\d{1,3}\b/g) || []).map((n) => String(Number(n))));
+    const v = (fam && fam.variant) || r.variants.find((x) => nums.has(String(Number(x.key))));
+    if (v) pick = spelled(v.partNo);
+  } else if (r.partNo) {
+    pick = spelled(r.partNo);
+  }
+  const taughtWhat = family
+    ? `learned "${family.subject}" - ${family.variants.length} sizes`
+    : pick ? `learned "${e.item}" = ${pick}` : '';
+  const notOnPortal = missing.length ? `\n⚠️ Not found on the portal: ${missing.slice(0, 5).join(', ')}` : '';
+
+  if (pick) {
+    store.log('escalate', `#${id} helper's words read: "${e.item}" -> ${pick}${family ? ' (range of ' + family.variants.length + ')' : ''}`);
+    await resolveWithAnswer(e, pick, learn ? 'helper' : 'memory');
+    await ack(e, `✅ *#${id} done* — ${taughtWhat}. ${prettyPhone(e.customerPhone)} got the portal's answer for ${pick}.` + notOnPortal + waitingLine());
+    return true;
+  }
+
+  // A range, but the customer named no size: show them the range, priced.
+  if (r.variants.length >= 2 && typeof e.customerBot.offerPriced === 'function') {
+    const rows = r.variants.map((v) => {
+      const hit = onPortal.get(teachings.normPn(v.partNo));
+      return { partNo: spelled(v.partNo), name: (hit && hit.name) || `${r.subject || e.item} ${v.label}`, available: hit ? hit.available : 0, key: String(Number(v.key)) };
+    });
+    const phone = e.customerPhone || String(e.chatId || '').replace(/@.*$/, '');
+    await e.customerBot.offerPriced({ chatId: e.chatId, from: phone }, { base: e.item, qty: e.qty || 1, rate: true }, rows, rows.length, send, t, rows.length);
+    await ack(e, `✅ *#${id} done* — ${taughtWhat}. ${prettyPhone(e.customerPhone)} was shown the sizes to pick from.` + notOnPortal + waitingLine());
+    return true;
+  }
+
+  // No part number anywhere: something to TELL the customer, in our words -
+  // written by the model from the instruction. With no model to write it,
+  // a plain "not available" is said for them; anything else they wrote still
+  // reaches the customer rather than nothing, which is the one thing worse.
+  const partQuestion = ['NOT_IN_CATALOGUE', 'NO_PART_NUMBER'].includes(e.reason);
+  const say = r.customerReply || (partQuestion && teachings.plainCustomerReply(words, e.item, e.chatId)) || words;
+  if (say) {
+    await send(say);
+    if (learn && partQuestion && e.item) knowledge.addNote(e.item, say, 'helper');
+    store.log('escalate', `#${id} helper's words turned into a reply for the customer`);
+    await ack(e, `✅ *#${id} done* — sent to ${prettyPhone(e.customerPhone)}: "${say}"` + waitingLine());
+    return true;
+  }
+
+  // Nothing the bot can act on. The question stays open, and the helper is
+  // told what would work - rather than their note reaching the customer.
+  pending.set(id, e);
+  persist();
+  store.log('escalate', `#${id} helper's words had no part number and no reply in them - kept open`);
+  await ack(
+    e,
+    `⚠️ *#${id}* — I could not turn that into an answer for ${prettyPhone(e.customerPhone)}. Reply with the part number, or "no" if it is not available.` + waitingLine(),
+  );
+  return true;
+}
+
 // The helper's own words, to the customer, exactly as written.
 async function relayWords(e, id, words) {
   await e.customerBot.transport.sendToChat(e.chatId, words);
@@ -767,8 +857,7 @@ async function handleReply(m) {
   // a voice note means that part.
   if (RELAY_REASONS.includes(e.reason) && !partAnswer(answer)) {
     if (!explicit) return backOut(e, id);
-    await relayWords(e, id, answer);
-    return true;
+    return teachFromWords(e, id, answer, { learn: false });
   }
 
   if (/^(no|nahi|nhi|not available|na)\b/i.test(answer)) {
@@ -826,8 +915,7 @@ async function handleReply(m) {
   const pa = chosen === answer ? partAnswer(answer) : null;
   if (chosen === answer && !pa) {
     if (!explicit) return backOut(e, id);
-    await relayWords(e, id, answer);
-    return true;
+    return teachFromWords(e, id, answer, { learn: true });
   }
   // "16510M65L10 2" - the part, and the quantity the helper gave with it.
   if (pa) {

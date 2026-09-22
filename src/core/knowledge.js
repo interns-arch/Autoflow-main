@@ -33,7 +33,64 @@ function bank() {
   // person every time it is asked for, and they answer "yes that's right"
   // again and again — the exact repetition this whole module exists to stop.
   if (!s.knowledge.onOrder) s.knowledge.onOrder = {};
+  // A RANGE a person taught in one message: "Cartrends wiper blade - 12
+  // inch is CTWBSI26P-12INCH, 14 inch is ..., 26 inch is ...". One entry, so
+  // "cartrend wiper blade 18 number" finds the 18 without anyone being asked.
+  if (!s.knowledge.families) s.knowledge.families = [];
   return s.knowledge;
+}
+
+// ---- families ----
+// Words that name nothing: "Wiper Blade FOR Cartrends", "it HAS SIZES".
+const FAMILY_FILLER = /^(for|of|the|a|an|and|ka|ki|ke|hai|h|size|sizes|inch|inches|number|no|part|parts|pcs|pc|chahiye|wala|wali|brand|company|ke liye)$/;
+// "cartrends" and "cartrend" are the same brand; "blades" and "blade" the same part.
+const stem = (w) => (w.length > 4 && w.endsWith('s') ? w.slice(0, -1) : w);
+function familyWords(text) {
+  return key(text)
+    .split(' ')
+    .filter((w) => w && !/^\d+$/.test(w) && !FAMILY_FILLER.test(w))
+    .map(stem);
+}
+
+// subject: "Cartrends wiper blade"; variants: [{ key: '16', label, partNo }]
+function learnFamily(subject, variants, source) {
+  const words = [...new Set(familyWords(subject))];
+  const vs = (variants || []).filter((v) => v && v.partNo && v.key);
+  if (!words.length || !vs.length) return null;
+  const fams = bank().families;
+  const same = fams.find((f) => f.words.length === words.length && f.words.every((w) => words.includes(w)));
+  const entry = {
+    id: same ? same.id : 'FAM-' + Date.now(),
+    subject: String(subject).trim(),
+    words,
+    variants: vs.map((v) => ({ key: String(v.key), label: String(v.label || v.key), partNo: String(v.partNo) })),
+    source: source || 'human',
+    learnedAt: new Date().toISOString(),
+  };
+  if (same) Object.assign(same, entry);
+  else fams.push(entry);
+  store.save();
+  store.log('knowledge', `family learned: "${entry.subject}" - ${entry.variants.length} variant(s)`);
+  return entry;
+}
+
+// The family this text is about, and the variant when it names one:
+// "cartrend wiper blade 16 number" -> { family, variant: {key:'16', ...} }.
+// Every word of the family has to be there - "wiper blade 16" without the
+// brand is some other brand's blade, and gets no answer from this one.
+function familyFor(text) {
+  const mine = new Set(familyWords(text));
+  if (!mine.size) return null;
+  const nums = new Set((key(text).match(/\b\d{1,3}\b/g) || []).map((n) => String(Number(n))));
+  let best = null;
+  for (const f of bank().families) {
+    if (!f.words.every((w) => mine.has(w))) continue;
+    if (best && best.words.length >= f.words.length) continue;
+    best = f;
+  }
+  if (!best) return null;
+  const variant = best.variants.find((v) => nums.has(String(Number(v.key)))) || null;
+  return { family: best, variant };
 }
 
 function normNo(v) {
@@ -73,6 +130,11 @@ function lookupAlias(phrase) {
   if (!k) return null;
   const aliases = bank().aliases;
   if (aliases[k]) return aliases[k].partNo;
+  // A range someone taught, and the size they asked for.
+  if (!isPartShaped(k)) {
+    const fam = familyFor(phrase);
+    if (fam && fam.variant) return fam.variant.partNo;
+  }
   // Looser matching is for NAMES only, and on whole words: "clutch set dzire
   // petrol please" still finds "clutch set dzire petrol". A part-number typo
   // is never matched inside anything, and a phrase that is itself a part
@@ -174,4 +236,4 @@ function all() {
   return { aliases: b.aliases, notes: b.notes };
 }
 
-module.exports = { lookupAlias, learnAlias, noteAliasHit, aliasNames, addNote, findNote, markOnOrder, isOnOrder, all };
+module.exports = { lookupAlias, learnAlias, noteAliasHit, aliasNames, addNote, findNote, markOnOrder, isOnOrder, all, learnFamily, familyFor };

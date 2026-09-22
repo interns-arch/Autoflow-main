@@ -64,7 +64,7 @@ function notAnAnswer(field, m, said) {
   const media = type && !['chat', 'text', 'interactive', 'button'].includes(type);
   if (media) {
     if (field.type === 'photo' && type === 'image') return false;
-    if (field.type === 'location' && type === 'location') return false;
+    if (field.type === 'location' && (type === 'location' || type === 'image')) return false;
     return true;
   }
   if (!said) return false;
@@ -376,6 +376,26 @@ async function answer(chatId, m, text, t) {
   }
 
   if (field.type === 'location') {
+    // A photo with the location printed on it is as good as a pin.
+    if (m && m.mediaBase64 && /^image\//.test(m.mediaMime || '')) {
+      const look = await require('./ai').readShopPhoto(m.mediaBase64, m.mediaMime);
+      if (takeStampedGps(form, look)) return advance(form, t);
+      const fix = require('./exif').gpsFrom(m.mediaBase64);
+      if (fix) {
+        form.answers.lat = fix.lat;
+        form.answers.lng = fix.lng;
+        form.answers.locationFrom = 'photo';
+        return advance(form, t);
+      }
+      return {
+        reply: t(
+          'There is no location on that photo. Please share the location: attach (📎) → Location → Send your current location.',
+          'Is photo pe location nahi hai. Location bhej dijiye — attach (📎) → Location → Send your current location.',
+        ),
+        done: false,
+        form,
+      };
+    }
     const loc = m && m.location;
     if (!loc || !Number.isFinite(loc.lat)) {
       return {
@@ -411,6 +431,10 @@ async function answer(chatId, m, text, t) {
     // refusal — the photo is accepted and the approver decides, exactly as
     // before any of this existed.
     const look = await require('./ai').readShopPhoto(m.mediaBase64, m.mediaMime);
+    // The LOCATION, when the camera printed it on the photo (GPS Map Camera
+    // and the like). Taken from any photo sent here - even one retaken for a
+    // better view of the board - so the pin is never asked for when we have it.
+    const stamped = takeStampedGps(form, look);
     if (look && !look.isShop) {
       form.photoTries = (form.photoTries || 0) + 1;
       if (form.photoTries < 2) {
@@ -457,6 +481,14 @@ async function answer(chatId, m, text, t) {
     // photo. It survives when the picture is sent as a DOCUMENT. So this
     // fires sometimes and the pin is still asked for the rest of the time.
     const fix = require('./exif').gpsFrom(m.mediaBase64);
+    if (stamped) {
+      const step = advance(form, t);
+      const said = t(
+        `Got it — the location is printed on the photo${stamped.address ? ' (' + stamped.address + ')' : ''}.\n\n`,
+        `Photo pe hi location hai${stamped.address ? ' (' + stamped.address + ')' : ''} — alag se bhejne ki zarurat nahi.\n\n`,
+      );
+      return step.done ? step : { ...step, reply: said + step.reply };
+    }
     if (fix && form.answers.lat === undefined) {
       form.answers.lat = fix.lat;
       form.answers.lng = fix.lng;
@@ -759,6 +791,18 @@ async function fillFromGst(form, gstin, t) {
   return step.done ? step : { ...step, reply: found + step.reply };
 }
 
+// A GPS stamp read off the photo goes on the form, once.
+function takeStampedGps(form, look) {
+  const g = look && look.gps;
+  if (!g || form.answers.lat !== undefined) return null;
+  form.answers.lat = g.lat;
+  form.answers.lng = g.lng;
+  form.answers.locationFrom = 'stamp';
+  if (g.address) form.answers.stampAddress = g.address;
+  store.log('create', `${form.chatId}: location read off the photo's GPS stamp (${g.lat}, ${g.lng})`);
+  return g;
+}
+
 function advance(form, t) {
   form.idx += 1;
   // Skip anything the GSTIN already answered. Asking a customer to type a
@@ -860,6 +904,7 @@ function summary(form, t) {
     a.bannerText ? 'Board reads: ' + a.bannerText : null,
     a.photoNote ? 'Photo: ' + a.photoNote : null,
     a.locationFrom === 'photo' ? 'Location: read from the photo EXIF' : null,
+    a.locationFrom === 'stamp' ? 'Location: printed on the photo (GPS stamp)' + (a.stampAddress ? ' — ' + a.stampAddress : '') : null,
     form.notChecked && form.notChecked.length
       ? 'NOT checked against the portal: ' + form.notChecked.join(', ')
       : null,
@@ -884,7 +929,7 @@ function summary(form, t) {
 
 // "OK WA-ABC123" / "NO WA-ABC123" from an approver.
 function readDecision(text) {
-  const m = String(text || '').trim().match(/^(ok|yes|haan|approve|no|nahi|reject)\s+(WA-[A-Z0-9]+)$/i);
+  const m = String(text || '').trim().match(/^(ok|yes|haan|approve|no|nahi|reject)\s+((?:WA|DSC)-[A-Z0-9]+)$/i);
   if (!m) return null;
   return { yes: /^(ok|yes|haan|approve)$/i.test(m[1]), requestId: m[2].toUpperCase() };
 }
@@ -909,6 +954,15 @@ function parked(requestId) {
 }
 function unpark(requestId) {
   awaiting.delete(String(requestId || '').toUpperCase());
+}
+// A discount rule the agent set up, kept on the request until it is approved.
+function addDiscount(requestId, rule) {
+  const id = String(requestId || '').toUpperCase();
+  const req = awaiting.get(id);
+  if (!req) return false;
+  req.discounts = [...(req.discounts || []), rule];
+  awaiting.set(id, req);
+  return true;
 }
 
 // Which of OUR messages carried which request, by WhatsApp id. 22 Sep, live:
@@ -955,6 +1009,7 @@ module.exports = {
   park,
   parked,
   unpark,
+  addDiscount,
   noteSummary,
   requestForMessage,
   requestIdIn,

@@ -439,14 +439,21 @@ function remarksWith(fields) {
   return bits.join(' | ') || null;
 }
 let mockHistory = null;
+const mockDiscountRules = [];
+let mockBrands = ['CARTRENDS', 'MARUTI SUZUKI', 'BOSCH', 'MINDA'];
 // tests: { track: {id: obj}, dispatches: [], invoiceStatus: {id: obj}, challans: {id: true}, shortages: [], partStatus: {part: obj}, incoming: [] }
 let mockLookups = {};
 const mockUsers = new Map(); // tests: mobile -> portal user
 const userCache = new Map(); // mobile -> { at, value }
 const USER_TTL_MS = 6 * 60 * 60 * 1000;
 
+// Upper-cased: the catalogue is case-sensitive and customers type "16510m65l10".
+// Not a number with a SPACE in it: that is the portal's own spelling, learned
+// from its catalogue ("CTWBSI26P-16 Inch"), and upper-casing it made it a part
+// the portal has never heard of.
 function portalPartNo(v) {
-  return String(v == null ? '' : v).trim().toUpperCase();
+  const s = String(v == null ? '' : v).trim();
+  return /\s/.test(s) ? s : s.toUpperCase();
 }
 
 // What create-part is sent for an Inventory Creation request. The house-style
@@ -926,6 +933,52 @@ module.exports = {
     const data = await api('POST', '/parts/create-part', body, true, 'admin');
     store.log('portal', `part created: ${body.part_no} (${body.brand})`);
     return { partNo: body.part_no, raw: data };
+  },
+
+  // DISCOUNT RULES - what the portal's "Create Discount Rule" screen writes.
+  // A new account's discount is set up here by the agent who opened it, and
+  // only created once the account itself is approved (core/discountSetup).
+  async listDiscountRules() {
+    if (isMock()) return mockDiscountRules.slice();
+    const data = await api('GET', '/discount-rules/', null, true, 'admin');
+    return Array.isArray(data) ? data : (data && (data.items || data.data || data.results)) || [];
+  },
+  async createDiscountRule(body) {
+    if (isMock()) {
+      const rule = { id: mockDiscountRules.length + 1, ...body };
+      mockDiscountRules.push(rule);
+      return rule;
+    }
+    const data = await api('POST', '/discount-rules/', body, true, 'admin');
+    store.log('portal', `discount rule created: "${body.rule_name || ''}" (${body.rule_type}, ${body.discount_value}${body.discount_mode === 'percent' ? '%' : ''})`);
+    return data;
+  },
+  // A rule that exists, changed: only the fields sent are touched.
+  async updateDiscountRule(ruleId, body) {
+    if (isMock()) {
+      const r = mockDiscountRules.find((x) => x.id === ruleId || x.rule_id === ruleId);
+      if (!r) throw Object.assign(new Error('rule ' + ruleId + ' not found'), { status: 404 });
+      Object.assign(r, body);
+      return r;
+    }
+    const data = await api('PUT', '/discount-rules/' + encodeURIComponent(ruleId), body, true, 'admin');
+    store.log('portal', `discount rule ${ruleId} updated: ${JSON.stringify(body).slice(0, 120)}`);
+    return data;
+  },
+  _setMockDiscountRules: (list) => {
+    mockDiscountRules.length = 0;
+    for (const r of list || []) mockDiscountRules.push(r);
+  },
+  // The brands the product master knows, so "cartrend" is written as the
+  // portal writes it before a rule is made against it.
+  async listBrands(q) {
+    if (isMock()) return mockBrands.filter((b) => !q || b.toLowerCase().includes(String(q).toLowerCase()));
+    const data = await api('GET', `/parts/brands?q=${encodeURIComponent(q || '')}&limit=20`);
+    const rows = Array.isArray(data) ? data : (data && (data.items || data.data || data.results || data.brands)) || [];
+    return rows.map((r) => (typeof r === 'string' ? r : r.brand || r.name || r.value)).filter(Boolean);
+  },
+  _setMockBrands: (list) => {
+    mockBrands = list || [];
   },
 
   // Vendor accounts. Same shape as a customer except the name field is called
@@ -1589,7 +1642,7 @@ module.exports = {
     ];
 
     const out = new Array(lines.length).fill(null);
-    const slots = lines.map((line, slot) => ({ slot, line, partNo: String(line.partNo || line.item).toUpperCase() }));
+    const slots = lines.map((line, slot) => ({ slot, line, partNo: portalPartNo(line.partNo || line.item) }));
 
     // one call for a set of slots; assigns results, or throws with the list of
     // part numbers the portal refused

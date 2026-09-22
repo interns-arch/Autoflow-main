@@ -1117,7 +1117,7 @@ async function geminiOrderImage(base64, mediaType) {
 const SHOP_PHOTO_PROMPT = [
   'You are looking at a photograph sent by a shop owner to open a trade account.',
   'Answer ONLY with JSON, no prose:',
-  '{"isShop": true|false, "hasBanner": true|false, "bannerText": "<text on the signboard, or empty>", "why": "<six words>"}',
+  '{"isShop": true|false, "hasBanner": true|false, "bannerText": "<text on the signboard, or empty>", "why": "<six words>", "gps": {"lat": <number or null>, "lng": <number or null>, "address": "<address printed with it, or empty>"}}',
   '',
   'isShop: true if this shows a shop, garage, workshop or business premises —',
   '  inside or outside. False for a selfie with no premises, a screenshot, a',
@@ -1125,7 +1125,21 @@ const SHOP_PHOTO_PROMPT = [
   'hasBanner: true if a signboard, banner, hoarding or painted shop name is',
   '  visible AND readable. A blank awning is not a banner.',
   'bannerText: exactly what the board says, if you can read it. Do not guess.',
+  'gps: a GPS stamp PRINTED on the photo by a camera app (e.g. "GPS Map Camera": "Lat 28.530972° Long',
+  '  77.053152°" and an address in a corner). Copy the numbers exactly as printed; south and west are',
+  '  negative. null for both when nothing like that is printed - never estimate a location from the scene.',
 ].join('\n');
+
+// A printed stamp, if the numbers are a real place. 0,0 and out-of-range
+// numbers are a misread, not a location.
+function stampedGps(g) {
+  if (!g || typeof g !== 'object') return null;
+  const lat = Number(g.lat);
+  const lng = Number(g.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  if (Math.abs(lat) > 90 || Math.abs(lng) > 180 || (lat === 0 && lng === 0)) return null;
+  return { lat, lng, address: String(g.address || '').trim().slice(0, 200) || null };
+}
 
 async function readShopPhoto(base64, mediaType) {
   const g = config.gemini;
@@ -1162,8 +1176,9 @@ async function readShopPhoto(base64, mediaType) {
       hasBanner: r.hasBanner === true,
       bannerText: String(r.bannerText || '').trim().slice(0, 80) || null,
       why: String(r.why || '').trim().slice(0, 60) || null,
+      gps: stampedGps(r.gps),
     };
-    store.log('ai', `shop photo: shop=${out.isShop} banner=${out.hasBanner}${out.bannerText ? ' "' + out.bannerText + '"' : ''}`);
+    store.log('ai', `shop photo: shop=${out.isShop} banner=${out.hasBanner}${out.bannerText ? ' "' + out.bannerText + '"' : ''}${out.gps ? ` gps=${out.gps.lat},${out.gps.lng}` : ''}`);
     return out;
   } catch (e) {
     // A vision call that failed must not stop an account being opened.

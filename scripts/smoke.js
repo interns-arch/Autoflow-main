@@ -2331,18 +2331,152 @@ async function main() {
     await dm(customer, '919000000292', 'cartrend wiper blade 16 number 10 pcs');
     const wq = customer.transport.outbox.find((o) => o.to === config.escalationNumber && /Question \*#/.test(o.text || '') && /wiper/i.test(o.text || ''));
     check('a part the portal does not have goes to the helper, with who is asking', Boolean(wq) && /Mock Customer/.test(wq.text));
+    // The founder's instruction, word for word. The portal spells one size
+    // with a space ("CTWBSI26P-16 Inch") and the rest without.
+    const sizes20 = ['12', '14', '16', '17', '18', '19', '20', '21', '22', '24', '26'];
+    const spell20 = (n) => (n === '16' ? 'CTWBSI26P-16 Inch' : `CTWBSI26P-${n}INCH`);
+    portal.setMockStock(sizes20.map((n) => ({ part_no: spell20(n), name: `Wiper Blade | ${n} Inches | All Cars`, quantity: 100, price: 40, mrp: 60, vendor: 'K' })));
+    const searchMock20 = portal.searchByName;
+    portal.searchByName = async (q) => {
+      const w = String(q).toUpperCase().replace(/[^A-Z0-9]/g, '');
+      const rows = sizes20.map(spell20).filter((p) => p.toUpperCase().replace(/[^A-Z0-9]/g, '').startsWith(w));
+      return { total: rows.length, top: rows.map((p) => ({ partNo: p, name: 'Wiper Blade | ' + p, available: 100 })) };
+    };
+    const TEACH20 =
+      'Whenever any customer ask for Wiper Blade for Cartrends then it has sizes. 12 INCHES PART NUMBER: CTWBSI26P-12INCH, 14 INCHES PART NUMBER: CTWBSI26P-14INCH,  16 INCHES PART NUMBER: CTWBSI26P-16 Inch, 17 INCHES PART NUMBER: CTWBSI26P-17INCH, 18 INCHES PART NUMBER: CTWBSI26P-18INCH, 19 INCHES PART NUMBER: CTWBSI26P-19INCH, 20 INCHES PART NUMBER: CTWBSI26P-20INCH, 21 INCHES PART NUMBER: CTWBSI26P-21INCH, 22 INCHES PART NUMBER: CTWBSI26P-22INCH, 24 INCHES PART NUMBER: CTWBSI26P-24INCH, 26 INCHES PART NUMBER: CTWBSI26P-26INCH';
     customer.transport.outbox.length = 0;
     await customer.transport.injectIncoming({
-      from: config.escalationNumber, chatId: 'sim-' + config.escalationNumber, isGroup: false,
-      body: 'Cartrend wiper 16 inch abhi stock mein nahi hai, 2 din mein aayega', contextId: wq && wq.id, mediaType: 'chat',
+      from: config.escalationNumber, chatId: 'sim-' + config.escalationNumber, isGroup: false, body: TEACH20, contextId: wq && wq.id, mediaType: 'chat',
     });
-    check('...the helper\'s words reach the customer', customer.transport.outbox.some((o) => String(o.to).indexOf('919000000292') >= 0 && /2 din mein aayega/.test(o.text || '')));
-    check('...and are learned', Boolean(k20.findNote('cartrend wiper blade 16 number')));
+    const toCust20 = customer.transport.outbox.filter((o) => String(o.to).indexOf('919000000292') >= 0).map((o) => o.text || '').join('\n');
+    check('...the instruction is NOT forwarded to the customer', !/Whenever any customer/i.test(toCust20));
+    check('...the customer gets the portal\'s answer for the 16 inch', /CTWBSI26P-16 Inch/.test(toCust20) && (orders.findDraft('sim-919000000292') || { lines: [] }).lines.some((l) => l.partNo === 'CTWBSI26P-16 Inch' && l.qty === 10));
+    check('...and the helper is told what was learned', customer.transport.outbox.some((o) => o.to === config.escalationNumber && /11 sizes/.test(o.text || '')));
+    check('...the whole range is learned', k20.lookupAlias('cartrend wiper blade 18 number') === 'CTWBSI26P-18INCH' && k20.lookupAlias('Cartrends wiper blade 16 inch') === 'CTWBSI26P-16 Inch');
     customer.transport.outbox.length = 0;
-    await dm(customer, '919000000293', 'Cartrend wiper blade 16 number 5 pcs');
-    check('the next customer asking the same gets that answer', customer.transport.outbox.some((o) => String(o.to).indexOf('919000000293') >= 0 && /2 din mein aayega/.test(o.text || '')));
+    await dm(customer, '919000000293', 'Cartrend wiper blade 18 number 5 pcs');
+    check('the next customer asking for another size gets it from the portal', (orders.findDraft('sim-919000000293') || { lines: [] }).lines.some((l) => l.partNo === 'CTWBSI26P-18INCH' && l.qty === 5));
     check('...and nobody is asked again', !customer.transport.outbox.some((o) => o.to === config.escalationNumber && /Question \*#/.test(o.text || '')));
-    check('a learned answer is not given to a different question', !k20.findNote('wiper') && !k20.findNote('cartrend wiper blade 18 number'));
+    check('another brand\'s blade is not answered from this range', k20.lookupAlias('bosch wiper blade 16') === null);
+    portal.searchByName = searchMock20;
+    portal.setMockStock([
+      { part_no: '16510M65L10', name: 'Oil Filter', quantity: 50, price: 100, mrp: 120, vendor: 'K' },
+      { part_no: '71761M67LA05PK', name: 'Bumper| Front Side | WagonR', quantity: 30, price: 50, mrp: 60, vendor: 'K' },
+      { part_no: '71791M85S005PK', name: 'BUMPER | ERTIGA/SWIFT | FRONT LOWER', quantity: 26, price: 500, mrp: 560, vendor: 'K' },
+    ]);
+  }
+
+  // DISCOUNT RULES (founder, 22 Sep). Every rule - set up by the agent for a
+  // new account, or a change to one that exists - goes to the Sales Head as
+  // "OK DSC-…" first; the portal is only touched once it is approved. A
+  // part-wise rule is set by the lowest sale price against the portal's MRP.
+  {
+    const cc20 = require('../src/core/customerCreate');
+    const ds20 = require('../src/core/discountSetup');
+    const cr20 = require('../src/config').creation;
+    const apprWas20 = cr20.approvers;
+    const dpCfg20 = require('../src/config').dealerPortal;
+    const listWas20 = dpCfg20.listPriceAccountId;
+    dpCfg20.listPriceAccountId = 3822; // the house account MRPs are read from, as live
+    cr20.approvers = { 919999492550: 'Prateek Sir' };
+    const APPR20 = '919999492550';
+    const AGENT20 = '919000000301';
+    const agentChat20 = 'sim-' + AGENT20;
+    const tt20 = (en, hi) => hi;
+    const say20 = async (from, body, buttonId) => {
+      customer.transport.outbox.length = 0;
+      await customer.transport.injectIncoming({ from, chatId: 'sim-' + from, isGroup: false, body, buttonId: buttonId || null, mediaType: 'chat' });
+      return customer.transport.outbox;
+    };
+    const text20 = (out) => out.map((o) => o.text || '').join('\n');
+    const dscIn20 = (out) => ((text20(out).match(/DSC-[A-Z0-9]{4}/) || [])[0]);
+    try {
+      // ---- a new account: the agent's brand rule ----
+      const form20 = {
+        chatId: agentChat20,
+        byName: 'Shubham',
+        answers: { requestId: 'WA-DSC20', phone: '919000000302', name: 'KALRA MOTORS', businessType: 'retailer', contactPerson: 'Kalra', email: 'k@example.com', gstNo: '06CIYPK2053H1ZZ', city: 'Gurgaon', state: 'Haryana', pin: '122001', address: 'Shop G2' },
+      };
+      cc20.park(form20);
+      customer.transport.outbox.length = 0;
+      await customer.startDiscountSetup({ chatId: agentChat20, from: AGENT20 }, form20, tt20);
+      check('the agent is asked for the discount: brand or part', /Brand wise ya Part wise/.test(text20(customer.transport.outbox)));
+      await say20(AGENT20, 'Brand wise', 'DSC_BRAND');
+      check('the brand is written as the portal writes it', /CARTRENDS — kitna discount/.test(text20(await say20(AGENT20, 'cartrend'))));
+      await say20(AGENT20, '12');
+      for (let i = 0; i < 4; i++) await say20(AGENT20, 'skip');
+      const sum20 = text20(await say20(AGENT20, '3 mahine'));
+      check('the rule is named customer + brand + discount', /KALRA MOTORS CARTRENDS 12%/.test(sum20) && /Min qty: 1/.test(sum20) && /3 months/.test(sum20));
+      const sent20 = await say20(AGENT20, 'Haan', 'DSC_YES');
+      const id20 = dscIn20(sent20);
+      const toAppr20 = sent20.filter((o) => o.to === APPR20).map((o) => o.text).join('\n');
+      check('the rule goes to the Sales Head for approval', Boolean(id20) && /\*Discount rule\*/.test(toAppr20) && /CARTRENDS — 12%/.test(toAppr20) && /OK DSC-/.test(toAppr20));
+      await say20(AGENT20, 'Bas itna', 'DSC_MORE_NO');
+      const before20 = (await portal.listDiscountRules()).length;
+      // the account is approved first: the rule waits for its own OK
+      await customer.decideNewCustomer({ chatId: 'sim-' + APPR20, from: APPR20 }, { yes: true, requestId: 'WA-DSC20' }, async () => true, tt20);
+      check('an unapproved rule is not created with the account', (await portal.listDiscountRules()).length === before20);
+      await say20(APPR20, 'OK ' + id20);
+      const rules20 = await portal.listDiscountRules();
+      const made20 = rules20[rules20.length - 1] || {};
+      check('"OK DSC-…" creates it on the portal', rules20.length === before20 + 1 && made20.rule_type === 'BRAND' && made20.brand === 'CARTRENDS' && made20.discount_value === 12);
+      check('...for the customer as the portal has them, for 3 months from today', made20.dealer_id === 1 && made20.rule_name === 'Mock Customer CARTRENDS 12%' && Date.parse(made20.valid_to) - Date.parse(made20.valid_from) > 85 * 864e5);
+      check('a customer registering themselves is not asked for a discount', !ds20.pending('sim-919000000302'));
+
+      // ---- a part-wise rule, set by the lowest sale price ----
+      portal.setMockStock([{ part_no: '16510M65L10', name: 'Oil Filter', quantity: 50, price: 90, mrp: 200, vendor: 'K' }]);
+      const form21 = { chatId: agentChat20, byName: 'Shubham', answers: { ...form20.answers, requestId: 'WA-DSC21', phone: '919000000303' } };
+      cc20.park(form21);
+      await customer.startDiscountSetup({ chatId: agentChat20, from: AGENT20 }, form21, tt20);
+      await say20(AGENT20, 'Part wise', 'DSC_PART');
+      const mrp21 = text20(await say20(AGENT20, '16510M65L10'));
+      check('part-wise: the portal MRP is shown and the lowest price asked', /MRP ₹200/.test(mrp21) && /Minimum kitne mein bechna/.test(mrp21));
+      check('...and the discount is worked out from it', /₹170 \/ MRP ₹200 = 15% discount/.test(text20(await say20(AGENT20, '170'))));
+      for (let i = 0; i < 4; i++) await say20(AGENT20, 'skip');
+      await say20(AGENT20, '30 din');
+      const sent21 = await say20(AGENT20, 'Haan', 'DSC_YES');
+      const toAppr21 = sent21.filter((o) => o.to === APPR20).map((o) => o.text).join('\n');
+      check('...and the Sales Head sees MRP, sale price and the discount', /Part: 16510M65L10 — 15%/.test(toAppr21) && /MRP ₹200 → sells at ₹170 \(15% off, ₹30 per piece\)/.test(toAppr21));
+      await say20(AGENT20, 'Bas itna', 'DSC_MORE_NO');
+      // rejected with the account: the rule goes with it
+      const id21 = dscIn20(sent21);
+      await customer.decideNewCustomer({ chatId: 'sim-' + APPR20, from: APPR20 }, { yes: false, requestId: 'WA-DSC21' }, async () => true, tt20);
+      check('a rejected account takes its discount rules with it', !ds20.find(id21));
+
+      // ---- an EXISTING customer changes their discount ----
+      portal._setMockDiscountRules([
+        { id: 501, rule_id: 501, rule_type: 'BRAND', brand: 'CARTRENDS', dealer_id: 1, discount_mode: 'PERCENT', discount_value: 12, is_active: true, rule_name: 'Mock Customer CARTRENDS 12%' },
+        { id: 502, rule_id: 502, rule_type: 'BRAND', brand: 'BOSCH', dealer_id: 999, discount_mode: 'PERCENT', discount_value: 5, is_active: true, rule_name: 'Other BOSCH 5%' },
+      ]);
+      const CUST22 = '919000000304';
+      const list22 = text20(await say20(CUST22, 'mera discount change karna hai'));
+      check('an existing customer is shown their own rules only', /1\. Mock Customer CARTRENDS 12% — 12%/.test(list22) && !/BOSCH/.test(list22));
+      check('...and asked the new %', /Abhi 12% hai\. Naya discount %/.test(text20(await say20(CUST22, '1'))));
+      check('...shown the change before it is sent', /12% → 15%/.test(text20(await say20(CUST22, '15'))));
+      const sent22 = await say20(CUST22, 'Haan', 'DSC_YES');
+      const id22 = dscIn20(sent22);
+      check('the change goes to the Sales Head, not the portal', /\*Discount change\*/.test(sent22.filter((o) => o.to === APPR20).map((o) => o.text).join('\n')) && (await portal.listDiscountRules())[0].discount_value === 12);
+      const ok22 = await say20(APPR20, 'OK ' + id22);
+      const rule22 = (await portal.listDiscountRules())[0];
+      check('"OK DSC-…" updates only the discount on the portal', rule22.discount_value === 15 && rule22.brand === 'CARTRENDS' && rule22.rule_name === 'Mock Customer CARTRENDS 15%');
+      check('...and the customer is told', ok22.some((o) => String(o.to).indexOf(CUST22) >= 0 && /12% → 15%/.test(o.text || '')));
+      // a NO leaves it as it was
+      await say20(CUST22, 'discount change karna hai');
+      await say20(CUST22, '1');
+      await say20(CUST22, '20');
+      const id23 = dscIn20(await say20(CUST22, 'Haan', 'DSC_YES'));
+      await say20(APPR20, 'NO ' + id23);
+      check('"NO DSC-…" changes nothing', (await portal.listDiscountRules())[0].discount_value === 15);
+    } finally {
+      cr20.approvers = apprWas20;
+      dpCfg20.listPriceAccountId = listWas20;
+      portal._setMockDiscountRules([]);
+      portal.setMockStock([
+        { part_no: '16510M65L10', name: 'Oil Filter', quantity: 50, price: 100, mrp: 120, vendor: 'K' },
+        { part_no: '71761M67LA05PK', name: 'Bumper| Front Side | WagonR', quantity: 30, price: 50, mrp: 60, vendor: 'K' },
+        { part_no: '71791M85S005PK', name: 'BUMPER | ERTIGA/SWIFT | FRONT LOWER', quantity: 26, price: 500, mrp: 560, vendor: 'K' },
+      ]);
+    }
   }
 
   // "2 box" is two boxes, whatever each holds; "4 pcs" is four pieces.
@@ -2951,7 +3085,9 @@ async function main() {
   await customer.transport.injectIncoming({
     from: HELPER33, chatId: 'sim-' + HELPER33, isGroup: false, body: 'ye part discontinued hai', contextId: q33.id, mediaType: 'chat',
   });
-  check('a swipe-reply in words is relayed to the customer', customer.transport.outbox.some((o) => String(o.to).indexOf(CUST33) >= 0 && /discontinued/.test(o.text || '')));
+  // Words are an instruction, read - never forwarded as an instruction. A
+  // short "discontinued" is a plain not-available for the customer.
+  check('a swipe-reply in words answers the customer', customer.transport.outbox.some((o) => String(o.to).indexOf(CUST33) >= 0 && /(not available|available nahi|discontinued)/i.test(o.text || '')));
   config.voiceEscalationNumber = hadVoice33;
 
   console.log('\n[33b] a typo someone once corrected does not rewrite a right number');
@@ -5418,6 +5554,37 @@ async function main() {
     check('...with the fix off the camera', Math.abs(exifAns.lat - 28.6139) < 0.001 && Math.abs(exifAns.lng - 77.209) < 0.001);
     check('...noted as coming from the photo, not a dropped pin', exifAns.locationFrom === 'photo');
     check('...and the pin is never asked for', /location bhej/i.test(fromExif.reply) === false);
+
+    // ---- a GPS stamp PRINTED on the photo ----
+    // 22 Sep, live: GPS Map Camera prints "Lat 28.530972° Long 77.053152°" and
+    // the address on the picture itself. WhatsApp strips EXIF, never pixels.
+    const STAMP66 = { lat: 28.530972, lng: 77.053152, address: '2, Carterpuri Rd, Bijwasan, New Delhi 110061' };
+    ai66.readShopPhoto = async () => ({ isShop: true, hasBanner: true, bannerText: 'SHARMA AUTO PARTS', why: 'board reads', gps: STAMP66 });
+    await toPhoto(CHP);
+    const stamp66 = await cc66.answer(CHP, { mediaBase64: 'QUJD', mediaMime: 'image/jpeg' }, '', t66);
+    const stampAns = (cc66.pending(CHP) || { answers: stamp66.form.answers }).answers;
+    check('a photo with a printed GPS stamp answers the location', stampAns.lat === 28.530972 && stampAns.lng === 77.053152 && stampAns.locationFrom === 'stamp');
+    check('...the pin is not asked for', !/location bhej/i.test(stamp66.reply) && /location hai/i.test(stamp66.reply));
+    check('...and the approver reads where it came from', /GPS stamp/.test(cc66.summary(stamp66.form, t66)));
+
+    // A stamped selfie with no board: the board is asked for again, but the
+    // location it carried is already kept.
+    ai66.readShopPhoto = async () => ({ isShop: true, hasBanner: false, bannerText: null, why: 'selfie at a gate', gps: STAMP66 });
+    await toPhoto(CHP);
+    const stampNoBoard = await cc66.answer(CHP, { mediaBase64: 'QUJD', mediaMime: 'image/jpeg' }, '', t66);
+    check('a stamped photo with no board still keeps its location', /[Bb]oard nahi dikh raha/.test(stampNoBoard.reply) && cc66.pending(CHP).answers.lat === 28.530972);
+
+    // At the location question itself: a stamped photo is as good as a pin;
+    // a photo with no location on it is not, and the pin is still asked.
+    ai66.readShopPhoto = async () => ({ isShop: true, hasBanner: true, bannerText: 'SHARMA AUTO PARTS', why: 'board reads' });
+    await toPhoto(CHP);
+    await cc66.answer(CHP, { mediaBase64: 'QUJD', mediaMime: 'image/jpeg' }, '', t66);
+    const noLoc66 = await cc66.answer(CHP, { mediaType: 'image', mediaBase64: 'QUJD', mediaMime: 'image/jpeg' }, '', t66);
+    check('a photo with no location, at the location question, still asks for the pin', /location nahi hai/i.test(noLoc66.reply) && cc66.pending(CHP).answers.lat === undefined);
+    ai66.readShopPhoto = async () => ({ isShop: true, hasBanner: false, bannerText: null, why: 'selfie', gps: STAMP66 });
+    await cc66.answer(CHP, { mediaType: 'image', mediaBase64: 'QUJD', mediaMime: 'image/jpeg' }, '', t66);
+    check('...and a stamped photo there answers it', ((cc66.pending(CHP) || {}).answers || stampAns).locationFrom === 'stamp');
+    ai66.readShopPhoto = async () => null;
 
     // ---- an account for somebody else ----
     cfg66.team = { 919873261929: 'Shubham' };
