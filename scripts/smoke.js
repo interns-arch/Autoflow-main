@@ -5214,10 +5214,37 @@ async function main() {
     cc66.cancel(CHD);
     cc66.start(CHD, '917355374975', t66);
     const dup66 = await cc66.answer(CHD, {}, '33AAACC1206D1ZN', t66);
-    check('a GSTIN already on the portal is refused', /pehle se hamare paas registered/i.test(dup66.reply));
-    check('...and says whose it is', /Existing Traders/.test(dup66.reply));
-    check('...and is not kept on the form', cc66.pending(CHD).answers.gstNo === undefined);
-    check('...and the form is still open for another one', Boolean(cc66.pending(CHD)));
+    // A CUSTOMER is told the account exists - never whose it is - and sent
+    // on to ordering. A GSTIN on the portal is an account; there is nothing
+    // "different" to send.
+    check('a GSTIN already on the portal tells the customer the account exists', /account pehle se bana hua hai/i.test(dup66.reply));
+    check('...without saying whose it is', !/Existing Traders/.test(dup66.reply));
+    check('...and the form is closed', !cc66.pending(CHD));
+
+    // A SALES AGENT is told whose it is, so they take the order there.
+    cfg66.team = { ...(teamWas66 || {}), 919811100066: 'Shubham' };
+    const CHDA = 'sim-create66-dup-agent';
+    cc66.cancel(CHDA);
+    cc66.start(CHDA, '919811100066', t66, { forSomeoneElse: false });
+    const dupA66 = await cc66.answer(CHDA, {}, '33AAACC1206D1ZN', t66);
+    check('an agent entering a registered GSTIN is told whose it is', /Existing Traders ke naam se/.test(dupA66.reply));
+    check('...and no new account is opened', /Naya account nahi banega/.test(dupA66.reply) && !cc66.pending(CHDA));
+    cfg66.team = teamWas66;
+
+    // 22 Sep, live: with the form open, a photo of two parts, "Ye dono part
+    // kitne ka hai" and "Cancel customer creation..." were all read as GST
+    // numbers - and the third "try" sent a review to both Sales Heads.
+    const CHX = 'sim-create66-aside';
+    cc66.cancel(CHX);
+    cc66.start(CHX, '917355374975', t66);
+    check('a part photo is not a GST number', (await cc66.answer(CHX, { mediaType: 'image', mediaBase64: 'QUJD', mediaMime: 'image/jpeg' }, '', t66)) === null);
+    check('"Ye dono part kitne ka hai" is not a GST number', (await cc66.answer(CHX, {}, 'Ye dono part kitne ka hai', t66)) === null);
+    check('...and neither costs a try: the form still waits', Boolean(cc66.pending(CHX)) && !cc66.pending(CHX).answers.gstNo);
+    const quit66 = await cc66.answer(CHX, {}, 'Cancel kardo customer creation', t66);
+    check('"Cancel kardo customer creation" closes the form', quit66 && quit66.quit === true && !cc66.pending(CHX));
+    cc66.start(CHX, '917355374975', t66);
+    const quit66b = await cc66.answer(CHX, {}, 'Cancel customer creation. Now tell about the parts price', t66);
+    check('...and so does it said in a sentence', quit66b && quit66b.quit === true && !cc66.pending(CHX));
 
     // ---- email: mandatory, and unverifiable ----
     // There is no route on the portal that takes an email and no email in

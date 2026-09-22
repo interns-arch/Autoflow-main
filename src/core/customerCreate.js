@@ -47,6 +47,36 @@ const SKIP = /^(skip|nahi|nhi|no|na|-|n\/a|none|baad mein|later)$/i;
 // without this a customer who changed their mind would be filling in a shop
 // address to escape. Their cart is untouched — only the form closes.
 const QUIT = /^(cancel|stop|rehne do|rhne do|chhodo|chodo|baad me karenge|baad mein karenge|nahi banana|abhi nahi)$/i;
+// ...and said inside a sentence. 22 Sep, live: "Cancel customer creation.
+// Now tell about the parts price" and "Cancel kardo customer creation" were
+// both read as GST numbers, and the second one sent a "GST not verified"
+// review to both Sales Heads.
+const QUIT_IN = /\b(cancel|rehne do|rhne do|chhod do|chhodo|mat banao|mat banaiye|nahi banana|nahi banwana|band karo|band kar do)\b/i;
+
+// NOT AN ANSWER. The form owns the chat while it is open, but a customer who
+// sends a photo of two parts and asks "ye dono part kitne ka hai" has moved
+// on - reading that as a GST number (22 Sep, live: three tries used up that
+// way, then a review raised on "YEDONOPARTKI...") answers nothing they asked.
+// Such a message goes back to the normal path and the form waits, untouched.
+const ASIDE_RE = /\b(kitne|kitna|kitni|price|rate|mrp|daam|stock|available|hai kya)\b|\?\s*$/i;
+function notAnAnswer(field, m, said) {
+  const type = String((m && m.mediaType) || '').toLowerCase();
+  const media = type && !['chat', 'text', 'interactive', 'button'].includes(type);
+  if (media) {
+    if (field.type === 'photo' && type === 'image') return false;
+    if (field.type === 'location' && type === 'location') return false;
+    return true;
+  }
+  if (!said) return false;
+  if (ASIDE_RE.test(said)) return true;
+  // A GST number is one token. A sentence with no GSTIN-looking run in it is
+  // something else being said.
+  if (field.type === 'gst') {
+    const words = said.split(/\s+/).filter((w) => /[a-z]{3,}/i.test(w));
+    if (words.length >= 2 && !/[0-9]{2}[A-Z]{5}[0-9]{4}/i.test(said.replace(/\s+/g, ''))) return true;
+  }
+  return false;
+}
 
 // GSTIN FIRST, because it answers five of the questions below on its own.
 // A firm's name, registered address, city, state and PIN are public record
@@ -312,7 +342,7 @@ async function answer(chatId, m, text, t) {
   const said = String(text || '').trim();
   form.at = Date.now();
 
-  if (QUIT.test(said)) {
+  if (QUIT.test(said) || (said.length <= 90 && QUIT_IN.test(said))) {
     open.delete(chatId);
     store.log('create', `${chatId}: customer form cancelled by the customer`);
     return {
@@ -324,6 +354,11 @@ async function answer(chatId, m, text, t) {
       quit: true,
       form,
     };
+  }
+
+  if (notAnAnswer(field, m, said)) {
+    store.log('create', `${chatId}: "${said.slice(0, 50) || '(' + ((m && m.mediaType) || 'media') + ')'}" is not an answer to ${field.key} - passed on, form waits`);
+    return null;
   }
 
   // "skip" on an optional field moves on; on a required one it does not.
@@ -594,6 +629,35 @@ async function refuseIfTaken(form, field, value, t) {
   const whose = r.name ? ' (' + r.name + ')' : '';
   delete form.answers[field];
   store.log('create', form.chatId + ': ' + field + ' ' + value + ' is already on the portal' + whose);
+
+  // A GSTIN on the portal IS an account - one firm, one GSTIN - so there is
+  // nothing to open and the form ends here rather than asking for "a
+  // different one". A sales agent is told whose it is, so they can take the
+  // order on that account. A customer is not: the name behind a GST number is
+  // not something anyone who types one in should be able to read.
+  if (field === 'gstNo') {
+    open.delete(form.chatId);
+    if (form.byName) {
+      return {
+        reply: t(
+          `This GST number is already registered${r.name ? ' as ' + r.name : ''} — no new account needed. Take the order on that account.`,
+          `Ye GST number pehle se registered hai${r.name ? ' — ' + r.name + ' ke naam se' : ''}. Naya account nahi banega, usi account pe order lijiye.`,
+        ),
+        done: false,
+        closed: true,
+        form,
+      };
+    }
+    return {
+      reply: t(
+        'There is already an account on this GST number. Send the part number and quantity and I will place the order.',
+        'Is GST number par account pehle se bana hua hai. Part number aur quantity bhejiye, order laga deta hoon.',
+      ),
+      done: false,
+      closed: true,
+      form,
+    };
+  }
   return {
     reply: t(
       'That ' + what + ' is already registered with us' + whose + '. Please send a different one.',
@@ -643,7 +707,7 @@ async function fillFromGst(form, gstin, t) {
   // here, where the customer can still say "oh, use the other one".
   const taken = await refuseIfTaken(form, 'gstNo', firm.gstin || gstin, t);
   if (taken) {
-    open.set(form.chatId, form);
+    if (!taken.closed) open.set(form.chatId, form);
     return taken;
   }
 
