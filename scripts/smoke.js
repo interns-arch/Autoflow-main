@@ -1875,12 +1875,11 @@ async function main() {
   // produces. It must reach a person, never be read back as though it were real.
   await asVoice('99999X99X99 2 pise');
   check('an unknown part is not read back', !/^(?:right|sahi hai)\?$/im.test(sent(customer)));
-  // It reaches a person NAMING the part number, not as an anonymous "voice
-  // note": once the words are read they go down the ordinary text path, and
-  // the helper gets the same question they would from a typed message — with
-  // the recording underneath it, because the number is a machine's guess.
-  check('an unknown part reaches a person', /99999X99X99/.test(sent(customer)));
-  check('...and the recording goes with it', customer.transport.outbox.some((o) => o.audio));
+  // Once the words are read they go down the ordinary text path, so a part
+  // number the portal has no match for is answered as a typed one is: not
+  // available, and nobody is asked (founder, 22 Sep).
+  check('an unknown part number is said to be unavailable', /99999X99X99 available nahi hai|99999X99X99 is not available/i.test(sent(customer)));
+  check('...and nobody is asked about it', !/Question \*#/.test(sent(customer)));
 
   // A no is the case a person most needs to see.
   await asVoice('VN-1001 5 pise');
@@ -1910,8 +1909,9 @@ async function main() {
   // A transcript we DID read still reaches the helper above the recording
   // whenever the text path ends up asking them.
   customer.transport.outbox.length = 0;
-  await asVoice('88888Y88Y88 chahiye');
+  await asVoice('zzz omega bracket - 2');
   check('with the transcript above it', /Heard in their voice note:/.test(sent(customer)));
+  check('...and the recording goes with it', customer.transport.outbox.some((o) => o.audio));
 
   // A PART NAMED IN WORDS, spoken. 21 Sep, live: "Maruti Suzuki Swift Dzire ka
   // bumper price" was transcribed word for word, and the customer was told
@@ -2287,6 +2287,35 @@ async function main() {
   check('"Create a customer" from a new number answers, and does not crash', /GST/i.test(r20k.said));
   require('../src/core/customerCreate').cancel('sim-919000000209');
   check('a model year is never a part word', require('../src/core/partish').isYear('2018') && !require('../src/core/partish').isYear('16510'));
+
+  // 22 Sep, live: eighteen part numbers the portal did not know went to a
+  // person and came back as eighteen "abhi confirm nahi ho paya" - while the
+  // portal had sixteen of them as <number>5PK. Offer the close match, one at a
+  // time, Haan / Nahi, then the whole order priced.
+  portal.setMockStock([
+    { part_no: '16510M65L10', name: 'Oil Filter', quantity: 50, price: 100, mrp: 120, vendor: 'K' },
+    { part_no: '71761M67LA05PK', name: 'Bumper| Front Side | WagonR', quantity: 30, price: 50, mrp: 60, vendor: 'K' },
+    { part_no: '71791M85S005PK', name: 'BUMPER | ERTIGA/SWIFT | FRONT LOWER', quantity: 26, price: 500, mrp: 560, vendor: 'K' },
+  ]);
+  const cat20 = [['71761M67LA05PK', 'Bumper| Front Side | WagonR', 30], ['71791M85S005PK', 'BUMPER | ERTIGA/SWIFT | FRONT LOWER', 26]];
+  portal.searchByName = async (q) => {
+    const w = String(q).toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const rows = cat20.filter(([p]) => p.startsWith(w));
+    return { total: rows.length, top: rows.map(([partNo, name, available]) => ({ partNo, name, available })) };
+  };
+  const near20 = await rate20('919000000210', '16510M65L10 2 pcs\n71761m67LA0 4 pcs\n71791m85S00 4 pcs\n71799Z99Z99 2 pcs');
+  const asked20 = customer.transport.outbox.filter((o) => o.to === config.escalationNumber && /Question \*#/.test(o.text || '')).map((o) => o.text).join('\n');
+  check('close matches are offered, not sent to a person', !/71761m67LA0|71791m85S00/i.test(asked20) && /71761M67LA05PK/.test(near20.said) && /\(1\/2\)/.test(near20.said));
+  check('...a number with no match is not available, and nobody is asked', !/71799Z99Z99/.test(asked20) && /Sorry, 71799Z99Z99 is not available/i.test(near20.said));
+  check('...and the part that WAS found is already in the order', (orders.findDraft('sim-919000000210') || { lines: [] }).lines.length === 1);
+  const near20b = await rate20('919000000210', 'haan');
+  check('"haan" adds the close match with the quantity asked', (orders.findDraft('sim-919000000210').lines.find((l) => /71761M67LA05PK/.test(l.partNo || l.item)) || {}).qty === 4);
+  check('...and the next one is asked', /\(2\/2\)/.test(near20b.said) && /71791M85S005PK/.test(near20b.said));
+  const near20c = await rate20('919000000210', 'nahi');
+  check('"nahi" says sorry, not available', /Sorry, 71791m85S00 available nahi hai/i.test(near20c.said));
+  check('...and the last answer brings the whole order priced, with pieces', /16510M65L10 x2/.test(near20c.said) && /71761M67LA05PK x4/.test(near20c.said) && /total/i.test(near20c.said) && /confirm/i.test(near20c.said));
+  check('...with the refused part left out', !orders.findDraft('sim-919000000210').lines.some((l) => /71791M85S0/.test(l.partNo || l.item)));
+  orders.clearDraft && orders.clearDraft('sim-919000000210');
   portal.searchByName = realSearch20;
 
   // ---- 21. A salesman ordering FOR a customer ----
@@ -2868,7 +2897,7 @@ async function main() {
   const CUST33 = '919000000933';
   portal.setMockStock([{ part_no: 'BP-1001', name: 'Brake Pad', quantity: 40, price: 450, mrp: 600, vendor: 'N' }]);
   customer.transport.outbox.length = 0;
-  await dm(customer, CUST33, 'ZQ7777XY77 2');
+  await dm(customer, CUST33, 'zzz sigma bracket - 2');
   const q33 = customer.transport.outbox.find((o) => o.to === HELPER33 && (o.text || '').includes('Question *#'));
   check('an unknown part opens a question for the helper', Boolean(q33) && esc33.hasPending());
 
@@ -2988,7 +3017,7 @@ async function main() {
   const CUST34 = '919000000934';
   portal.setMockStock([{ part_no: 'BP-1001', name: 'Brake Pad', quantity: 40, price: 450, mrp: 600, vendor: 'N' }]);
   customer.transport.outbox.length = 0;
-  await dm(customer, CUST34, 'ZR8888QY88 3');
+  await dm(customer, CUST34, 'zzz rho bracket - 3');
   const q34 = customer.transport.outbox.find((o) => o.to === config.escalationNumber && (o.text || '').includes('Question *#'));
   const idMatch34 = q34 && /Question \*#(\d+)\*/.exec(q34.text);
   const qid34 = idMatch34 ? Number(idMatch34[1]) : 0;
@@ -3004,8 +3033,8 @@ async function main() {
     from: config.escalationNumber, chatId: 'sim-' + config.escalationNumber, isGroup: false, body: 'BP-1001', contextId: q34.id, mediaType: 'chat',
   });
   check('the helper\'s swipe-reply after the restart still answers the customer', customer.transport.outbox.some((o) => String(o.to).indexOf(CUST34) >= 0));
-  await dm(customer, '919000000935', 'ZS9999QZ99 1');
-  const next34 = customer.transport.outbox.find((o) => o.to === config.escalationNumber && /Question \*#(\d+)\*/.test(o.text || '') && (o.text || '').indexOf('ZS9999QZ99') >= 0);
+  await dm(customer, '919000000935', 'zzz tau bracket - 1');
+  const next34 = customer.transport.outbox.find((o) => o.to === config.escalationNumber && /Question \*#(\d+)\*/.test(o.text || '') && (o.text || '').indexOf('zzz tau bracket') >= 0);
   const nextId34 = next34 ? Number(/Question \*#(\d+)\*/.exec(next34.text)[1]) : 0;
   check('...and numbering carries on instead of starting again at #1', nextId34 > qid34);
 

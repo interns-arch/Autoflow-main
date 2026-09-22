@@ -263,4 +263,45 @@ function priceText(p, t) {
   return 'MRP ₹' + money(p.mrp);
 }
 
-module.exports = { quote, prices, priceText, norm, _internals: { render } };
+// The whole order, priced: every line with its pieces, what one costs, what
+// the line comes to, and the total. quote() stops at five parts and prints no
+// quantities; an order of eighteen lines needs all eighteen.
+// lines: [{ partNo, qty, available?, source? }]
+async function priceList(lines, who, t) {
+  const rows = (lines || []).filter((l) => l && l.partNo);
+  if (!rows.length) return '';
+  const nos = [...new Set(rows.map((l) => String(l.partNo).toUpperCase()))];
+  const got = new Map();
+  for (let i = 0; i < nos.length; i += 8) {
+    const part = await prices(nos.slice(i, i + 8), who);
+    for (const [k, v] of part) got.set(k, v);
+  }
+  let total = 0;
+  let complete = true;
+  const kinds = new Set();
+  const out = rows.map((l, i) => {
+    const qty = Math.max(1, Number(l.qty) || 1);
+    const p = got.get(norm(l.partNo));
+    const note =
+      l.source === 'unavailable' ? t(' (on order)', ' (on order)')
+        : Number(l.available) > 0 && Number(l.available) < qty ? t(` (only ${l.available} available)`, ` (sirf ${l.available} available)`)
+          : '';
+    if (!p) {
+      complete = false;
+      return `${i + 1}. ${l.partNo} x${qty} - ${t('price to follow', 'price confirm karke')}${note}`;
+    }
+    const unit = Number(p.rate || p.mrp);
+    kinds.add(p.rate ? 'net' : 'mrp');
+    total += unit * qty;
+    return `${i + 1}. ${l.partNo} x${qty} - ${priceText(p, t)} = ₹${money(unit * qty)}${note}`;
+  });
+  // A total only when every line is priced the same way - see render().
+  const pcs = rows.reduce((n, l) => n + Math.max(1, Number(l.qty) || 1), 0);
+  let foot = '';
+  if (complete && kinds.size === 1 && total > 0) {
+    foot = '\n\n' + (kinds.has('net') ? t(`Total (${pcs} pcs): ₹`, `${pcs} pcs ka total: ₹`) : t(`Total at MRP (${pcs} pcs): ₹`, `${pcs} pcs ka total (MRP): ₹`)) + money(total);
+  }
+  return out.join('\n') + foot;
+}
+
+module.exports = { quote, prices, priceText, priceList, norm, _internals: { render } };

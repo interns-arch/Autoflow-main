@@ -98,6 +98,15 @@ const rateOptions = require('../core/chatState').slot('rateOptions');
 // - the second never says the car again, and searching "rear bumper" alone
 // offered a Chevrolet Corsa (22 Sep, live). chatId -> { words, at }
 const spokenCar = require('../core/chatState').slot('spokenCar');
+// Part numbers the portal does not know, but has a CLOSE match for, being
+// offered one at a time: "71761M67LA0 nahi mila - 71761M67LA05PK chahiye?"
+// 22 Sep, live: eighteen such lines each went to a person and came back as
+// eighteen "abhi confirm nahi ho paya" - while sixteen of them had an obvious
+// match on the portal. chatId -> { at, queue, done, total, ctx }
+const nearAsk = require('../core/chatState').slot('nearAsk');
+const NEAR_MAX_MS = 3 * 60 * 60 * 1000;
+const NEAR_YES = /^(haan+|han+|ha+|hn|yes+|y|ok+|okay|ji|ji haan|sahi|sahi hai|theek|thik|theek hai|chalega|done|haan ji|yes please)\b.{0,15}$/i;
+const NEAR_NO = /^(nahi+|nahin|nhi|nai|no+|n|na|mat|nahi chahiye|no thanks)\b.{0,15}$/i;
 function withSpokenCar(chatId, item) {
   const words = String(item || '').replace(/[()[\]{},;:!?"]/g, ' ').split(/\s+/).filter(Boolean);
   const models = words.filter((w) => partish.isCarWord(w) && !partish.isMaker(w));
@@ -719,6 +728,17 @@ class CustomerBot {
           'Kaunsa part? Part number bhejiye, ya us message pe swipe karke puchiye.',
         ),
       );
+    }
+
+    // HAAN / NAHI to a closest-match part we are offering, one by one.
+    {
+      const near = nearAsk.get(m.chatId);
+      if (near && Date.now() - near.at > NEAR_MAX_MS) nearAsk.delete(m.chatId);
+      else if (near && near.queue.length) {
+        const yes = m.buttonId === 'NEAR_YES' || (!m.buttonId && NEAR_YES.test(text));
+        const no = m.buttonId === 'NEAR_NO' || (!m.buttonId && NEAR_NO.test(text));
+        if (yes || no) return this.answerNear(m, yes, reply, t);
+      }
     }
 
     // A pick from the priced list a rate question was answered with. Before
@@ -1909,6 +1929,117 @@ class CustomerBot {
     return false;
   }
 
+  // The one catalogue part each written number most likely means: the same
+  // number with a pack suffix ("71761M67LA0" -> "71761M67LA05PK"), or the
+  // number with its last character dropped. Only a part that BEGINS with what
+  // was written counts - never a guess from a similar-looking one.
+  async closestMatches(asked) {
+    const norm = (v) => String(v || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const out = new Map();
+    for (const a of asked.slice(0, 30)) {
+      const want = norm(a);
+      if (want.length < 6) continue;
+      try {
+        const rows = ((await portal.searchByName(want)) || {}).top || [];
+        const hits = rows.filter((r) => r.partNo && (norm(r.partNo).startsWith(want) || want.startsWith(norm(r.partNo))));
+        // In stock first: searchByName already sorts that way.
+        if (hits.length) out.set(a, { partNo: hits[0].partNo, name: hits[0].name, available: hits[0].available });
+      } catch (e) {
+        store.log(this.key, 'closest match search failed for ' + a + ': ' + String((e && e.message) || e).slice(0, 80));
+      }
+    }
+    return out;
+  }
+
+  // Offer the next closest match, with Haan / Nahi buttons where the line
+  // has them. `lead` goes above it: what was found, or the answer to the last.
+  async askNear(m, lead, reply, t) {
+    const st = nearAsk.get(m.chatId);
+    if (!st || !st.queue.length) return false;
+    const q = st.queue[0];
+    let price = '';
+    try {
+      const got = await rates.prices([q.partNo], { ctx: st.ctx });
+      const p = got.get(rates.norm(q.partNo));
+      if (p) price = rates.priceText(p, t);
+    } catch (e) {
+      /* the question still stands without a price */
+    }
+    const stock = Number(q.available) > 0 ? t('in stock', 'stock hai') : t('on order', 'order pe');
+    const n = st.done + 1;
+    const body =
+      `(${n}/${st.total}) ${t(`${q.asked} did not match exactly. Closest part:`, `${q.asked} exact nahi mila. Milta-julta part:`)}\n` +
+      `*${q.partNo}*${q.name ? ' — ' + q.name : ''}\n` +
+      `${price ? price + ' · ' : ''}${stock}\n\n` +
+      t(`${q.qty} pcs of this one?`, `Yahi chahiye, ${q.qty} pcs?`);
+    const text = lead ? lead + '\n\n' + body : body;
+    const group = String(m.chatId || '').endsWith('@g.us') || m.isGroup;
+    if (this.transport.sendButtons && !group) {
+      try {
+        const id = await this.transport.sendButtons(m.from, text, [
+          { id: 'NEAR_YES', title: t('Yes', 'Haan') },
+          { id: 'NEAR_NO', title: t('No', 'Nahi') },
+        ]);
+        conversation.record(m.chatId, 'us', text);
+        rememberMsg(m.chatId, id, 'us', text);
+        return true;
+      } catch (e) {
+        store.log(this.key, 'near-match buttons failed, sending text: ' + String((e && e.message) || e).slice(0, 80));
+      }
+    }
+    return reply(text + '\n\n' + t('Reply Yes or No', 'Haan ya Nahi likhiye'));
+  }
+
+  async answerNear(m, yes, reply, t) {
+    const st = nearAsk.get(m.chatId);
+    const q = st.queue.shift();
+    st.done += 1;
+    st.at = Date.now();
+    let lead;
+    if (yes) {
+      const [line] = await availability.resolve([{ item: q.partNo, qty: q.qty, ref: q.ref, key: q.key }], st.ctx).catch(() => []);
+      if (line && line.source !== 'unidentified' && line.source !== 'unknown') {
+        const order = orders.getOrCreateDraft(m.chatId, m.from);
+        if (st.ctx) order.portalCustomer = st.ctx;
+        orders.addLines(order, [{ ...line, requested: q.asked }]);
+        lead = t(`Added ${q.partNo} x${q.qty}.`, `${q.partNo} x${q.qty} order mein daal diya.`);
+      } else {
+        lead = t(`Sorry, ${q.partNo} could not be added right now.`, `Sorry, ${q.partNo} abhi add nahi ho paya.`);
+      }
+    } else {
+      lead = t(`Sorry, ${q.asked} is not available.`, `Sorry, ${q.asked} available nahi hai.`);
+    }
+    store.log(this.key, `closest match ${q.asked} -> ${q.partNo}: ${yes ? 'yes' : 'no'}`);
+    cancelConfirmNudge(m.chatId);
+    if (st.queue.length) {
+      nearAsk.set(m.chatId, st);
+      return this.askNear(m, lead, reply, t);
+    }
+    nearAsk.delete(m.chatId);
+    return this.finishNear(m, st, lead, reply, t);
+  }
+
+  // Every question answered: the whole order, priced, with pieces, and the
+  // one question that is left.
+  async finishNear(m, st, lead, reply, t) {
+    const order = orders.findDraft(m.chatId);
+    if (!order || !order.lines.length) {
+      return reply((lead ? lead + '\n\n' : '') + t('Nothing is in the order yet.', 'Order mein abhi koi part nahi hai.'));
+    }
+    const lines = order.lines.map((l) => ({ partNo: l.partNo || l.item, qty: l.qty, available: l.available, source: l.source }));
+    const list = await rates.priceList(lines, { ctx: st.ctx }, t).catch(() => '');
+    const text =
+      (lead ? lead + '\n\n' : '') +
+      t(`Your order (${order.lines.length} items):`, `Aapka order (${order.lines.length} item):`) +
+      '\n' +
+      (list || orders.summary(order)) +
+      '\n\n' +
+      t('Shall I place this order?', 'Ye order confirm karun sir?');
+    order.confirmAskedAt = new Date().toISOString();
+    store.save();
+    return reply(text);
+  }
+
   // The portal part numbers that begin with what was written: a handwritten
   // "71751M69R00" is the catalogue's 71751M69R005PK (13 Sep, live). Offered,
   // never ordered - a 5PK is a pack of five, not the same line.
@@ -2536,7 +2667,31 @@ class CustomerBot {
     // desk is told what the portal has instead, with the closest part numbers.
     const desk = salesOrder.isSalesPerson(m.from);
     const notFound = resolved.filter((l) => l.source === 'unidentified' && (digitsOnly(l) || desk));
-    const unknown = resolved.filter((l) => l.source === 'unidentified' && !digitsOnly(l) && !desk);
+    let unknown = resolved.filter((l) => l.source === 'unidentified' && !digitsOnly(l) && !desk);
+
+    // A CUSTOMER'S part number the portal does not know. Nobody is asked:
+    // look for the close match - usually the same number with "5PK" on the
+    // end - and offer it, one line at a time, for a yes or a no. A number with
+    // no match at all is simply not available (founder, 22 Sep: eighteen
+    // "abhi confirm nahi ho paya" for one list was the alternative). Only a
+    // line with no part number in it at all - nothing to say "not available"
+    // about - still goes to a person.
+    const nearQueue = [];
+    const noMatch = [];
+    if (unknown.length && !this.inquiryOnly(m.from, m.chatId)) {
+      // A real part number, not whatever was typed: resolve() copies the
+      // words into partNo too ("clutch set dzire petrol").
+      const isNumber = (u) => partish.isPartNumber(String(u.requested || u.item || '').trim()) || Boolean(ai.partNumberIn(String(u.requested || u.item || '')));
+      const numbered = unknown.filter(isNumber);
+      const close = await this.closestMatches(numbered.map((u) => u.requested || u.partNo || u.item));
+      for (const u of numbered) {
+        const asked = u.requested || u.partNo || u.item;
+        const c = close.get(asked);
+        if (c) nearQueue.push({ asked, qty: u.qtyMissing ? 1 : u.qty || 1, ref: u.ref || null, key: u.key || null, partNo: c.partNo, name: c.name, available: c.available });
+        else noMatch.push(asked);
+      }
+      unknown = unknown.filter((u) => !isNumber(u));
+    }
     for (const u of unknown) {
       await escalation.create(this, {
         chatId: m.chatId,
@@ -2597,6 +2752,45 @@ class CustomerBot {
     // there is how one chat ended up holding fourteen items across three hours
     // of unrelated questions, every one of them unorderable.
     const usable = resolved.filter((l) => l.source !== 'unidentified' && l.source !== 'unknown');
+
+    // Closest matches to offer, or numbers with none: the parts that WERE
+    // found go into the order now, and the questions start. The priced list
+    // and "confirm?" come once the last one is answered.
+    if (nearQueue.length || noMatch.length) {
+      if (usable.length) {
+        const order0 = orders.getOrCreateDraft(m.chatId, m.from);
+        if (ctx) order0.portalCustomer = ctx;
+        orders.addLines(order0, usable.map((l) => (l.qtyMissing ? { ...l, qty: 1, qtyMissing: false } : l)), { replace: opts.fromPhoto === true });
+      }
+      cancelConfirmNudge(m.chatId);
+      const head = [];
+      if (usable.length) head.push(t(`${usable.length} part(s) found and added.`, `${usable.length} part mil gaye, order mein daal diye.`));
+      if (noMatch.length) {
+        head.push(
+          noMatch.length === 1
+            ? t(`Sorry, ${noMatch[0]} is not available.`, `Sorry, ${noMatch[0]} available nahi hai.`)
+            : t(`Sorry, these are not available: ${noMatch.join(', ')}`, `Sorry, ye part available nahi hain: ${noMatch.join(', ')}`),
+        );
+      }
+      if (unknown.length) {
+        const names = unknown.map((u) => u.requested || u.item);
+        head.push(t(`Checking ${names.join(', ')} - will confirm shortly.`, `${names.join(', ')} check kar raha hoon, thodi der mein batata hoon.`));
+      }
+      if (!nearQueue.length) {
+        store.log(this.key, `${noMatch.length} part number(s) with no match - told not available, nobody asked`);
+        if (!usable.length) return reply(head.join('\n\n'));
+        return this.finishNear(m, { ctx }, head.join('\n\n'), reply, t);
+      }
+      head.push(
+        t(
+          `${nearQueue.length} part number(s) did not match exactly, but a close one is available. Let us check them one by one.`,
+          `${nearQueue.length} part number exact nahi mile, par milta-julta part hai. Ek ek karke confirm kar lete hain.`,
+        ),
+      );
+      nearAsk.set(m.chatId, { at: Date.now(), queue: nearQueue, done: 0, total: nearQueue.length, ctx: ctx || null });
+      store.log(this.key, `${nearQueue.length} closest match(es) to offer one by one, ${noMatch.length} not available, ${unknown.length} to a person`);
+      return this.askNear(m, head.join('\n\n'), reply, t);
+    }
 
     // Some numbers only ever ask. They are answered properly and then left
     // alone: no cart is built, nothing is remembered to confirm, and they are
