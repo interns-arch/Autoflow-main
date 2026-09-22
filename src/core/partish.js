@@ -65,9 +65,17 @@ function isPositionWord(word) {
   return POSITION.test(String(word || '').trim());
 }
 // Joining words a spoken name carries: "Swift Dzire KA front bumper".
-const FILLER = /^(ka|ki|ke|wala|wali|wale|for|of|the|a|an|and|aur|chahiye|chaiye|chahie|hai|h)$/i;
+// Also the rest of a sentence said around the part: "MUJHE Swift Dzire 2018
+// ka front bumper CHAHIYE", "MERA GAADI 2018 MODEL hai USKE LIYE KAUN SA".
+const FILLER =
+  /^(ka|ki|ke|ko|wala|wali|wale|for|of|the|a|an|and|aur|chahiye|chaiye|chahie|chahiya|hai|h|mujhe|muje|mujhko|mera|meri|mere|meko|liye|uske|iske|is|us|model|gaadi|gadi|gaddi|car|kaun|kaunsa|konsa|kon|sa|si|se|do|de|dijiye|dena|bhai|sir|ji|price|rate|mrp|kitne|kitna|kitni|ka|batao|bataiye|chahta|chahti|hu|hoon|hun|wali|new|naya|nayi|original|genuine)$/i;
 function isFiller(word) {
   return FILLER.test(String(word || '').trim());
+}
+// "2018": a model year. Never a part word - searched as one it found an air
+// filter for "Swift Dzire 2018 front bumper" (22 Sep, live). It narrows below.
+function isYear(word) {
+  return /^(19[89]\d|20[0-4]\d)$/.test(String(word || '').trim());
 }
 
 // A question, not a thing to sell. Kept separate from the vehicle list so the
@@ -161,4 +169,4 @@ function classify(text) {
   return 'nothing';
 }
 
-module.exports = { classify, isPartNumber, partNumber, isNameQuery, isQuestion, isVehicle, isCarWord, isMaker, isPositionWord, isFiller, joined };
+module.exports = { classify, isPartNumber, partNumber, isNameQuery, isQuestion, isVehicle, isCarWord, isMaker, isPositionWord, isFiller, isYear, joined };

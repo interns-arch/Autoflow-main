@@ -193,7 +193,7 @@ function commercialDefaults() {
 // number confirmed an order. Spellings are loose on purpose: coustomer,
 // custmer and costumer are all how it actually arrives.
 const WORD_ACCOUNT = '(?:customer|coustomer|custmer|costumer|custumer|account|akaunt|khata|khaata|id)';
-const WORD_MAKE = '(?:creat\\w*|new|naya|nayi|register|registr\\w*|banao|bana\\s?do|bana\\s?dijiye|banana|banwana|kholo|khol\\s?do|open|add)';
+const WORD_MAKE = '(?:creat\\w*|new|naya|nayi|register|registr\\w*|banao|bnao|bana\\s?do|bna\\s?do|bana\\s?dijiye|bna\\s?dijiye|banana|banwana|banwa\\s?do|kholo|khol\\s?do|open|add)';
 const START_RE = new RegExp(
   `\\b${WORD_MAKE}\\b[\\s\\S]{0,24}\\b${WORD_ACCOUNT}\\b` +
     `|\\b${WORD_ACCOUNT}\\b[\\s\\S]{0,24}\\b${WORD_MAKE}\\b` +

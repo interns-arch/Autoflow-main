@@ -2262,6 +2262,31 @@ async function main() {
   const r20h = await rate20('919000000206', '2');
   check('"2" picks the second part and prices it', r20h.said.includes('71811M79M00') && /kitne piece|how many/i.test(r20h.said));
   check('...not as a quantity', !orders.findDraft('sim-919000000206'));
+
+  // 22 Sep, live, one chat: the car named once is the car for the next
+  // question; "price kitna hai" and "account bna do" are not answers to
+  // "Kaunsi gaadi?"; and "Create a customer" crashed on a stray variable.
+  const seen20 = [];
+  const searchWas20 = portal.searchByName;
+  portal.searchByName = async (q) => { seen20.push(String(q)); return searchWas20(q); };
+  await rate20('919000000207', 'Swift Dzire bumper price');
+  const r20i = await rate20('919000000207', 'mera gaadi ka rear bumper kitne ka hai');
+  check('the car named before is searched with the next part', seen20.some((q) => /rear bumper/i.test(q) && /dzire/i.test(q)));
+  check('...and answers with that car\'s part', r20i.said.includes('71811M79M00'));
+  portal.searchByName = searchWas20;
+  const clar20 = require('../src/core/clarify');
+  clar20.ask('sim-919000000208', { base: 'bumper', qty: 1 }, { facet: 1, text: 'Kaunsi gaadi?' });
+  const r20j = await rate20('919000000208', 'Price kitna hai');
+  check('"Price kitna hai" is not taken as the car', !clar20.get('sim-919000000208') && !/kaunsi gaadi/i.test(r20j.said));
+  check('"Account bna do mera" opens an account', require('../src/core/customerCreate').wantsToStart('Account bna do mera'));
+  const cust20 = require('../src/core/customers');
+  const resolveWas20 = cust20.resolve;
+  cust20.resolve = async (p) => (String(p).includes('919000000209') ? { found: false } : resolveWas20(p));
+  const r20k = await rate20('919000000209', 'Create a customer');
+  cust20.resolve = resolveWas20;
+  check('"Create a customer" from a new number answers, and does not crash', /GST/i.test(r20k.said));
+  require('../src/core/customerCreate').cancel('sim-919000000209');
+  check('a model year is never a part word', require('../src/core/partish').isYear('2018') && !require('../src/core/partish').isYear('16510'));
   portal.searchByName = realSearch20;
 
   // ---- 21. A salesman ordering FOR a customer ----

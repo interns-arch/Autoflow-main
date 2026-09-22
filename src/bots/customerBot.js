@@ -92,7 +92,27 @@ const pendingCancel = require('../core/chatState').slot('cancelAsk');
 const quotable = require('../core/chatState').slot('quotable');
 // The priced short list a rate question was answered with, so "2" picks from
 // it. chatId -> { base, parts: [{ partNo, name }], at }
-const rateOptions = require('../core/chatState').slot('rateOptions'); // chatId -> { at, items: [{ id, dir, text }] }
+const rateOptions = require('../core/chatState').slot('rateOptions');
+// The car a customer last NAMED in words, for the half hour after. "Swift
+// Dzire bumper price", then "mera gaadi 2018 model hai, kaun sa rear bumper"
+// - the second never says the car again, and searching "rear bumper" alone
+// offered a Chevrolet Corsa (22 Sep, live). chatId -> { words, at }
+const spokenCar = require('../core/chatState').slot('spokenCar');
+function withSpokenCar(chatId, item) {
+  const words = String(item || '').replace(/[()[\]{},;:!?"]/g, ' ').split(/\s+/).filter(Boolean);
+  const models = words.filter((w) => partish.isCarWord(w) && !partish.isMaker(w));
+  if (models.length) {
+    spokenCar.set(chatId, { words: models.join(' '), at: Date.now() });
+    return item;
+  }
+  const had = spokenCar.get(chatId);
+  if (!had || Date.now() - had.at > 30 * 60 * 1000) return item;
+  return `${item} ${had.words}`;
+}
+// "Is part ka naam kya hai", "ye kaunsa part hai", "what is this part".
+const PART_INFO_RE = /\b(naam|name)\b.*\b(kya|batao|bataiye|hai|is)\b|\bkaun\s*sa\s+part\b|\bkaunsa\s+part\b|\bwhat\s+(is\s+)?(this|the)\s+part\b/i;
+// Words that make a short message its own question, never a pick.
+const NOT_A_PICK_RE = /\b(price|rate|mrp|daam|kitne|kitna|kitni|naam|name|kya|kyu|kaise|kab|account|customer|order|cancel|status)\b|\?/i; // chatId -> { at, items: [{ id, dir, text }] }
 function rememberMsg(chatId, id, dir, text) {
   if (!chatId || !id || typeof id !== 'string') return;
   const row = quotable.get(chatId) || { at: 0, items: [] };
@@ -368,20 +388,6 @@ class CustomerBot {
           }
           return reply(msg + t('\n\nReply "kisi aur ka" to open one.', '\n\n"kisi aur ka" likh dijiye to bana dete hain.'));
         }
-      }
-      // The portal being down is NOT "no account". 22 Sep, live: the
-      // portal answered HTTP 500 (its connection pool was exhausted) and
-      // every number looked unregistered. Opening a form here would ask a
-      // customer who ALREADY has an account for twelve answers, and the
-      // creation at the end would fail anyway.
-      if (already && already.found === null) {
-        store.log(this.key, `${m.from} asked to open an account but the portal is not answering`);
-        return reply(
-          t(
-            "Our system isn't responding right now — give me a few minutes and ask again.",
-            'System abhi respond nahi kar raha — thodi der baad phir bolieye, turant bana denge.',
-          ),
-        );
       }
       store.log(this.key, `${m.from} asked to open an account${forElse ? ' for someone else' : ''}${agent ? ' (agent: ' + agent + ')' : ''}`);
       return reply(customerCreate.start(m.chatId, m.from, t, { forSomeoneElse: forElse }));
@@ -677,6 +683,44 @@ class CustomerBot {
       voiceOrder.clear(m.chatId);
     }
 
+    // "Is part ka naam kya hai" - swiped onto a reply, or about the part just
+    // discussed. 22 Sep, live: it was glued onto an old "Kaunsi gaadi?" and
+    // asked the same question back. The answer is the part: its name, price
+    // and stock.
+    if (PART_INFO_RE.test(text)) {
+      const q = m.contextId ? quotedMsg(m.chatId, m.contextId) : null;
+      const from = q ? partsIn(q.text) : focus.names(m.chatId);
+      const nos = [...new Set(from.map((p) => ai.partNumberIn(p) || p).filter((p) => partish.isPartNumber(p)))].slice(0, 3);
+      if (nos.length) {
+        clarify.clear(m.chatId);
+        store.log(this.key, `"${text}" -> about ${nos.join(', ')}`);
+        return this.quoteForOrder(m, nos.map((p) => ({ partNo: p })), reply, t);
+      }
+    }
+    // A question about "the part" while our priced list is the last thing
+    // on screen: the list IS the answer - names and prices are in it.
+    {
+      const offered = rateOptions.get(m.chatId);
+      if (offered && Date.now() - offered.at < 30 * 60 * 1000 && (PART_INFO_RE.test(text) || /^(price|rate|mrp|daam)\b.{0,20}$|^(kitne|kitna|kitni) ka\b/i.test(text))) {
+        return reply(
+          t(
+            `Each part's price is in the list above - send its number (1-${offered.parts.length}) and I will give you the details.`,
+            `Upar list mein har part ka naam aur price hai - number bhejiye (1-${offered.parts.length}), poori detail de deta hoon.`,
+          ),
+        );
+      }
+    }
+    // "Is part ka naam kya hai" with no part anywhere is a question, never a
+    // part name to search the catalogue for.
+    if (PART_INFO_RE.test(text)) {
+      return reply(
+        t(
+          'Which part? Send the part number, or swipe-reply on the message about it.',
+          'Kaunsa part? Part number bhejiye, ya us message pe swipe karke puchiye.',
+        ),
+      );
+    }
+
     // A pick from the priced list a rate question was answered with. Before
     // the quantity readers: the "2" is which part, not how many.
     {
@@ -690,7 +734,7 @@ class CustomerBot {
           rateOptions.delete(m.chatId);
           clarify.clear(m.chatId);
           store.log(this.key, `rate: picked ${pick.partNo} from the priced list`);
-          return this.quoteForOrder(m, [{ partNo: pick.partNo, name: pick.name, requested: offered.base }], reply, t);
+          return this.quoteForOrder(m, [{ partNo: pick.partNo, name: pick.name, requested: offered.base, price: pick.price }], reply, t);
         }
       }
     }
@@ -754,6 +798,13 @@ class CustomerBot {
     // rather than being parsed as a fresh order.
     // Swiped onto an older message: about that message, not an answer to the
     // question we asked last.
+    // Not an answer to "Kaunsi gaadi?": a question of its own ("price kitna
+    // hai", "naam kya hai") or something else entirely ("account bna do").
+    // 22 Sep, live: all three were added to "rear bumper" and searched.
+    if (clarify.get(m.chatId) && (NOT_A_PICK_RE.test(text) || customerCreate.wantsToStart(text))) {
+      store.log(this.key, `"${text}" is not an answer to the open question - moving on`);
+      clarify.clear(m.chatId);
+    }
     if (!oldSwipe && clarify.isAnswerTo(m.chatId, text)) {
       const p = clarify.refine(m.chatId, text);
       const hits = await availability.byName(p.base);
@@ -929,7 +980,7 @@ class CustomerBot {
           let top = [];
           let hits = null;
           try {
-            hits = await availability.byName(vehicle.narrow(m.chatId, item));
+            hits = await availability.byName(vehicle.narrow(m.chatId, withSpokenCar(m.chatId, item)));
             top = (hits && hits.top) || [];
           } catch (e) {
             store.log(this.key, 'rate: catalogue lookup failed for "' + item + '": ' + String((e && e.message) || e).slice(0, 80));
@@ -2184,7 +2235,14 @@ class CustomerBot {
     });
     askQty.clear(m.chatId);
     askQty.forget(m.chatId);
-    rateOptions.set(m.chatId, { base: state.base, parts: shown.map((x) => ({ partNo: x.partNo, name: x.name })), at: Date.now() });
+    rateOptions.set(m.chatId, {
+      base: state.base,
+      parts: shown.map((x) => {
+        const p = priced.get(rates.norm(x.partNo));
+        return { partNo: x.partNo, name: x.name, price: p ? rates.priceText(p, t) : null };
+      }),
+      at: Date.now(),
+    });
     // Kept too, so "2nd gen" narrows the same search instead of starting over.
     clarify.offer(m.chatId, state, top);
     const more = total > shown.length ? t(` (${total} fit - the first ${shown.length})`, ` (${total} milte hain - pehle ${shown.length})`) : '';
@@ -2221,12 +2279,23 @@ class CustomerBot {
         return null;
       });
 
+    for (const f of found) {
+      if (f.name) continue;
+      const r = await availability.byName(f.partNo).catch(() => null);
+      const hit = ((r && r.top) || []).find((x) => rates.norm(x.partNo) === rates.norm(f.partNo));
+      if (hit) f.name = hit.name;
+    }
     const what = found.filter((f) => f.name).map((f) => `${f.partNo} — ${f.name}`).join('\n');
     const stock = resolved.map((l) => availability.describe(l, m.chatId)).join('\n');
     askQty.ask(m.chatId, partNos.map((p) => ({ item: p })));
 
     let price = quoted;
-    if (!quoted) {
+    // The price we showed in the list a minute ago still stands. 22 Sep: the
+    // portal timed out once on the pick, and the customer who had just read
+    // "MRP ₹2,650" was told the rate would follow.
+    if (!quoted && found.every((f) => f.price)) {
+      price = found.map((f) => `${f.partNo} - ${f.price}`).join('\n');
+    } else if (!quoted) {
       await escalation.create(this, {
         chatId: m.chatId,
         customerPhone: m.from,
@@ -2239,7 +2308,7 @@ class CustomerBot {
     } else {
       store.upsertCustomer(m.from);
     }
-    store.log(this.key, `rate: quoted ${partNos.join(', ')} by name${quoted ? '' : ' (no price found - asked a person)'}`);
+    store.log(this.key, `rate: quoted ${partNos.join(', ')} by name${quoted ? '' : price !== quoted && found.every((f) => f.price) ? ' (price from the list)' : ' (no price found - asked a person)'}`);
     return reply(
       [what, price, stock ? 'Stock: ' + stock : null, t('How many do you need?', 'Kitne piece chahiye?')]
         .filter(Boolean)
@@ -2694,10 +2763,23 @@ class CustomerBot {
       }
       let top = [];
       try {
-        const hits = await availability.byName(vehicle.narrow(chatId, item));
+        const hits = await availability.byName(vehicle.narrow(chatId, chatId ? withSpokenCar(chatId, item) : item));
         top = (hits && hits.top) || [];
       } catch (e) {
         store.log(this.key, `inquiry: catalogue lookup failed for "${item}": ${String((e && e.message) || e).slice(0, 80)}`);
+      }
+      // One part asked about by name: answer it the way a price question is
+      // answered - what it is, its price, whether we have it, how many. The
+      // bare "Stock check: 13780M55R50 - hai" told them nothing they could
+      // order from (22 Sep, live).
+      const asText = async (x) => x;
+      if (items.length === 1 && m && top.length === 1) {
+        store.log(this.key, `"${item}" -> ${top[0].partNo} by name (only match)`);
+        return this.quoteForOrder(m, [{ partNo: top[0].partNo, name: top[0].name, requested: item }], asText, t);
+      }
+      if (items.length === 1 && m && top.length > 1) {
+        store.log(this.key, `"${item}" -> ${top.length} catalogue matches; showing them priced`);
+        return this.offerPriced(m, { base: item, qty: 1, rate: true }, top, top.length, asText, t);
       }
       if (top.length === 1) {
         store.log(this.key, `"${item}" -> ${top[0].partNo} by name (only match)`);

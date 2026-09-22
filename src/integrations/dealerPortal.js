@@ -964,7 +964,9 @@ module.exports = {
   async searchByName(query, limit = 6) {
     const q = String(query || '').trim();
     if (!q || isMock()) return { total: 0, top: [] };
-    const words = q.split(/\s+/).filter(Boolean);
+    // Brackets and commas are not part of any word: "rear bumper (2018
+    // model)" kept "(2018" and "model)" as part words and matched nothing.
+    const words = q.replace(/[()[\]{},;:!?"]/g, ' ').split(/\s+/).filter(Boolean);
     try {
       // The portal matches the phrase literally, and part names are written
       // "BRAKE PAD | MAHINDRA SCORPIO | FRONT" — the PART first, the car after.
@@ -987,10 +989,15 @@ module.exports = {
       // nothing), so when a MODEL is named, search the part word alone -
       // "bumper" - and let the model, the position ("front") and the rest
       // narrow it below. That gives 176 rows, every one a Dzire bumper.
-      const core = partWords.filter((w) => !partish.isPositionWord(w) && !partish.isFiller(w));
-      const models = words.filter((w) => partish.isCarWord(w) && !partish.isMaker(w));
+      //
+      // The same goes for a position with no car: "rear bumper" as a phrase
+      // found four Chevrolet Tavera parts; "bumper" narrowed by "rear" finds
+      // every rear bumper. So whenever the part word is not the whole of what
+      // they said, it is searched on its own first.
+      const core = partWords.filter((w) => !partish.isPositionWord(w) && !partish.isFiller(w) && !partish.isYear(w));
+      const year = Number(words.find((w) => partish.isYear(w)) || 0);
       const tries = [];
-      if (core.length && models.length) tries.push(core);
+      if (core.length && core.length !== words.length) tries.push(core);
 
       // Then: the phrase as they said it; the part words alone; then the
       // leading words, shortest last — the old behaviour, still the right
@@ -1025,7 +1032,7 @@ module.exports = {
       const inUse = new Set(used.map((w) => w.toLowerCase()));
       const extra = words
         .map((w) => w.toLowerCase())
-        .filter((w) => !inUse.has(w) && !partish.isMaker(w) && !partish.isFiller(w));
+        .filter((w) => !inUse.has(w) && !partish.isMaker(w) && !partish.isFiller(w) && !partish.isYear(w));
       for (const w of extra) {
         const narrowed = rows.filter((r) => String(r.partName || '').toLowerCase().includes(w));
         if (narrowed.length) rows = narrowed;
@@ -1038,6 +1045,19 @@ module.exports = {
         const want = core.join(' ').toLowerCase();
         const exact = rows.filter((r) => String(r.partName || '').split('|')[0].trim().toLowerCase() === want);
         if (exact.length) rows = exact;
+      }
+      // The model year against the years a part is written for: "(2011-2017)",
+      // "(2017+ sedan)". A part that names no year is kept - most do not.
+      if (year) {
+        const fitsYear = (name) => {
+          const s = String(name || '');
+          const ranges = [...s.matchAll(/\b(19\d\d|20\d\d)\s*[-–]\s*(19\d\d|20\d\d)\b/g)].map((m) => [Number(m[1]), Number(m[2])]);
+          const from = [...s.matchAll(/\b(19\d\d|20\d\d)\s*\+/g)].map((m) => [Number(m[1]), 9999]);
+          const all = [...ranges, ...from];
+          return !all.length || all.some(([a, b]) => year >= a && year <= b);
+        };
+        const byYear = rows.filter((r) => fitsYear(r.partName));
+        if (byYear.length) rows = byYear;
       }
       const out = rows.map((r) => {
         const dealers = Array.isArray(r.dealers) ? r.dealers : [];
