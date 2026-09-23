@@ -120,6 +120,90 @@ async function embed(text) {
   return vec;
 }
 
+// MANY AT ONCE.
+//
+// A catalogue of 100,000 parts is 100,000 embeddings. One call each is days of
+// wall clock; a hundred per call is about half an hour. Measured against the
+// live endpoint (23 Sep): 100 vectors in 1.68s, and 250 is refused — the
+// batch ceiling is 100.
+//
+// -> array the same length as `texts`, with null wherever one could not be
+// embedded. Never throws: the caller stores what came back and tries the rest
+// later.
+const BATCH_MAX = 100;
+
+async function embedBatch(texts) {
+  const list = (texts || []).map((t) => String(t == null ? '' : t).trim());
+  if (!list.length) return [];
+  if (!available()) return list.map(() => null);
+
+  const out = new Array(list.length).fill(null);
+  const model = config.kb.embeddingModel;
+  const url =
+    'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':batchEmbedContents';
+
+  for (let start = 0; start < list.length; start += BATCH_MAX) {
+    const slice = list.slice(start, start + BATCH_MAX);
+    // A cached vector still counts; only the unseen ones are sent.
+    const need = [];
+    slice.forEach((t, i) => {
+      const hit = t ? cached(t) : null;
+      if (hit !== undefined && hit !== null) out[start + i] = hit;
+      else if (t) need.push({ i: start + i, text: t });
+    });
+    if (!need.length) continue;
+
+    const body = {
+      requests: need.map((n) => ({
+        model: 'models/' + model,
+        content: { parts: [{ text: n.text }] },
+        outputDimensionality: config.kb.embeddingDim,
+      })),
+    };
+
+    let res = null;
+    // 429 is a rate limit, and on a run this long it WILL happen. Backing off
+    // and carrying on is the difference between a finished import and a half
+    // one.
+    for (let attempt = 0; attempt < 4; attempt++) {
+      if (attempt) await new Promise((r) => setTimeout(r, 2000 * attempt));
+      try {
+        res = await fetch(url + '?key=' + encodeURIComponent(config.gemini.apiKey), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(Math.max(config.kb.embeddingTimeoutMs, 30000)),
+        });
+      } catch (e) {
+        store.log('kb', 'batch embedding request failed: ' + String((e && e.message) || e).slice(0, 90));
+        res = null;
+        continue;
+      }
+      if (res.ok || ![429, 500, 502, 503, 504].includes(res.status)) break;
+    }
+    if (!res || !res.ok) {
+      store.log('kb', 'batch embedding HTTP ' + (res ? res.status : '?') + ' for ' + need.length + ' item(s)');
+      continue; // leave them null; the caller will come back for them
+    }
+
+    let vectors = [];
+    try {
+      const data = await res.json();
+      vectors = (data.embeddings || []).map((e) => (e && e.values) || null);
+    } catch (e) {
+      store.log('kb', 'batch embedding reply was not JSON');
+      continue;
+    }
+    need.forEach((n, k) => {
+      const v = vectors[k];
+      if (!Array.isArray(v) || v.length !== config.kb.embeddingDim) return;
+      remember(n.text, v);
+      out[n.i] = v;
+    });
+  }
+  return out;
+}
+
 // pgvector's text form: '[0.1,0.2,...]'. Passed as a string parameter and cast
 // in SQL, which is how the driver and the extension agree on the type.
 function toSqlVector(vec) {
@@ -146,4 +230,4 @@ function _clearCacheForTests() {
   cache.clear();
 }
 
-module.exports = { embed, available, searchableText, toSqlVector, cosine, _clearCacheForTests };
+module.exports = { embed, embedBatch, available, searchableText, toSqlVector, cosine, _clearCacheForTests };

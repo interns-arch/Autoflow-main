@@ -112,15 +112,39 @@ async function embedPending(limit = 500, onProgress) {
     );
     const rows = (res && res.rows) || [];
     if (!rows.length) break;
-    for (const row of rows) {
-      const vec = await embeddings.embed(row.searchable);
-      if (!vec) return done; // the service is down; the rest waits for next time
-      await db.query('UPDATE bot_parts SET embedding = $2::vector WHERE id = $1', [
-        row.id,
-        embeddings.toSqlVector(vec),
-      ]);
-      done++;
-      if (onProgress && done % 50 === 0) onProgress(done);
+
+    // A hundred at a time. One call per part would be days for a catalogue
+    // this size; measured, a batch of 100 takes under two seconds.
+    const vectors = await embeddings.embedBatch(rows.map((r) => r.searchable));
+
+    // ONE round trip for the whole batch, not one per part. Writing them
+    // individually meant 100,000 statements for a catalogue this size, and
+    // the database round trip — not the embedding API — became the slow part.
+    const ids = [];
+    const vecs = [];
+    for (let i = 0; i < rows.length; i++) {
+      if (!vectors[i]) continue; // left for the next run rather than lost
+      ids.push(rows[i].id);
+      vecs.push(embeddings.toSqlVector(vectors[i]));
+    }
+    let stored = 0;
+    if (ids.length) {
+      const w = await db.query(
+        `UPDATE bot_parts SET embedding = v.emb::vector
+           FROM (SELECT unnest($1::bigint[]) AS id, unnest($2::text[]) AS emb) v
+          WHERE bot_parts.id = v.id`,
+        [ids, vecs],
+        null,
+      );
+      stored = (w && w.rowCount) || 0;
+      done += stored;
+    }
+    if (onProgress) onProgress(done);
+    // Nothing came back at all: the service is down or the quota is spent, and
+    // hammering it will not help. Stop and let the run be resumed.
+    if (!stored) {
+      store.log('parts', 'embedding stopped after ' + done + ' — nothing came back for the last batch');
+      break;
     }
   }
   return done;
