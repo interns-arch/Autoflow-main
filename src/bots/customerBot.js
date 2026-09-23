@@ -20,6 +20,7 @@ const orders = require('../core/orders');
 const knowledge = require('../core/knowledge');
 const inquiries = require('../core/inquiries');
 const customers = require('../core/customers');
+const agent = require('../agent');
 const customerCreate = require('../core/customerCreate');
 const portal = require('../integrations/dealerPortal');
 const escalation = require('../core/escalation');
@@ -481,6 +482,37 @@ class CustomerBot {
         const rid = (m.contextId && customerCreate.requestForMessage(m.contextId)) || customerCreate.requestIdIn(text);
         if (rid) return this.noteOnNewCustomer(m, rid, text, reply, t);
       }
+    }
+
+    // THE AGENT.
+    //
+    // One agent holding every tool, deciding for itself which to reach for.
+    // It sits HERE and not at the top of the handler on purpose: everything
+    // above this line is cheap, deterministic and has been right in
+    // production for months — the echo guard, voice and photo, a half-filled
+    // customer form, an approver saying yes. Handing any of that to a model
+    // would be paying tokens to get worse.
+    //
+    // Two gates, and both default to shut. AGENT_ENABLED is off, and
+    // AGENT_ALLOW_FROM is empty, so turning the flag on by accident still
+    // reaches nobody. While it is being tried out it answers exactly the
+    // numbers named in that list and no others.
+    //
+    // If the agent cannot run, this falls through to everything below and
+    // the bot behaves as it always has. If the agent RAN but has nothing to
+    // add — because a tool has already messaged the customer — nothing more
+    // is sent, because the alternative is answering the same person twice.
+    if (agent.enabled() && agent.allowed(m.from)) {
+      const who = await customers.resolve(m.from).catch(() => null);
+      const res = await agent.handle({
+        bot: this,
+        chatId: m.chatId,
+        phone: m.from,
+        customer: who && who.found ? who : null,
+        text,
+      });
+      if (res.handled) return res.reply ? reply(res.reply) : true;
+      store.log(this.key, 'agent could not answer ' + m.from + ' — falling back to the usual path');
     }
 
     // "CREATE CUSTOMER". Asked for in words, rather than waiting for an

@@ -119,12 +119,39 @@ async function portalCanAnswer(item, reason) {
   if (!['NOT_IN_CATALOGUE', 'NO_PART_NUMBER'].includes(reason)) return null;
   const asked = String(item || '').trim();
   if (asked.length < 4) return null;
+
+  // A QUESTION IS NOT A PART, AND MUST NOT BE SEARCHED AS ONE.
+  //
+  // The catalogue search drops words until something matches, so a question
+  // reaches it as a bag of words and can come back with exactly one row.
+  // "kya tum log sunday ko khule ho" matched B102AKYAA01 — one row, therefore
+  // "confident" — and because the caller LEARNS what this returns, the phrase
+  // was aliased to that part for good. Every customer asking about Sunday
+  // opening would then have been quoted a part number.
+  //
+  // availability.byName has always refused questions and vehicles. This path
+  // went to the portal directly and so never got that refusal; now it does.
+  const partish = require('./partish');
+  if (partish.isQuestion(asked) || partish.isVehicle(asked)) {
+    store.log('escalate', `"${asked.slice(0, 40)}" is a ${partish.classify(asked)}, not a part — not searched, going to a person`);
+    return null;
+  }
+
   try {
     const portal = require('../integrations/dealerPortal');
     const rows = ((await portal.searchByName(asked, 5)) || {}).top || [];
     if (rows.length !== 1) return null; // ambiguous or nothing — ask a person
     const hit = rows[0];
     if (!hit || !hit.partNo) return null;
+
+    // ONE ROW IS NOT THE SAME AS THE RIGHT ROW. The single hit still has to
+    // agree with what the customer actually said — the same rule the keyword
+    // and vector paths already apply, and the one that keeps a Fortuner blade
+    // from answering a Cartrends question.
+    if (!require('./availability').matchTrustworthy(asked, hit)) {
+      store.log('escalate', `"${asked.slice(0, 40)}" -> ${hit.partNo} contradicts the question — asking a person instead`);
+      return null;
+    }
     return hit;
   } catch (err) {
     store.log('escalate', 'portal could not be reached before escalating: ' + String((err && err.message) || err).slice(0, 80));

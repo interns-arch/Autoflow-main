@@ -16,13 +16,19 @@
     "test:history": "node scripts/test-history.js",
     "verify:wiper": "node scripts/verify-wiper.js",
     "test:echo": "node scripts/test-echo.js",
-    "import:parts": "node scripts/import-parts.js"
+    "import:parts": "node scripts/import-parts.js",
+    "try:agent": "node scripts/try-agent.js",
+    "test:agent": "node scripts/test-agent.js"
   },
   "dependencies": {
+    "@langchain/core": "^1.2.12",
+    "@langchain/google-genai": "^2.3.2",
+    "@langchain/langgraph": "^1.4.17",
     "adm-zip": "^0.6.1",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "imapflow": "^2.0.0",
+    "langchain": "^1.5.12",
     "node-cron": "^3.0.3",
     "pg": "^8.23.0",
     "qrcode": "^1.5.4",

@@ -38,9 +38,18 @@ stub('../src/integrations/dealerPortal', {
   searchByName: async () => { if (portalThrows) throw new Error('portal down'); return { top: portalRows }; },
   analyze: async (p) => p, commercialAnalyze: async () => null,
 });
+// The REAL brand check, captured before the stub goes in.
+//
+// escalation asks the portal by name one last time before disturbing anybody,
+// and a single hit that contradicts the question must not be accepted — that
+// is how "kya tum log sunday ko khule ho" became a part number. Stubbing this
+// out with a function that always says yes would test nothing, so the double
+// carries the real rule.
+const realMatchTrustworthy = require('../src/core/availability').matchTrustworthy;
 stub('../src/core/availability', {
   resolve: async (l) => l.map((x) => ({ item: x.item, partNo: x.item, qty: 1, source: 'available' })),
   describe: (l) => l.item + ' - available',
+  matchTrustworthy: realMatchTrustworthy,
 });
 stub('../src/core/orders', {
   getOrCreateDraft: () => ({ id: 'SO', lines: [] }),
@@ -100,6 +109,29 @@ const ask = (item, phone, reason) =>
   portalRows = [{ partNo: 'CTCP-SWIFT-01', name: 'Clutch Plate Swift', available: 4 }];
   const r = await ask('clutch plate swift', '917000000008');
   check('portal has it -> helper NOT asked', toHelper.length === 0 && r && r.fromPortal, JSON.stringify(r));
+
+  // ONE ROW IS NOT THE SAME AS THE RIGHT ROW.
+  //
+  // Live, 23 Sep: "kya tum log sunday ko khule ho" went to the catalogue,
+  // which drops words until something matches, and came back with exactly one
+  // row — B102AKYAA01. One row reads as confidence, so the phrase was learned
+  // as an alias for that part, permanently. Every customer asking about
+  // Sunday opening would have been quoted a body kit.
+  //
+  // A single hit now has to agree with what was actually asked.
+  escalation._forgetInMemory(); toHelper = []; toCustomer = [];
+  const aliasesBefore = Object.keys(require('../src/core/knowledge').all().aliases || {}).length;
+  portalRows = [{ partNo: 'B102AKYAA01', name: 'AKYAA HO BODY KIT', available: 2 }];
+  const q = await ask('kya tum log sunday ko khule ho', '917000000021');
+  check(
+    'a question that happens to match one part is NOT answered from the catalogue',
+    toHelper.length === 1 && !(q && q.fromPortal),
+    JSON.stringify(q),
+  );
+  check(
+    '...and that phrase is never learned as a part number',
+    Object.keys(require('../src/core/knowledge').all().aliases || {}).length === aliasesBefore,
+  );
 
   escalation._forgetInMemory(); toHelper = [];
   portalRows = [{ partNo: 'A1' }, { partNo: 'B2' }];

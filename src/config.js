@@ -352,6 +352,31 @@ const config = {
 
   // The catalogue index: which PART the customer means. Never what it costs
   // or whether we have it - see core/parts.
+  // THE AGENT.
+  //
+  // One agent, every tool, a docstring on each so the model chooses rather
+  // than a router deciding for it. Flash Lite because routing accuracy is
+  // what matters here and it measured 94% at a fraction of the latency.
+  agent: {
+    // The name it answers to and signs off as. Appears in the system prompt
+    // and nowhere else, so changing it here changes it everywhere.
+    name: process.env.AGENT_NAME || 'Prateek',
+    model: process.env.AGENT_MODEL || 'gemini-3.5-flash-lite',
+    // OFF by default. Nothing reaches a customer through the agent until
+    // this is set, so the existing deterministic path stays in charge while
+    // the agent is being driven by hand from a test number.
+    enabled: String(process.env.AGENT_ENABLED || '').toLowerCase() === 'true',
+    // Numbers allowed to talk to the agent while it is being trialled. Empty
+    // means nobody, even when enabled is true.
+    allowFrom: String(process.env.AGENT_ALLOW_FROM || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean),
+    // A runaway loop costs money and makes a customer wait. Measured: a
+    // normal part-and-price turn is 2 to 4 tool calls.
+    maxToolCalls: parseInt(process.env.AGENT_MAX_TOOL_CALLS || '10', 10),
+  },
+
   parts: {
     // Lower than the knowledge threshold on purpose. A part name is a short,
     // dense string and the customer writes a different short, dense string;
