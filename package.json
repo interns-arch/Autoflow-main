@@ -15,7 +15,8 @@
     "import:whatsapp-history": "node scripts/import-whatsapp-history.js",
     "test:history": "node scripts/test-history.js",
     "verify:wiper": "node scripts/verify-wiper.js",
-    "test:echo": "node scripts/test-echo.js"
+    "test:echo": "node scripts/test-echo.js",
+    "import:parts": "node scripts/import-parts.js"
   },
   "dependencies": {
     "adm-zip": "^0.6.1",

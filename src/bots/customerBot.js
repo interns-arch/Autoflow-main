@@ -23,6 +23,7 @@ const customers = require('../core/customers');
 const customerCreate = require('../core/customerCreate');
 const portal = require('../integrations/dealerPortal');
 const escalation = require('../core/escalation');
+const parts = require('../core/parts');
 const kb = require('../core/kb');
 const clarify = require('../core/clarify');
 const lang = require('../core/lang');
@@ -3357,6 +3358,22 @@ class CustomerBot {
         lines.push(l);
         continue;
       }
+      // THE CATALOGUE INDEX FIRST, when one has been imported.
+      //
+      // The portal search is a literal phrase match, which is how "Cartend
+      // wiper blade 17 number" ended up quoting a Fortuner blade: the brand
+      // was dropped and one row was taken as proof. The index matches on
+      // meaning instead, so the customer's words reach the right part number.
+      //
+      // It answers WHICH PART and nothing else — price and stock are still
+      // read from the portal below, every time.
+      const indexed = await parts.find(l.item).catch(() => null);
+      if (indexed && indexed.partNo) {
+        store.log(this.key, `"${l.item}" -> ${indexed.partNo} from the catalogue index`);
+        lines.push({ ...l, item: indexed.partNo, requested: l.item });
+        continue;
+      }
+
       const hits = await availability.byName(vehicle.narrow(m.chatId, l.item));
       // One row is only an answer when it does not contradict the question.
       // "Cartend wiper blade 17 number" matched a Fortuner blade and was

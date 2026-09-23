@@ -350,6 +350,22 @@ const config = {
     notCarriedDays: parseInt(process.env.NOT_CARRIED_MEMORY_DAYS || 30, 10),
   },
 
+  // The catalogue index: which PART the customer means. Never what it costs
+  // or whether we have it - see core/parts.
+  parts: {
+    // Lower than the knowledge threshold on purpose. A part name is a short,
+    // dense string and the customer writes a different short, dense string;
+    // "Cartend wiper blade 16 number" against "Wiper Blade | 16 Inches | All
+    // Cars" is a real match that scores nothing like a paraphrased sentence.
+    // Tune with /api/parts/search before trusting it.
+    threshold: parseFloat(process.env.PARTS_SIMILARITY_THRESHOLD || '0.60'),
+    topK: parseInt(process.env.PARTS_TOP_K || '5', 10),
+    // How far clear the best match must be from the runner-up. Two parts a
+    // whisker apart is the wiper case - right size, wrong brand, sitting
+    // next to each other - and a near-tie is shown rather than chosen.
+    margin: parseFloat(process.env.PARTS_MATCH_MARGIN || '0.03'),
+  },
+
   // ---------------------------------------------------------------- knowledge
   // The self-learning knowledge base: what a person has told us that is worth
   // telling the next customer who asks the same thing. Postgres + pgvector,
