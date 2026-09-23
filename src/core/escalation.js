@@ -31,7 +31,11 @@ const helperLastInbound = new Map();
 
 // Part questions get a "could not confirm" follow-up when the helper is slow;
 // these reasons never do (see create()).
-const NO_FALLBACK_REASONS = ['NOT_A_PART', 'DOCUMENT', 'VOICE'];
+// RATE belongs here too. The follow-up asks for "the exact part number", which
+// is the wrong question entirely when the customer already named the part and
+// asked what it costs - on 23 Sep a rate question came back as
+// 'We could not confirm "WB17, WB18" yet. Please share the exact part number'.
+const NO_FALLBACK_REASONS = ['NOT_A_PART', 'DOCUMENT', 'VOICE', 'RATE'];
 
 // What survives a restart: everything needed to recognise and answer the
 // question. Not the photo or the recording (the helper already has them in
@@ -477,7 +481,9 @@ async function create(
   // ("Please collect cheque tomorrow") is rare, and two of them that read
   // alike are usually not the same request at all, so those still go through
   // every time.
-  const DEDUPE_REASONS = ['NOT_IN_CATALOGUE', 'NO_PART_NUMBER'];
+  // RATE repeats more than anything else: a customer types "Price" twice in a
+  // minute and he was sent questions #30, #31 and #32 about the same parts.
+  const DEDUPE_REASONS = ['NOT_IN_CATALOGUE', 'NO_PART_NUMBER', 'RATE'];
   const already = DEDUPE_REASONS.includes(reason || '')
     ? [...pending.values()].find((pe) => pe.reason === reason && sameQuestion(pe.item, item) && !pe.timedOut)
     : null;

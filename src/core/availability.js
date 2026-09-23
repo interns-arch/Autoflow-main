@@ -182,9 +182,30 @@ async function resolve(lines, ctx) {
   // number the portal does not know still goes down the old road - which
   // answers availability perfectly well, just without any money on it.
   let answered = null;
-  if (ctx && (ctx.accountId || ctx.buyerId)) {
+  // Was this priced for the person ASKING, or merely priced? The difference
+  // decides whether the rate may be repeated to them (see describe/priceOf).
+  // config.dealerPortal.listPriceAccountId is the fallback used to read MRP
+  // for a number the portal does not know — its discount is not theirs.
+  const ownAccount = Boolean(
+    ctx &&
+      (ctx.accountId || ctx.buyerId) &&
+      String(ctx.accountId || ctx.buyerId) !== String(config.dealerPortal.listPriceAccountId || ''),
+  );
+  // A number the portal does not know still gets an MRP, by pricing against
+  // the fallback account. Only the MRP is then repeatable (ownAccount is
+  // false above), so the customer hears "MRP Rs.799" and never that account's
+  // negotiated Rs.187. Without this, an unregistered customer got no money
+  // information at all and every "Price" went to a person.
+  const priceCtx =
+    ctx && (ctx.accountId || ctx.buyerId)
+      ? ctx
+      : config.dealerPortal.listPriceAccountId
+        ? { ...(ctx || {}), accountId: config.dealerPortal.listPriceAccountId }
+        : null;
+
+  if (priceCtx) {
     try {
-      answered = await portal.commercialAnalyze(prepared, ctx);
+      answered = await portal.commercialAnalyze(prepared, priceCtx);
     } catch (e) {
       store.log('avail', 'commercial-analyze failed, falling back: ' + String((e && e.message) || e).slice(0, 120));
     }
@@ -205,6 +226,8 @@ async function resolve(lines, ctx) {
         : r;
     return {
     ...out,
+    // Only true when the portal priced against this customer's own account.
+    pricedForCustomer: ownAccount,
     requested: prepared[i].item,
     item: out.item || prepared[i].item,
     // Dropping this here collapsed four of the customer's orders back into
@@ -274,6 +297,22 @@ function displayName(line) {
 // counter would actually type — the customer asked one thing, not for a
 // paragraph. `eta` used to be appended to an already-"available" line, which
 // read as "available (Rs.450) — available".
+// What may be said about money for this line, as a short suffix.
+//
+// `pricedForCustomer` is set by resolve() only when the portal priced against
+// the asking customer's own account. Without it the rate on the line is
+// somebody else's, and only the MRP is repeatable.
+function priceOf(line) {
+  const money = (n) => 'Rs.' + Math.round(Number(n));
+  const rate = Number(line.rate);
+  const mrp = Number(line.mrp);
+  if (line.pricedForCustomer && Number.isFinite(rate) && rate > 0) {
+    return Number.isFinite(mrp) && mrp > rate ? ` — ${money(rate)} (MRP ${money(mrp)})` : ` — ${money(rate)}`;
+  }
+  if (Number.isFinite(mrp) && mrp > 0) return ` — MRP ${money(mrp)}`;
+  return '';
+}
+
 function describe(line, chatId) {
   const t = lang.for(chatId);
   const name = displayName(line);
@@ -282,7 +321,16 @@ function describe(line, chatId) {
     return `${name} - ` + t('confirming the exact part, will get back to you', 'exact part confirm karke batata hoon');
   // Founder's rule for a not-in-stock item: never say no, say when.
   if (line.source === 'unavailable') return `${name} - on order, ETA = ${config.onOrderEtaDays} days`;
-  const price = ''; // rates are not quoted over WhatsApp
+  // THE PRICE, WITHOUT BEING ASKED — but only a price that is theirs.
+  //
+  // The portal prices against an ACCOUNT. When it knows this customer it
+  // prices for them, and that number is correct for them by definition. When
+  // it does not (an unregistered number), the rate that comes back belongs to
+  // whichever account the bot is logged in as — on 23 Sep that was 186.97
+  // against an MRP of 799, a 76.6% discount belonging to account 3822 and to
+  // nobody who was asking. MRP is public and is theirs to see; that account's
+  // discount is not.
+  const price = priceOf(line);
   if (line.partial)
     return (
       `${name} - ` +

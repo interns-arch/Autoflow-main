@@ -14,7 +14,8 @@
     "test:escalation": "node scripts/test-escalation.js",
     "import:whatsapp-history": "node scripts/import-whatsapp-history.js",
     "test:history": "node scripts/test-history.js",
-    "verify:wiper": "node scripts/verify-wiper.js"
+    "verify:wiper": "node scripts/verify-wiper.js",
+    "test:echo": "node scripts/test-echo.js"
   },
   "dependencies": {
     "adm-zip": "^0.6.1",

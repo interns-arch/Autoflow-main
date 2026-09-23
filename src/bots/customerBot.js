@@ -139,6 +139,50 @@ function withSpokenCar(chatId, item) {
 const PART_INFO_RE = /\b(naam|name)\b.*\b(kya|batao|bataiye|hai|is)\b|\bkaun\s*sa\s+part\b|\bkaunsa\s+part\b|\bwhat\s+(is\s+)?(this|the)\s+part\b/i;
 // Words that make a short message its own question, never a pick.
 const NOT_A_PICK_RE = /\b(price|rate|mrp|daam|kitne|kitna|kitni|naam|name|kya|kyu|kaise|kab|account|customer|order|cancel|status)\b|\?/i; // chatId -> { at, items: [{ id, dir, text }] }
+// Is this inbound message one of OUR recent messages, sent back?
+//
+// Compared on the words, not the characters, because forwarding adds
+// decoration and WhatsApp rewraps long lines. The test is containment in both
+// directions: nearly all of our message is in theirs, and nearly all of
+// theirs is in ours. A customer quoting one line of a sixty-item list fails
+// the second half and is handled normally, which is what picking from a list
+// looks like.
+const ECHO_MIN_CHARS = 40; // shorter than this is a real reply, not a forward
+const ECHO_OVERLAP = 0.85;
+
+function echoWords(s) {
+  return String(s || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .split(' ')
+    .filter(Boolean);
+}
+
+function isOurOwnMessageBack(chatId, body) {
+  const text = String(body || '').trim();
+  if (text.length < ECHO_MIN_CHARS) return false;
+  const theirs = echoWords(text);
+  if (theirs.length < 8) return false;
+  const theirSet = new Set(theirs);
+
+  for (const turn of conversation.turns(chatId)) {
+    if (turn.role !== 'us') continue;
+    const ours = echoWords(turn.text);
+    if (ours.length < 8) continue;
+    const ourSet = new Set(ours);
+    let shared = 0;
+    for (const w of ourSet) if (theirSet.has(w)) shared++;
+    // nearly all of ours inside theirs, AND nearly all of theirs inside ours
+    const coversOurs = shared / ourSet.size;
+    let back = 0;
+    for (const w of theirSet) if (ourSet.has(w)) back++;
+    const coversTheirs = back / theirSet.size;
+    if (coversOurs >= ECHO_OVERLAP && coversTheirs >= ECHO_OVERLAP) return true;
+  }
+  return false;
+}
+
 function rememberMsg(chatId, id, dir, text) {
   if (!chatId || !id || typeof id !== 'string') return;
   const row = quotable.get(chatId) || { at: 0, items: [] };
@@ -342,6 +386,21 @@ class CustomerBot {
     // language they last showed us stands.
     lang.note(m.chatId, m.body || '');
     const t = lang.for(m.chatId);
+
+    // OUR OWN WORDS, SENT BACK TO US.
+    //
+    // 23 Sep: the bot listed sixty wiper blades, the customer forwarded that
+    // list straight back, and the bot read its own message as an order and
+    // put two of them in the cart. Whatever they meant by forwarding it, they
+    // did not type it, and it is not an instruction.
+    //
+    // Only a WHOLE message of ours counts. Quoting one line to choose it —
+    // "1. CTWBSI26P-24INCH" — is how a customer picks from a list, and that
+    // has to keep working.
+    if (isOurOwnMessageBack(m.chatId, m.body)) {
+      store.log(this.key, `ignored an echo of our own message from ${m.from}`);
+      return true;
+    }
 
     // Both sides of the thread are remembered, so "pakka?" and "This also"
     // mean something on the next message instead of arriving out of nowhere.
