@@ -1156,6 +1156,9 @@ class CustomerBot {
           }
           if (top.length === 1 && availability.matchTrustworthy(item, top[0])) {
             store.log(this.key, `rate: "${item}" -> ${top[0].partNo} by name (only match)`);
+        // Keep what it cost us to find. The next customer asking this way
+        // is a vector lookup, not another search (core/parts.remember).
+        parts.remember({ partNo: top[0].partNo, name: top[0].name }).catch(() => {});
             found.push({ partNo: top[0].partNo, name: top[0].name, requested: item });
           } else if (top.length >= 1) {
             // Front or rear, which car: ask the way the counter would, and
@@ -3383,6 +3386,9 @@ class CustomerBot {
       const trusted = hits.top.length === 1 && availability.matchTrustworthy(l.item, hits.top[0]);
       if (trusted) {
         store.log(this.key, `"${l.item}" -> ${hits.top[0].partNo} by name (only match)`);
+        // Keep what it cost us to find. The next customer asking this way
+        // is a vector lookup, not another search (core/parts.remember).
+        parts.remember({ partNo: hits.top[0].partNo, name: hits.top[0].name }).catch(() => {});
         lines.push({ ...l, item: hits.top[0].partNo, requested: l.item });
       } else if (hits.top.length >= 1) {
         choices.push({ asked: l.item, total: hits.total, top: hits.top, qty: l.qty, ref: l.ref, key: l.key });
@@ -3738,18 +3744,24 @@ class CustomerBot {
       const trustedOne = top.length === 1 && availability.matchTrustworthy(item, top[0]);
       if (items.length === 1 && m && trustedOne) {
         store.log(this.key, `"${item}" -> ${top[0].partNo} by name (only match)`);
+        // Keep what it cost us to find. The next customer asking this way
+        // is a vector lookup, not another search (core/parts.remember).
+        parts.remember({ partNo: top[0].partNo, name: top[0].name }).catch(() => {});
         return this.quoteForOrder(m, [{ partNo: top[0].partNo, name: top[0].name, requested: item }], asText, t);
       }
       if (items.length === 1 && m && top.length >= 1) {
         store.log(this.key, `"${item}" -> ${top.length} catalogue matches; showing them priced`);
         return this.offerPriced(m, { base: item, qty: 1, rate: true }, top, top.length, asText, t);
       }
-      if (top.length === 1) {
+      if (top.length === 1 && availability.matchTrustworthy(item, top[0])) {
         store.log(this.key, `"${item}" -> ${top[0].partNo} by name (only match)`);
+        // Keep what it cost us to find. The next customer asking this way
+        // is a vector lookup, not another search (core/parts.remember).
+        parts.remember({ partNo: top[0].partNo, name: top[0].name }).catch(() => {});
         lines.push({ item: top[0].partNo, qty: 1, requested: item });
         continue;
       }
-      if (top.length > 1 && chatId) {
+      if (top.length >= 1 && chatId) {
         // Several parts carry that name — front or rear, which car. Ask the
         // way the counter would rather than quoting one of them at random.
         store.log(this.key, `"${item}" -> ${top.length} catalogue matches; asking which`);

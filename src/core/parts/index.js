@@ -228,6 +228,72 @@ async function find(text, opts = {}) {
   return { partNo: best.part_no, name: best.name, similarity: sim, exact: false, candidates: rows };
 }
 
+// REMEMBER A PART THE BOT JUST WORKED OUT.
+//
+// The catalogue export fills this table in one go, but the bot also resolves
+// parts the hard way every day — a portal search that came back with one row,
+// a size out of a learned range, a number a person gave. Each of those cost
+// something to find, and none of it was kept: the next customer to ask paid
+// the same cost again.
+//
+// So every part the bot successfully identifies is written here with whatever
+// the portal calls it, and embedded. The next question like it is a vector
+// lookup instead of a search, a guess, or a message to a person.
+//
+// PRICE AND STOCK ARE STILL NOT STORED. Only which part it is.
+//
+// Never throws and never blocks a reply: the customer already has their
+// answer by the time this runs.
+async function remember(part) {
+  if (!enabled()) return false;
+  const partNo = String((part && part.partNo) || '').trim();
+  if (!partNo) return false;
+  const normed = parse.normPartNo(partNo);
+  if (normed.length < 3) return false;
+
+  try {
+    const row = {
+      partNo,
+      name: String((part && part.name) || '').trim() || partNo,
+      brand: (part && part.brand) || null,
+      fitment: (part && part.fitment) || null,
+      category: (part && part.category) || null,
+    };
+    const searchable = parse.searchableText(row);
+
+    // Only embed when it is new or the words changed — a part seen fifty times
+    // a day must not cost fifty embedding calls.
+    const existing = await db.query(
+      'SELECT id, searchable, embedding IS NOT NULL AS has_vec FROM bot_parts WHERE norm_part_no = $1',
+      [normed],
+      { rows: [] },
+    );
+    const prev = existing && existing.rows[0];
+    if (prev && prev.searchable === searchable && prev.has_vec) return false;
+
+    const vec = await embeddings.embed(searchable);
+    await db.query(
+      `INSERT INTO bot_parts (part_no, norm_part_no, name, brand, fitment, category, searchable, embedding, source, active)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8::vector,'learned',true)
+       ON CONFLICT (norm_part_no) DO UPDATE
+         SET name = EXCLUDED.name,
+             brand = COALESCE(EXCLUDED.brand, bot_parts.brand),
+             fitment = COALESCE(EXCLUDED.fitment, bot_parts.fitment),
+             searchable = EXCLUDED.searchable,
+             embedding = COALESCE(EXCLUDED.embedding, bot_parts.embedding),
+             active = true,
+             updated_at = now()`,
+      [partNo, normed, row.name, row.brand, row.fitment, row.category, searchable, vec ? embeddings.toSqlVector(vec) : null],
+      null,
+    );
+    store.log('parts', 'remembered ' + partNo + (prev ? ' (updated)' : ' (new)'));
+    return true;
+  } catch (e) {
+    store.log('parts', 'could not remember ' + partNo + ': ' + String((e && e.message) || e).slice(0, 80));
+    return false;
+  }
+}
+
 async function noteUsed(partNo) {
   await db.query(
     'UPDATE bot_parts SET usage_count = usage_count + 1, last_used_at = now() WHERE part_no = $1',
@@ -247,4 +313,4 @@ async function stats() {
   return (r && r.rows[0]) || { total: 0, embedded: 0, used: 0 };
 }
 
-module.exports = { enabled, importFile, embedPending, find, stats, searchableText: parse.searchableText };
+module.exports = { enabled, importFile, embedPending, find, remember, stats, searchableText: parse.searchableText };
