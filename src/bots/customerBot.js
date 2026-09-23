@@ -1153,10 +1153,10 @@ class CustomerBot {
           } catch (e) {
             store.log(this.key, 'rate: catalogue lookup failed for "' + item + '": ' + String((e && e.message) || e).slice(0, 80));
           }
-          if (top.length === 1) {
+          if (top.length === 1 && availability.matchTrustworthy(item, top[0])) {
             store.log(this.key, `rate: "${item}" -> ${top[0].partNo} by name (only match)`);
             found.push({ partNo: top[0].partNo, name: top[0].name, requested: item });
-          } else if (top.length > 1) {
+          } else if (top.length >= 1) {
             // Front or rear, which car: ask the way the counter would, and
             // remember it was a price they wanted.
             store.log(this.key, `rate: "${item}" -> ${top.length} catalogue matches; showing them priced`);
@@ -3358,10 +3358,16 @@ class CustomerBot {
         continue;
       }
       const hits = await availability.byName(vehicle.narrow(m.chatId, l.item));
-      if (hits.top.length === 1) {
+      // One row is only an answer when it does not contradict the question.
+      // "Cartend wiper blade 17 number" matched a Fortuner blade and was
+      // quoted, because the brand was dropped from the search and "only one
+      // match" was doing all the work. Untrusted now means SHOWN, not
+      // guessed: the customer picks instead of being told the wrong thing.
+      const trusted = hits.top.length === 1 && availability.matchTrustworthy(l.item, hits.top[0]);
+      if (trusted) {
         store.log(this.key, `"${l.item}" -> ${hits.top[0].partNo} by name (only match)`);
         lines.push({ ...l, item: hits.top[0].partNo, requested: l.item });
-      } else if (hits.top.length > 1) {
+      } else if (hits.top.length >= 1) {
         choices.push({ asked: l.item, total: hits.total, top: hits.top, qty: l.qty, ref: l.ref, key: l.key });
       } else {
         lines.push(l); // nothing in the catalogue — falls through to a human
@@ -3710,11 +3716,14 @@ class CustomerBot {
       // bare "Stock check: 13780M55R50 - hai" told them nothing they could
       // order from (22 Sep, live).
       const asText = async (x) => x;
-      if (items.length === 1 && m && top.length === 1) {
+      // Same rule as the order path: one row that contradicts the question
+      // is shown, not quoted (see availability.matchTrustworthy).
+      const trustedOne = top.length === 1 && availability.matchTrustworthy(item, top[0]);
+      if (items.length === 1 && m && trustedOne) {
         store.log(this.key, `"${item}" -> ${top[0].partNo} by name (only match)`);
         return this.quoteForOrder(m, [{ partNo: top[0].partNo, name: top[0].name, requested: item }], asText, t);
       }
-      if (items.length === 1 && m && top.length > 1) {
+      if (items.length === 1 && m && top.length >= 1) {
         store.log(this.key, `"${item}" -> ${top.length} catalogue matches; showing them priced`);
         return this.offerPriced(m, { base: item, qty: 1, rate: true }, top, top.length, asText, t);
       }

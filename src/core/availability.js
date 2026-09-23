@@ -302,6 +302,63 @@ function displayName(line) {
 // `pricedForCustomer` is set by resolve() only when the portal priced against
 // the asking customer's own account. Without it the rate on the line is
 // somebody else's, and only the MRP is repeatable.
+// ONE MATCH IS NOT THE SAME AS THE RIGHT MATCH.
+//
+// 23 Sep: a customer asked for "Cartend wiper blade 17 number". The catalogue
+// search drops words it cannot use, so the portal was asked for "wiper blade
+// 17 number", returned exactly one row — WIPER BLADE 17 | FORTUNER / ENDEAVOUR
+// / GLOSTER / XUV700 — and the bot quoted it. Right size, wrong brand, and
+// "only one match" was doing all the work. Cartrends' own CTWBSI26P-16 Inch
+// was sitting in the same catalogue.
+//
+// So a single hit is trusted only when it does not CONTRADICT the question:
+// every distinctive word the customer used has to appear somewhere in the
+// part's name or number. Words that describe nothing on their own are
+// ignored, and so are the sizes, which the search already matched on.
+const MATCH_FILLER =
+  /^(number|no|nos|pcs|pc|piece|pieces|qty|ka|ki|ke|ko|hai|chahiye|chaiye|wala|wali|new|old|latest|model|type|size|sizes|inch|inches|for|the|and|with|please|plz|sir|kitne|kitna|kitni|kya|kaun|kaunsi|milega|milegi|price|rate|mrp|cost|stock|available|avl|dena|bhejo|bhej)$/i;
+
+// Words that name the SAME thing. A customer writes "Maruti Suzuki"; the
+// catalogue writes "MARUTI". Treating the missing half as a contradiction
+// would send every Maruti question to a list.
+const SYNONYMS = [['maruti', 'suzuki', 'msil']];
+
+function synonymsOf(word) {
+  for (const group of SYNONYMS) if (group.includes(word)) return group;
+  return [word];
+}
+
+function matchTrustworthy(asked, row) {
+  const words = (s) =>
+    String(s || '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, ' ')
+      .trim()
+      .split(' ')
+      .filter(Boolean);
+
+  const theirs = words(asked).filter((w) => w.length >= 3 && !MATCH_FILLER.test(w) && !/^\d+$/.test(w));
+  if (!theirs.length) return true; // nothing distinctive was said; the size matched
+
+  const have = new Set(words(String(row.name || '') + ' ' + String(row.partNo || '')));
+  for (const w of theirs) {
+    let found = false;
+    for (const alias of synonymsOf(w)) {
+      for (const h of have) {
+        // "cartend" against "cartrends", "bottel" against "bottle": dealers
+        // spell by ear, and the first four letters carry it.
+        if (h === alias || (h.length >= 4 && alias.length >= 4 && h.slice(0, 4) === alias.slice(0, 4))) {
+          found = true;
+          break;
+        }
+      }
+      if (found) break;
+    }
+    if (!found) return false;
+  }
+  return true;
+}
+
 function priceOf(line) {
   const money = (n) => 'Rs.' + Math.round(Number(n));
   const rate = Number(line.rate);
@@ -345,6 +402,7 @@ function describe(line, chatId) {
 module.exports = {
   groupedPart,
   priceOf,
+  matchTrustworthy,
   resolve,
   resolveOne,
   describe,
