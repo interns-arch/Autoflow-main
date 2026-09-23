@@ -1252,7 +1252,21 @@ async function main() {
     'the ask arrives once they go quiet',
     customer.transport.outbox.map((o) => o.text).join(' ').match(/confirm/i) !== null,
   );
-  check('...and never quotes a price', !/₹|\brs\.?\s*\d|\b\d+\.\d{2}\b/i.test(lastOut(customer)));
+  // Rates ARE quoted now (founder, 23 Sep: the price must go out with the
+  // stock, without the customer asking). What must never happen is quoting a
+  // rate that is not this customer's — the portal prices against an ACCOUNT,
+  // and the rate for a number it does not know belongs to whoever the bot is
+  // logged in as. The mock portal prices for the asking customer, so their
+  // own rate is expected here.
+  check('...and the price goes out with the stock', /rs\.?\s*\d/i.test(lastOut(customer)));
+  check(
+    '...but a rate that is NOT theirs is never quoted',
+    (() => {
+      const l = { source: 'portal', item: 'BP-1001', qty: 1, available: 1, rate: 528, mrp: 600, pricedForCustomer: false };
+      const out = require('../src/core/orders').lineText(l, (en) => en);
+      return /MRP\s*Rs\.\s*600/i.test(out) && !/528/.test(out);
+    })(),
+  );
 
   // ---- 7bb. a retired cart is announced, not silently dropped ----
   console.log('\n[7bb] stale cart is closed WITH a word to the customer');

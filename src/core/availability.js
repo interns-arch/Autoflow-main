@@ -344,6 +344,7 @@ function describe(line, chatId) {
 
 module.exports = {
   groupedPart,
+  priceOf,
   resolve,
   resolveOne,
   describe,

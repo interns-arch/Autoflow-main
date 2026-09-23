@@ -175,9 +175,11 @@ function cancel(order) {
 function lineText(l, t) {
   t = t || ((en) => en);
   const name = availability.displayName(l);
-  // NO PRICE to the customer. The CRM team does not quote rates over WhatsApp
-  // and neither does the bot — a rate needs a person who knows the account.
-  const price = '';
+  // The money, on the same line as the stock. One rule, in
+  // availability.priceOf: a customer the portal knows sees the rate it priced
+  // for THEIR account; anyone else sees MRP and never the logged-in account's
+  // negotiated discount.
+  const price = availability.priceOf(l);
   if (l.source === 'unavailable')
     return `${name} x${l.qty}${price} - on order, ETA = ${appConfig.onOrderEtaDays} days`;
   if (l.source === 'unknown' || l.source === 'unidentified')
@@ -236,7 +238,7 @@ function summary(order) {
   return order.lines
     .map((l, i) => {
       const name = availability.displayName(l);
-      const price = ''; // see lineText: rates never go to the customer
+      const price = availability.priceOf(l);
       const state =
         l.source === 'unavailable'
           ? `on order, ETA = ${appConfig.onOrderEtaDays} days`
