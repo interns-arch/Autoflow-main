@@ -80,7 +80,44 @@ services:
         max-size: '10m'
         max-file: '3'
 
+  # Postgres with pgvector, for the self-learning knowledge base ONLY.
+  # Orders, learned part numbers and open escalations stay in the JSON state
+  # file on autoflow-data — this database holds verified business answers and
+  # their embeddings, and the bot runs without it (questions go to a person,
+  # exactly as before). The image is the stock Postgres one with the extension
+  # already compiled in; plain postgres:17 will fail the migration. pg17 because
+  # that image is already pulled on the EC2 host - pg16 would be a 600MB
+  # download onto a box that is already swapping.
+  autoflow-db:
+    image: pgvector/pgvector:pg17
+    container_name: cartrends-autoflow-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: autoflow
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: autoflow
+    volumes:
+      - autoflow-db:/var/lib/postgresql/data
+    # Not published: only the bot on this compose network talks to it.
+    expose:
+      - '5432'
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U autoflow -d autoflow']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
 volumes:
+  autoflow-db:
   autoflow-data:
   dataentry-data:
   autoflow-shared:

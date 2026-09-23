@@ -44,6 +44,10 @@ RUN npm install --omit=dev --no-audit --no-fund
 
 COPY src ./src
 COPY scripts ./scripts
+# The knowledge-base schema. Without it `npm run migrate` inside this image
+# finds no migrations and reports "already up to date" on an empty database,
+# which looks like success and is not.
+COPY migrations ./migrations
 
 # Orders, learned parts and the sale-loss log live here. Mounted as a volume by
 # compose — without that, every rebuild would wipe what the bot has learned.

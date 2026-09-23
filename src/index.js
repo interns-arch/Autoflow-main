@@ -76,6 +76,34 @@ async function main() {
     .warmGstIndex()
     .catch(() => {});
 
+  // The knowledge base, if one is configured. Reported at boot rather than
+  // discovered on the first customer question: "schema missing" is a five
+  // second fix when you read it at startup and a mystery when you read it in
+  // the middle of a busy line.
+  const kb = require('./core/kb');
+  if (!kb.enabled()) {
+    store.log('boot', 'knowledge base: OFF (no DATABASE_URL) — questions go to a person, as before');
+  } else {
+    kb.health()
+      .then((h) => {
+        store.log(
+          'boot',
+          h.ok
+            ? `knowledge base: ready, ${h.approved} approved answer(s)`
+            : 'knowledge base: NOT USABLE — ' + h.reason,
+        );
+        if (h.ok) return kb.backfillEmbeddings();
+        return 0;
+      })
+      .then((n) => {
+        if (n) store.log('kb', 'embedded ' + n + ' entry(ies) that had none');
+      })
+      .catch(() => {});
+    // Entries approved while the embedding service was unreachable would stay
+    // unsearchable forever otherwise.
+    setInterval(() => kb.backfillEmbeddings().catch(() => {}), 60 * 60 * 1000).unref();
+  }
+
   store.log('boot', 'ready. Console: http://localhost:' + config.consolePort);
 }
 

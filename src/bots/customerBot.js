@@ -23,6 +23,7 @@ const customers = require('../core/customers');
 const customerCreate = require('../core/customerCreate');
 const portal = require('../integrations/dealerPortal');
 const escalation = require('../core/escalation');
+const kb = require('../core/kb');
 const clarify = require('../core/clarify');
 const lang = require('../core/lang');
 const askQty = require('../core/askQty');
@@ -252,6 +253,59 @@ class CustomerBot {
   // escalation (inquiryOnly) and the tests (isStaff) ask the bot directly.
   listensTo(m) {
     return route.listensTo(m);
+  }
+
+  // WHAT THE HISTORY SUGGESTS THIS IS ABOUT — and nothing more.
+  //
+  // Years of exported chats tell us what a dealer calls a part ("barek oil
+  // cap", "wiper bottel") and which part number our people gave them. They do
+  // NOT tell us what is in stock today: an example saying "4 pcs hai" is from
+  // June and its numbers are stripped before storage (core/history/extract,
+  // responsePattern).
+  //
+  // So history is allowed to do exactly one thing here: name the part. The
+  // portal then answers for it, through the same availability path as every
+  // other line, and the customer hears today's answer.
+  //
+  // -> true when the customer has been answered, false to carry on to a person
+  async historyPart(m, text, reply) {
+    const history = require('../core/history');
+    if (!history.enabled()) return null;
+    let matches = [];
+    try {
+      matches = await history.similar(text, {
+        customerId: store.normPhone(m.from),
+        agentId: this.inquiryOnly(store.normPhone(m.from), m.chatId) ? store.normPhone(m.from) : null,
+      });
+    } catch (err) {
+      store.log(this.key, 'history lookup failed: ' + String((err && err.message) || err).slice(0, 80));
+      return null;
+    }
+    const withPart = matches.find((x) => x.partNo);
+    if (!withPart) return null;
+
+    const availability = require('../core/availability');
+    let line = null;
+    try {
+      const resolved = await availability.resolve([{ item: withPart.partNo, qty: 1 }]);
+      line = resolved && resolved[0];
+    } catch (err) {
+      store.log(this.key, 'history part could not be priced: ' + String((err && err.message) || err).slice(0, 80));
+      return null;
+    }
+    // The portal does not recognise it either. History was a lead, not a fact,
+    // and a lead that does not check out goes to a person like anything else.
+    if (!line || line.source === 'unknown' || line.source === 'unidentified') return null;
+
+    store.log(
+      this.key,
+      `history example #${withPart.id} (${withPart.similarity.toFixed(2)}) suggested ${withPart.partNo} - portal answered`,
+    );
+    // The phrase is now worth keeping in the bot's own store, so the next
+    // customer does not need the history lookup at all.
+    knowledge.learnAlias(text.slice(0, 80), line.partNo || withPart.partNo, 'historical_chat');
+    await reply(availability.describe(line, m.chatId));
+    return true;
   }
 
   inquiryOnly(phone, chatId) {
@@ -706,6 +760,7 @@ class CustomerBot {
         await escalation.create(this, {
           chatId: m.chatId,
           customerPhone: m.from,
+          customerMessageId: m.id || null,
           item: 'voice note',
           qty: 1,
           kind: 'order',
@@ -1097,11 +1152,30 @@ class CustomerBot {
           return reply(quoted);
         }
 
+        // The portal could not price it. Before a person is asked, check
+        // whether one has already answered this — payment terms, a standing
+        // discount, "what is the rate for X" answered last week. A rate
+        // question was the one give-up path that never consulted what the bot
+        // had been taught.
+        if (kb.enabled()) {
+          // Not `known` — that is the list of parts in this scope.
+          const taught = await kb.answer(text, {
+            chatId: m.chatId,
+            customerId: store.normPhone(m.from),
+            agentId: this.inquiryOnly(store.normPhone(m.from), m.chatId) ? store.normPhone(m.from) : null,
+          });
+          if (taught.answered) {
+            store.log(this.key, `rate question answered from knowledge #${taught.entry.id}`);
+            return reply(taught.text);
+          }
+        }
+
         // Rates come from a person who knows the account. Send it to the
         // same helper everything else goes to, with the parts attached.
         const raised = await escalation.create(this, {
           chatId: m.chatId,
           customerPhone: m.from,
+          customerMessageId: m.id || null,
           item: known.slice(0, 5).join(", "),
           qty: 1,
           kind: 'inquiry',
@@ -1240,6 +1314,7 @@ class CustomerBot {
             await escalation.create(this, {
               chatId: m.chatId,
               customerPhone: m.from,
+              customerMessageId: m.id || null,
               item: phrase,
               partNo: availability.extractPartNo(phrase),
               qty: 1,
@@ -2495,6 +2570,7 @@ class CustomerBot {
       await escalation.create(this, {
         chatId: m.chatId,
         customerPhone: m.from,
+        customerMessageId: m.id || null,
         item: partNos.join(', '),
         qty: 1,
         kind: 'inquiry',
@@ -3111,11 +3187,45 @@ class CustomerBot {
         return false;
       }
 
+      // Has a person already answered this, or one just like it? The whole
+      // point of the knowledge base: the second customer to ask about returns
+      // gets the answer Prateek sir gave the first one, and he is not asked
+      // again (founder: "agli baar usse koi same sawal poochhe to vapas
+      // mujhse na poochhe").
+      //
+      // A miss here is never a guess — it falls through to the same person it
+      // always did.
+      if (kb.enabled()) {
+        const known = await kb.answer(text, {
+          chatId: m.chatId,
+          customerId: store.normPhone(m.from),
+          // When the sales team asks on a customer's behalf, THEY are the
+          // agent — so anything scoped to that salesman is in play too.
+          agentId: this.inquiryOnly(store.normPhone(m.from), m.chatId) ? store.normPhone(m.from) : null,
+        });
+        if (known.answered) {
+          store.log(this.key, `answered from knowledge #${known.entry.id}: "${text.slice(0, 50)}"`);
+          return reply(known.text);
+        }
+      }
+
+      // Nothing learned covers it. Has anyone been asked this BEFORE, in the
+      // years of chat history we imported?
+      //
+      // What comes back is context, never an answer: which part the question
+      // is probably about. The part is then priced and counted by the portal
+      // exactly like any other, so a customer hears today's stock and never
+      // the figure somebody typed last June. A history example that names no
+      // part teaches us nothing we can act on here, so it is skipped rather
+      // than paraphrased at the customer.
+      if (await this.historyPart(m, text, reply)) return true;
+
       // Money, billing, returns, complaints — real business the bot must not
       // answer for itself. Before this it vanished; now a person sees it.
       const asked = await escalation.create(this, {
         chatId: m.chatId,
         customerPhone: m.from,
+        customerMessageId: m.id || null,
         item: text.slice(0, 80),
         qty: 1,
         kind: 'inquiry',
@@ -3268,6 +3378,7 @@ class CustomerBot {
       await escalation.create(this, {
         chatId: m.chatId,
         customerPhone: m.from,
+        customerMessageId: m.id || null,
         item: u.requested || u.item,
         // What the bot actually extracted, which is what the reader needs to
         // see. Passing only the raw line meant a photo of a label arrived as
@@ -3605,6 +3716,7 @@ class CustomerBot {
         await escalation.create(this, {
           chatId: m.chatId,
           customerPhone: m.from,
+          customerMessageId: m.id || null,
           item: l.requested || l.item,
           partNo: ai.partNumberIn(String(l.requested || l.item || '')) || null,
           reason: ai.partNumberIn(String(l.requested || l.item || '')) ? 'NOT_IN_CATALOGUE' : 'NO_PART_NUMBER',

@@ -341,6 +341,74 @@ const config = {
     timeoutMs: parseInt(process.env.GEMINI_VISION_TIMEOUT_MS || '30000', 10),
   },
 
+  // How long an answer that is not a part number stays good for.
+  knowledgeMemory: {
+    // "We do not carry that" is true of a catalogue, not forever. After this
+    // many days the question goes back to a person once, in case it is now
+    // stocked. A wrong "not available" costs a sale; one extra question does
+    // not.
+    notCarriedDays: parseInt(process.env.NOT_CARRIED_MEMORY_DAYS || 30, 10),
+  },
+
+  // ---------------------------------------------------------------- knowledge
+  // The self-learning knowledge base: what a person has told us that is worth
+  // telling the next customer who asks the same thing. Postgres + pgvector,
+  // separate from data/state.json on purpose — see core/kb/db.js.
+  //
+  // With DATABASE_URL unset the whole feature is OFF and the bot behaves
+  // exactly as it did before: it asks a person. Nothing degrades silently.
+  kb: {
+    databaseUrl: (process.env.DATABASE_URL || '').trim(),
+    ssl: /^(1|true|yes)$/i.test(process.env.DATABASE_SSL || ''),
+    poolMax: parseInt(process.env.DATABASE_POOL_MAX || '5', 10),
+    connectTimeoutMs: parseInt(process.env.DATABASE_CONNECT_TIMEOUT_MS || '4000', 10),
+
+    // Gemini's embedding endpoint, using the key the vision and voice paths
+    // already use.
+    //
+    // text-embedding-004 was the default here and answers 404 on this key —
+    // the same way gemini-2.5-flash was retired under the vision path. The
+    // models this account can actually call are gemini-embedding-001 and
+    // gemini-embedding-2; -001 is the one measured against real questions.
+    // It returns 3072 floats by default and is asked for 768 via
+    // outputDimensionality, which MUST match the vector(768) column in
+    // migrations/001 — change one without the other and every search fails.
+    embeddingModel: (process.env.EMBEDDING_MODEL || 'gemini-embedding-001').trim(),
+    embeddingDim: parseInt(process.env.EMBEDDING_DIM || '768', 10),
+    embeddingTimeoutMs: parseInt(process.env.EMBEDDING_TIMEOUT_MS || '10000', 10),
+
+    // How close a stored question must be before it is even considered.
+    //
+    // 0.85 came from the specification and was WRONG for this model: measured
+    // against the real endpoint, a stored return-policy entry scores 0.80
+    // against "Can I return this part?" and 0.76 against "Ye part wapas ho
+    // sakta hai?" — so nothing ever matched and nothing was ever recalled.
+    // Unrelated questions sit at 0.46-0.53, so the gap is wide and real; the
+    // threshold just has to be inside it. Measured 22 Sep on
+    // gemini-embedding-001 at 768 dims. Re-measure with /api/kb/search if the
+    // model or the dimension ever changes.
+    similarityThreshold: parseFloat(process.env.KNOWLEDGE_SIMILARITY_THRESHOLD || '0.65'),
+    topK: parseInt(process.env.KNOWLEDGE_TOP_K || '5', 10),
+    // Below this the model's own "yes this answers it" is not trusted either.
+    minConfidence: parseFloat(process.env.KNOWLEDGE_MIN_CONFIDENCE || '0.75'),
+    // Two stored entries this close are the same question, and the second one
+    // updates the first instead of becoming a duplicate.
+    //
+    // Measured on gemini-embedding-001, comparing whole entries (question +
+    // answer + keywords, which is what duplicate detection compares):
+    //   0.976  same question, answer corrected 7 days -> 15 days
+    //   0.976  reworded question, same answer
+    //   0.946  Hinglish question, same answer
+    //   0.799  a different subject entirely
+    // 0.93 left the Hinglish case clearing by 0.016 - one phrasing away from
+    // silently creating a second copy. 0.90 sits between the two groups.
+    duplicateThreshold: parseFloat(process.env.KNOWLEDGE_DUPLICATE_THRESHOLD || '0.90'),
+
+    // Who may call the knowledge-management API. Unset = the endpoints refuse
+    // every request rather than standing open.
+    apiToken: (process.env.KNOWLEDGE_API_TOKEN || '').trim(),
+  },
+
   // Voice notes -> text, for the HELPER to read. Claude takes no audio at all,
   // so this is Google. Blank key = the whole feature is off and voice notes
   // reach a person exactly as they did before.

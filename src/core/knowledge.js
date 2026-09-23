@@ -52,6 +52,62 @@ function familyWords(text) {
     .map(stem);
 }
 
+// One letter out is the normal case, not the exception: every wiper-blade
+// question in the queue was raised as "Cartend", and the instruction that
+// answered them all said "Cartrends". Matched strictly, a person's answer
+// never reaches the question they were answering.
+//
+// Held down hard, because a family that matches too much answers the wrong
+// part with confidence: a word carrying a digit is never matched loosely
+// ("10w30" and "10w40" are one edit apart and are different oils), short
+// words are never matched loosely, the first letter must agree, and only
+// ONE word of a family may be a near miss.
+function within1(a, b) {
+  if (a === b) return true;
+  const [s, l] = a.length <= b.length ? [a, b] : [b, a];
+  if (l.length - s.length > 1) return false;
+  let i = 0;
+  let j = 0;
+  let diff = 0;
+  while (i < s.length && j < l.length) {
+    if (s[i] === l[j]) {
+      i++;
+      j++;
+      continue;
+    }
+    if (++diff > 1) return false;
+    if (s.length === l.length) i++;
+    j++;
+  }
+  return true;
+}
+
+function near(a, b) {
+  if (a === b) return true;
+  if (a.length < 5 || b.length < 5) return false;
+  if (/[0-9]/.test(a) || /[0-9]/.test(b)) return false;
+  if (a[0] !== b[0]) return false;
+  return within1(a, b);
+}
+
+// Is every word of `words` present in `mine`, allowing one near miss?
+function coversWords(words, mine) {
+  let loose = 0;
+  for (const w of words) {
+    if (mine.has(w)) continue;
+    let hit = false;
+    for (const m of mine) {
+      if (near(w, m)) {
+        hit = true;
+        break;
+      }
+    }
+    if (!hit) return false;
+    if (++loose > 1) return false;
+  }
+  return true;
+}
+
 // subject: "Cartrends wiper blade"; variants: [{ key: '16', label, partNo }]
 function learnFamily(subject, variants, source) {
   const words = [...new Set(familyWords(subject))];
@@ -63,7 +119,20 @@ function learnFamily(subject, variants, source) {
     id: same ? same.id : 'FAM-' + Date.now(),
     subject: String(subject).trim(),
     words,
-    variants: vs.map((v) => ({ key: String(v.key), label: String(v.label || v.key), partNo: String(v.partNo) })),
+    variants: vs.map((v) => ({
+      key: String(v.key),
+      label: String(v.label || v.key),
+      partNo: String(v.partNo),
+      // WORDS that pick this variant out, when a number cannot.
+      //
+      // Wiper blades are chosen by size, so the key IS the number. An air
+      // filter is chosen by which car it fits, and the portal knows: "Air
+      // Filter| | Ciaz / Ertiga 2nd Gen / SCross / XL6". Only words unique to
+      // ONE variant belong here — "ertiga" fits two of the three air filters,
+      // so it decides nothing and is left out, and the customer is shown the
+      // choice instead of being guessed at.
+      match: [...new Set((v.match || []).map((w) => String(w).toLowerCase().trim()).filter(Boolean))],
+    })),
     source: source || 'human',
     learnedAt: new Date().toISOString(),
   };
@@ -84,12 +153,24 @@ function familyFor(text) {
   const nums = new Set((key(text).match(/\b\d{1,3}\b/g) || []).map((n) => String(Number(n))));
   let best = null;
   for (const f of bank().families) {
-    if (!f.words.every((w) => mine.has(w))) continue;
+    if (!coversWords(f.words, mine)) continue;
     if (best && best.words.length >= f.words.length) continue;
     best = f;
   }
   if (!best) return null;
-  const variant = best.variants.find((v) => nums.has(String(Number(v.key)))) || null;
+
+  // By number first — "cartrend wiper blade 18 number" names its size.
+  let variant = best.variants.find((v) => /^\d+$/.test(v.key) && nums.has(String(Number(v.key)))) || null;
+
+  // Then by word: "air filter brezza", "bonnet kabza left". A variant is only
+  // picked when exactly ONE of them claims a word in the question — two
+  // claiming it means the question has not actually chosen, and the caller
+  // shows the options rather than picking one.
+  if (!variant) {
+    const said = ' ' + key(text) + ' ';
+    const hits = best.variants.filter((v) => (v.match || []).some((w) => said.includes(' ' + w + ' ')));
+    if (hits.length === 1) variant = hits[0];
+  }
   return { family: best, variant };
 }
 
@@ -116,6 +197,57 @@ function isOnOrder(partNo) {
   return true;
 }
 
+// "We don't carry that." The one answer Prateek sir gave that was never kept:
+// he said no, the customer was told, and the next person to ask the same thing
+// sent him the identical question again.
+//
+// NOT permanent, unlike an alias. "We don't stock it" is true of a catalogue
+// today and can stop being true next month, so it is remembered for a window
+// and then asked once more. A wrong "not available" costs a sale, which is
+// worse than one extra question.
+function markNotCarried(phrase, source) {
+  const k = key(phrase);
+  if (!k) return null;
+  const b = bank();
+  if (!b.notCarried) b.notCarried = {};
+  b.notCarried[k] = { phrase: String(phrase).trim(), source: source || 'helper', at: new Date().toISOString(), hits: 0 };
+  store.save();
+  store.log('knowledge', `not carried: "${k}" (remembered for ${config().notCarriedDays} days)`);
+  return b.notCarried[k];
+}
+
+function config() {
+  return require('../config').knowledgeMemory || { notCarriedDays: 30 };
+}
+
+// -> the record when we were told this recently, else null. Matched the same
+// way an alias is, so "CTWB18" and "CTWB 18" are one question here too.
+function notCarried(phrase) {
+  const b = bank();
+  if (!b.notCarried) return null;
+  const k = key(phrase);
+  if (!k) return null;
+  let rec = b.notCarried[k];
+  if (!rec) {
+    const squashed = normNo(k);
+    if (squashed.length >= 4) {
+      for (const [kk, v] of Object.entries(b.notCarried)) {
+        if (normNo(kk) === squashed) {
+          rec = v;
+          break;
+        }
+      }
+    }
+  }
+  if (!rec) return null;
+  const days = config().notCarriedDays;
+  const age = (Date.now() - new Date(rec.at).getTime()) / 86400000;
+  if (!Number.isFinite(age) || age > days) return null; // stale: worth asking again
+  rec.hits = (rec.hits || 0) + 1;
+  store.save();
+  return rec;
+}
+
 // phrase -> part number, or null. Exact key first, then a contained-phrase
 // match so "5 clutch plate swift" still finds "clutch plate swift".
 // A key that is itself a part number (one token, letters AND digits) is a
@@ -130,6 +262,23 @@ function lookupAlias(phrase) {
   if (!k) return null;
   const aliases = bank().aliases;
   if (aliases[k]) return aliases[k].partNo;
+
+  // THE SAME SHORTCUT, TYPED THE OTHER WAY. "CTWB 18", "CTWB18" and "CTWB-18"
+  // are one shortcut to the person typing them, and were three different keys
+  // here — so a shortcut Prateek sir had already explained went back to him
+  // the moment somebody left the space out.
+  //
+  // Still EXACT, not a substring: "ctwb18" finds "ctwb 18" and never
+  // "ctwb180". Comparing part numbers with the separators stripped is already
+  // how this codebase decides two part numbers are the same (see normNo here
+  // and normPn in core/teachings).
+  const squashed = normNo(k);
+  if (squashed.length >= 4) {
+    for (const [alias, entry] of Object.entries(aliases)) {
+      if (normNo(alias) === squashed) return entry.partNo;
+    }
+  }
+
   // A range someone taught, and the size they asked for.
   if (!isPartShaped(k)) {
     const fam = familyFor(phrase);
@@ -236,4 +385,4 @@ function all() {
   return { aliases: b.aliases, notes: b.notes };
 }
 
-module.exports = { lookupAlias, learnAlias, noteAliasHit, aliasNames, addNote, findNote, markOnOrder, isOnOrder, all, learnFamily, familyFor };
+module.exports = { lookupAlias, learnAlias, noteAliasHit, aliasNames, addNote, findNote, markOnOrder, isOnOrder, markNotCarried, notCarried, all, learnFamily, familyFor, familyWords, coversWords };

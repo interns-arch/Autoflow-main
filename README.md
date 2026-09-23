@@ -169,6 +169,193 @@ All bots run in one Node process and talk over an internal event bus;
 inter-bot WhatsApp messages (`#PROCURE …`) mirror the bus so the bots can be
 split into separate processes/machines later without code changes.
 
+## Self-learning knowledge base (RAG)
+
+A question Prateek sir answers once, the bot answers by itself from then on.
+This covers **business** questions — returns, warranty, GST, payment terms,
+delivery — and deliberately **not** part identification: "16 inch" and "18
+inch" are nearly identical to an embedding, and a near-miss there ships the
+wrong part. Part numbers keep using the exact alias/family matching in
+`core/knowledge.js`.
+
+```
+customer question
+   │
+   ▼
+search approved knowledge ──► vector top-K ──► similarity ≥ threshold?
+   │                                                  │
+   │ no                                               │ yes
+   ▼                                                  ▼
+ask Prateek sir                            does it ANSWER the question?
+   │                                        (LLM relevance check)
+   │                                             │yes        │no
+   ▼                                             ▼           └──► ask Prateek sir
+his reply ──► structured ──► embedded ──► saved ──► customer gets it
+                                  │
+                                  └──► next customer is served with nobody asked
+```
+
+Two rules the code enforces rather than trusts:
+
+- **The LLM never invents a business fact.** It phrases an *approved* answer.
+  A reply containing a number the approved answer does not contain is thrown
+  away and the stored wording is sent instead (`core/kb/index.js`, `phrase`).
+- **One dealer's terms never reach another.** Scope is filtered in the SQL
+  `WHERE` clause, and an answer stating money or percentages is never saved
+  as `global` — it is tied to that customer, or held for review.
+
+### Setup
+
+```
+docker compose up -d autoflow-db     # Postgres with pgvector
+# put DATABASE_URL + KNOWLEDGE_API_TOKEN in .env
+npm run migrate                      # creates bot_knowledge, bot_escalations
+npm start                            # boot log says: knowledge base: ready
+```
+
+**Where it actually runs.** pgvector cannot be built on a Windows laptop
+without admin rights, so the database lives on the EC2 host beside the other
+containers:
+
+```
+container  cartrends-autoflow-db        pgvector/pgvector:pg17
+bound to   127.0.0.1:5433               never exposed to the internet
+compose    ~/autoflow-kb/docker-compose.yml   (its own project, so bringing it
+                                               up restarts nothing else)
+applied    001_knowledge_base           PostgreSQL 17.11, pgvector 0.8.6
+```
+
+From EC2 the bot reaches it as `autoflow-db:5432` once both are on the same
+compose project. From a laptop, tunnel first:
+
+```
+ssh -i ~/.ssh/CT_EC2_key.pem -L 5433:127.0.0.1:5433 ubuntu@52.66.83.8
+```
+
+`DATABASE_URL` empty = the feature is **off** and the bot behaves exactly as
+before: every question goes to a person. Nothing degrades silently — a
+database that is down or a schema that is missing is reported at boot and each
+question simply goes to a person.
+
+Embeddings come from Gemini using the `GEMINI_API_KEY` already configured for
+photos and voice notes (Anthropic has no embeddings API). `EMBEDDING_DIM` must
+match the `vector(768)` column in `migrations/001`.
+
+### Tuning
+
+`KNOWLEDGE_SIMILARITY_THRESHOLD` (default 0.85) is the knob that matters. Too
+low and the bot answers the wrong question confidently; too high and Prateek
+sir keeps being asked things he has already answered. Try real questions
+against it without messaging anyone:
+
+```
+curl -s localhost:3010/api/kb/search -H "Authorization: Bearer $KNOWLEDGE_API_TOKEN" \
+  -H 'content-type: application/json' -d '{"question":"Ye part wapas ho sakta hai?"}'
+```
+
+```json
+{ "answered": true, "similarity": 0.93, "confidence": 0.94,
+  "text": "Parts can be returned within 7 days if unused...",
+  "entry": { "id": 4, "category": "returns", "scope": "global" } }
+```
+
+### Managing what it knows
+
+All of these need `Authorization: Bearer $KNOWLEDGE_API_TOKEN`; with no token
+configured they return 503 rather than standing open.
+
+```
+GET    /api/kb?status=pending_review     what is waiting for approval
+POST   /api/kb                           add an answer by hand
+POST   /api/kb/:id/approve               let the bot start using it
+POST   /api/kb/:id/reject
+PUT    /api/kb/:id                       edit (re-embeds automatically)
+POST   /api/kb/:id/archive
+GET    /api/kb/analytics                 most-asked unanswered questions
+GET    /api/escalations?status=pending
+POST   /api/escalations/:id/answer       answer from the console, and learn
+```
+
+Corrections are handled for you: answering a question the bot already knows
+differently **archives** the old entry and replaces it, so two conflicting
+answers are never live at once.
+
+## Learning from exported chat history
+
+Years of WhatsApp exports tell us what a dealer *calls* a part and which part
+number our people gave them. They do **not** tell us what is in stock or what
+it costs — those are read from the portal on every question, every time.
+
+```
+npm run import:whatsapp-history -- ./chats/*.zip     parse, verify, store
+npm run import:whatsapp-history -- --apply           make approved mappings live
+```
+
+Importing the same ZIP twice does nothing: the file's sha256 is unique, and
+inside it each example is keyed by a content hash.
+
+What the pipeline keeps, and what it throws away:
+
+| From the chat | Kept as | Why |
+|---|---|---|
+| `5pcs petrol filter 15410M72R00` | alias `petrol filter` → `15410M72R00` | the dealer's own wording, spelling included |
+| `"CTWB 18 milega?"` | example: intent `CHECK_STOCK`, part `CTWB18` | tells us what the question means |
+| `"4 pcs hai stock me"` | pattern `"{qty} pcs hai stock me"` | June's stock is not today's |
+| `"aapko 12 percent discount"` | example scoped to **that dealer** | never another customer's answer |
+
+A mapping becomes an alias only when **nothing competes with it and the dealer
+portal confirms the part exists**. `"air filter"` pointed at three different
+part numbers across the exports and stays in review, because an alias either
+way would be wrong for two cars out of three.
+
+```
+GET  /api/history/imports          what has been imported
+GET  /api/history/mappings?status=pending_review
+GET  /api/history/examples?intent=CHECK_STOCK
+POST /api/history/mappings/:id/approve
+POST /api/history/mappings/apply   write approved mappings into the alias store
+POST /api/history/similar          what history makes of a question (no answer)
+```
+
+Result of the first import (16 dealer exports, 23 Sep): 2,922 messages →
+392 examples, 120 part mappings, 104 confirmed by the portal, **50 applied**,
+70 held for review.
+
+## When Prateek sir gets a message
+
+Only when the data cannot be got any other way. In order:
+
+1. **Already learned?** the alias/family store, then the knowledge base
+2. **The dealer portal** — for a part question the catalogue is searched by
+   name one last time. A single confident hit answers the customer and the
+   phrase is learned, so nobody is disturbed
+3. **Already asked?** the same part question already waiting on an answer does
+   not go a second time. The second customer is recorded as waiting and gets
+   the same answer the moment it arrives
+4. Otherwise he is asked
+
+Ambiguous portal results (several matches) and an unreachable portal both
+count as "cannot fetch" and do reach him — silence is not an answer. Voice
+notes and documents are never deduplicated: every recording is its own
+question even though they all carry the label "voice note".
+
+Answering: swipe-reply on his phone, or `#72 <answer>`. A business answer is
+also accepted with no swipe-reply when exactly one such question is open —
+but never when two are, and never for chatter like "ok dekh lunga".
+
+### Tests
+
+```
+npm run test:kb                                  offline (stand-in database)
+DATABASE_URL=postgres://... npm run test:kb      against real Postgres
+npm run test:escalation                          when a person gets asked
+```
+
+The offline run covers the retrieval rules, the scope boundary, duplicate
+detection, corrections and the no-invention guards. It does **not** prove the
+SQL is valid Postgres — that needs the second form, with the migrations
+applied.
+
 node scripts/import_closing_stock.js "D:\Downloads\ClosingStock.csv"
 
 # for checking log

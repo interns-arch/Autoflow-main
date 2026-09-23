@@ -53,6 +53,10 @@ function snapshot(e) {
     candidates: e.candidates || [],
     askedAt: e.askedAt,
     wamid: e.wamid || null,
+    customerMessageId: e.customerMessageId || null,
+    // Other customers who asked the same thing while this was open. They get
+    // the same answer, so they have to survive a restart with it.
+    waiters: e.waiters || [],
     sentTo: e.sentTo || null,
     timedOut: Boolean(e.timedOut),
   };
@@ -69,6 +73,59 @@ function persist() {
 
 function hasPending() {
   return pending.size > 0;
+}
+
+// Is this the question we are already waiting on an answer for? Compared on
+// words rather than characters, so "Cartend wiper blade 16 number" and
+// "cartend wiper blade 16 no." are recognised as one question.
+function sameQuestion(a, b) {
+  const words = (s) =>
+    String(s || '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, ' ')
+      .trim()
+      .split(' ')
+      .filter((w) => w && !/^(ka|ki|ke|ko|hai|h|chahiye|chaiye|number|no|nos|pcs|pc|piece|pieces|qty|the|a|of|for)$/.test(w));
+  const x = words(a);
+  const y = words(b);
+  if (!x.length || !y.length) return false;
+  if (x.length !== y.length) return false;
+  const sx = [...x].sort().join(' ');
+  const sy = [...y].sort().join(' ');
+  return sx === sy;
+}
+
+// LAST CHANCE AT THE PORTAL, before a person is asked.
+//
+// Founder, 23 Sep: message Prateek sir only when we cannot get the data from
+// the dealer portal. Every caller here already reaches this point BECAUSE the
+// portal could not identify the line — but "could not identify" and "is not
+// there" are different things: the portal's analyze route matches on part
+// number, and a customer who typed a NAME ("clutch plate swift") comes back
+// unidentified while the catalogue search finds it immediately.
+//
+// So the catalogue is searched by name once more here. A single confident hit
+// is the answer, and nobody is asked. Anything else — several matches, none,
+// or a portal that will not answer — is the case the founder means by
+// "unable to fetch", and the question goes to a person as before.
+//
+// Never throws: a portal that is down must not stop a question reaching a
+// human, which is the whole point of the escalation.
+async function portalCanAnswer(item, reason) {
+  if (!['NOT_IN_CATALOGUE', 'NO_PART_NUMBER'].includes(reason)) return null;
+  const asked = String(item || '').trim();
+  if (asked.length < 4) return null;
+  try {
+    const portal = require('../integrations/dealerPortal');
+    const rows = ((await portal.searchByName(asked, 5)) || {}).top || [];
+    if (rows.length !== 1) return null; // ambiguous or nothing — ask a person
+    const hit = rows[0];
+    if (!hit || !hit.partNo) return null;
+    return hit;
+  } catch (err) {
+    store.log('escalate', 'portal could not be reached before escalating: ' + String((err && err.message) || err).slice(0, 80));
+    return null;
+  }
 }
 
 // Which person this question goes to. Only voice notes were split out —
@@ -321,7 +378,7 @@ function candidatesFor(item) {
 
 async function create(
   customerBot,
-  { chatId, item, qty, kind, partNo, reason, customerPhone, photo, audio, docName, about, transcript, customerName, context },
+  { chatId, item, qty, kind, partNo, reason, customerPhone, photo, audio, docName, about, transcript, customerName, context, customerMessageId },
 ) {
   // The gate chain handed this to a person - noted for the shadow log only.
   require('../pipeline/shadow').noteHandoff(reason);
@@ -371,6 +428,28 @@ async function create(
     return { fromNote: true, note: taught };
   }
 
+  // Told recently that we do not carry this. The customer gets the same answer
+  // they would have got after waiting for a person, immediately, and nobody is
+  // asked a question already answered. Goes stale on its own (see
+  // knowledge.notCarried) so a newly stocked part is not refused forever.
+  const refused = teachable ? knowledge.notCarried(partNo || item) : null;
+  if (refused) {
+    store.log('escalate', `"${item}" was answered "not available" on ${String(refused.at).slice(0, 10)} - said so again, nobody asked`);
+    try {
+      const tt = lang.for(chatId);
+      await customerBot.transport.sendToChat(
+        chatId,
+        tt(
+          `"${item}" is not available. You can share an alternate part number if you have one.`,
+          `"${item}" abhi available nahi hai. Aapke paas alternate part number ho to bhej dijiye.`,
+        ),
+      );
+    } catch (err) {
+      store.log('escalate', 'could not repeat the not-available answer: ' + String((err && err.message) || err).slice(0, 80));
+    }
+    return { notCarried: true, since: refused.at };
+  }
+
   // Questions now outlive their timeout so a late answer is still learned, so
   // something has to retire them eventually. A day is far longer than any
   // helper takes, and keeps the map from growing for the life of the process.
@@ -379,6 +458,64 @@ async function create(
     if (pe.askedAt && Date.now() - pe.askedAt > DAY) pending.delete(pid);
   }
   persist();
+
+  // ALREADY ASKED. The same question was being sent again every time anyone
+  // asked it, so one wiper size appeared four times in a queue that reached
+  // 67 — and the more a queue repeats itself, the less any message in it
+  // means.
+  //
+  // Only where `item` IS the question. For a voice note or a document it is
+  // the label "voice note", identical for every recording anybody sends, and
+  // deduplicating on that drops real questions on the floor.
+  //
+  // The second customer is NOT forgotten: they are recorded as waiting on the
+  // same answer and are sent it the moment it arrives. Suppressing the ask
+  // without that would leave them waiting forever, which is worse than asking
+  // twice. The caller still tells them a person is on it — one is.
+  // PART questions only. Those are the ones that actually repeat — 63 of the
+  // 67 in the queue, the same wiper sizes over and over. A business question
+  // ("Please collect cheque tomorrow") is rare, and two of them that read
+  // alike are usually not the same request at all, so those still go through
+  // every time.
+  const DEDUPE_REASONS = ['NOT_IN_CATALOGUE', 'NO_PART_NUMBER'];
+  const already = DEDUPE_REASONS.includes(reason || '')
+    ? [...pending.values()].find((pe) => pe.reason === reason && sameQuestion(pe.item, item) && !pe.timedOut)
+    : null;
+  if (already) {
+    const phone = customerPhone || String(chatId || '').replace(/@.*$/, '');
+    if (!already.waiters) already.waiters = [];
+    if (already.chatId !== chatId && !already.waiters.some((w) => w.chatId === chatId)) {
+      already.waiters.push({ chatId, customerPhone: phone, qty: qty || 1, kind: kind || 'order' });
+      persist();
+    }
+    store.log(
+      'escalate',
+      `"${item}" is already open as #${already.id} - not asking again` +
+        (already.waiters.length ? ` (${already.waiters.length} also waiting)` : ''),
+    );
+    return { alreadyOpen: already.id };
+  }
+
+  // The portal, one last time, by NAME. If it holds this part there is no
+  // question to ask anybody — the customer is answered from the catalogue and
+  // the phrase is learned so the next one never gets this far.
+  const onPortal = await portalCanAnswer(item, reason);
+  if (onPortal) {
+    store.log('escalate', `"${item}" found on the portal as ${onPortal.partNo} - answered from there, nobody asked`);
+    if (teachable) knowledge.learnAlias(item, onPortal.partNo, 'portal');
+    try {
+      await resolveWithAnswer(
+        { customerBot, chatId, item, qty, kind, customerPhone, reason, candidates: [] },
+        onPortal.partNo,
+        'memory',
+      );
+      return { fromPortal: true, partNo: onPortal.partNo };
+    } catch (err) {
+      // Answering failed for some other reason — fall through and ask, rather
+      // than leave the customer with nothing.
+      store.log('escalate', 'portal answer could not be delivered: ' + String((err && err.message) || err).slice(0, 80));
+    }
+  }
 
   const id = ++seq;
   const candidates = candidatesFor(item);
@@ -396,6 +533,9 @@ async function create(
     reason: reason || (partNo ? 'NOT_IN_CATALOGUE' : 'NO_PART_NUMBER'),
     customerPhone: customerPhone || String(chatId || '').replace(/@.*$/, ''),
     customerName: customerName || null,
+    // The id of the CUSTOMER message that raised this, for the learning
+    // record. Not the id of what we send the helper.
+    customerMessageId: customerMessageId || null,
     context: context || null,
     // The customer's own photo, when the question IS the photo. Nobody can
     // name a part from the words "label photo".
@@ -479,6 +619,24 @@ async function create(
     }
     store.log('escalate', `E${id} sent to ${to} for "${item}" (${e.kind})`);
     persist(); // now with the message id a swipe-reply will quote
+
+    // The learning record. Deliberately not awaited and never able to throw:
+    // the customer's question has already gone to a person, and a database
+    // that is down must not change that. See core/kb/db.js.
+    require('./kb')
+      .recordEscalation({
+        local_ref: String(id),
+        customer_id: store.normPhone(e.customerPhone),
+        conversation_id: e.chatId,
+        // The customer's OWN message, not e.wamid — that is the id of the
+        // message we just sent to the helper, and storing it here made the
+        // column say the opposite of its name.
+        customer_message_id: e.customerMessageId || null,
+        question: item,
+        reason: e.reason,
+        assigned_to: to,
+      })
+      .catch(() => {});
   } catch (err) {
     pending.delete(id);
     persist();
@@ -596,6 +754,46 @@ function asksOnlyFor(e) {
   return Boolean(bot && typeof bot.inquiryOnly === 'function' && bot.inquiryOnly(phone, e && e.chatId));
 }
 
+// Hand an answered question to the knowledge base. Never throws and never
+// changes what the customer was told — by the time this runs they already have
+// their answer, so the worst case is that we failed to learn something.
+async function learnForNextTime(e, words) {
+  try {
+    const kb = require('./kb');
+    if (!kb.enabled()) return null;
+    return await kb.learnFromHelper({
+      question: e.item,
+      answer: words,
+      sourceMessageId: e.wamid || null,
+      ctx: {
+        localRef: String(e.id),
+        chatId: e.chatId,
+        // Who this was agreed WITH. It is what stops one dealer's terms being
+        // read out to another (core/kb/learner.js, scopeFor).
+        customerId: store.normPhone(e.customerPhone),
+        answeredBy: config.escalationNumber,
+      },
+      // The person answering IS the approver: Prateek sir replying on his own
+      // number is the approval. Anything the learner finds commercially
+      // sensitive still goes to pending_review — see scopeFor().
+      autoApprove: true,
+    });
+  } catch (err) {
+    store.log('escalate', 'could not learn from that answer: ' + String((err && err.message) || err).slice(0, 80));
+    return null;
+  }
+}
+
+// What to tell the person who answered, so they can see it was kept.
+function learnedLine(learned) {
+  if (!learned || !learned.entry) return '';
+  const e = learned.entry;
+  if (learned.action === 'unchanged') return '\n_Already in the knowledge base._';
+  if (learned.action === 'corrected') return `\n📚 _Updated the saved answer (#${e.id}); the old one is archived._`;
+  if (e.status === 'pending_review') return `\n📚 _Saved as #${e.id} — needs approval before the bot uses it._`;
+  return `\n📚 _Learned (#${e.id}, ${e.scope}). The next customer who asks gets this without anyone being asked._`;
+}
+
 // THE HELPER'S WORDS ARE AN INSTRUCTION TO THE BOT (founder, 22 Sep), never
 // a message to forward. Read them for part numbers - one, or a whole range
 // ("12 inch: CTWBSI26P-12INCH, 14 inch: ...") - learn them, find each on the
@@ -626,6 +824,9 @@ async function teachFromWords(e, id, words, { learn }) {
     family = knowledge.learnFamily(r.subject, r.variants.map((v) => ({ ...v, partNo: spelled(v.partNo) })), 'helper');
   }
 
+  const alsoClosed = family ? await closeSiblings(family) : [];
+  const alsoLine = alsoClosed.length ? '\n\n_Also answered from the same instruction:_\n' + alsoClosed.join('\n') : '';
+
   // Which one THIS customer asked for.
   let pick = null;
   if (r.variants.length >= 2) {
@@ -644,7 +845,7 @@ async function teachFromWords(e, id, words, { learn }) {
   if (pick) {
     store.log('escalate', `#${id} helper's words read: "${e.item}" -> ${pick}${family ? ' (range of ' + family.variants.length + ')' : ''}`);
     await resolveWithAnswer(e, pick, learn ? 'helper' : 'memory');
-    await ack(e, `✅ *#${id} done* — ${taughtWhat}. ${prettyPhone(e.customerPhone)} got the portal's answer for ${pick}.` + notOnPortal + waitingLine());
+    await ack(e, `✅ *#${id} done* — ${taughtWhat}. ${prettyPhone(e.customerPhone)} got the portal's answer for ${pick}.` + notOnPortal + alsoLine + waitingLine());
     return true;
   }
 
@@ -656,7 +857,7 @@ async function teachFromWords(e, id, words, { learn }) {
     });
     const phone = e.customerPhone || String(e.chatId || '').replace(/@.*$/, '');
     await e.customerBot.offerPriced({ chatId: e.chatId, from: phone }, { base: e.item, qty: e.qty || 1, rate: true }, rows, rows.length, send, t, rows.length);
-    await ack(e, `✅ *#${id} done* — ${taughtWhat}. ${prettyPhone(e.customerPhone)} was shown the sizes to pick from.` + notOnPortal + waitingLine());
+    await ack(e, `✅ *#${id} done* — ${taughtWhat}. ${prettyPhone(e.customerPhone)} was shown the sizes to pick from.` + notOnPortal + alsoLine + waitingLine());
     return true;
   }
 
@@ -668,9 +869,30 @@ async function teachFromWords(e, id, words, { learn }) {
   const say = r.customerReply || (partQuestion && teachings.plainCustomerReply(words, e.item, e.chatId)) || words;
   if (say) {
     await send(say);
+    // ...and anyone else who asked the same thing while this was open.
+    for (const w of e.waiters || []) {
+      try {
+        await e.customerBot.transport.sendToChat(w.chatId, say);
+        store.log('escalate', `#${id} same answer also sent to ${prettyPhone(w.customerPhone)}`);
+      } catch (err) {
+        store.log('escalate', `#${id} could not answer a waiting customer: ` + String((err && err.message) || err).slice(0, 80));
+      }
+    }
     if (learn && partQuestion && e.item) knowledge.addNote(e.item, say, 'helper');
+
+    // KEEP IT FOR THE NEXT CUSTOMER. Until now a question that was not about a
+    // part — returns, warranty, GST, payment terms — was answered once and
+    // forgotten, so the same question came back to a person every time it was
+    // asked. The helper's ORIGINAL words are what gets learned, not the short
+    // `say`: the full reply carries the conditions, and dropping a condition
+    // is how a policy turns into a promise.
+    const learned = await learnForNextTime(e, words);
+
     store.log('escalate', `#${id} helper's words turned into a reply for the customer`);
-    await ack(e, `✅ *#${id} done* — sent to ${prettyPhone(e.customerPhone)}: "${say}"` + waitingLine());
+    await ack(
+      e,
+      `✅ *#${id} done* — sent to ${prettyPhone(e.customerPhone)}: "${say}"` + learnedLine(learned) + waitingLine(),
+    );
     return true;
   }
 
@@ -705,6 +927,24 @@ async function resolveWithAnswer(e, chosen, source) {
   const availability = require('./availability');
   const reply = (text) => e.customerBot.transport.sendToChat(e.chatId, text);
   const t = lang.for(e.chatId);
+
+  // Everyone else who asked this same thing while it was open. Answered the
+  // same way, in their own chat — the alternative is that suppressing a
+  // duplicate ask silently strands them. Done first so one failure at the end
+  // cannot skip them, and each is isolated so one bad chat id does not cost
+  // the others their answer.
+  const waiters = e.waiters || [];
+  if (waiters.length) {
+    e.waiters = []; // no re-entry: the clones below must not fan out again
+    for (const w of waiters) {
+      try {
+        await resolveWithAnswer({ ...e, chatId: w.chatId, customerPhone: w.customerPhone, qty: w.qty, kind: w.kind, waiters: [] }, chosen, 'memory');
+        store.log('escalate', `#${e.id} same answer also sent to ${prettyPhone(w.customerPhone)}`);
+      } catch (err) {
+        store.log('escalate', `#${e.id} could not answer a waiting customer: ` + String((err && err.message) || err).slice(0, 80));
+      }
+    }
+  }
 
   // LEARN IT — the next customer asking this never reaches a human.
   // Same rule on the way out: only a question that was about a part teaches
@@ -750,6 +990,21 @@ async function resolveWithAnswer(e, chosen, source) {
   return reply('✅ ' + orders.ack([line], order, []));
 }
 
+// Talk, not an answer. The helper says "ok", "dekh lunga", "call me" — and
+// none of that is meant for a customer. Whatever is caught here still reaches
+// the customer if it is sent as a swipe-reply, which is the deliberate way to
+// say "yes, send exactly this".
+const CHATTER =
+  /^(ok(ay)?|thik|theek|haan|han|ji|hmm+|kk|done|sure|yes sir|got it|noted|dekh(ta|ke)?\s*(hu|hoon|lunga)?|batata\s*hoon|baad\s*me(in)?|call\s*me|ring\s*me|busy|abhi\s*nahi|kal\s*batata)\b/i;
+function chatter(text) {
+  const t = String(text || '').trim();
+  if (!t) return true;
+  // Short and conversational. A real answer to a business question is longer
+  // than four words: "Yes, if unused and within 7 days" is seven.
+  if (t.split(/\s+/).length <= 4 && CHATTER.test(t)) return true;
+  return false;
+}
+
 // Does a bare message look like an ANSWER to a part question? A part number
 // ("16510M65L10", "16510M65L10 2"), an option number, or the yes/no words
 // the helper is told to use. Anything else is a sentence, and a sentence
@@ -769,6 +1024,71 @@ function backOut(e, id) {
   persist();
   store.log('escalate', '#' + id + ' kept open - a bare sentence is not relayed without a reply to the question');
   return false;
+}
+
+// WHICH QUESTION IS THIS THE ANSWER TO, when nobody swiped and nobody typed
+// a number? The helper names the part instead, as a heading: "Cartend wiper
+// blade 18 number: Whenever any customer ask for Wiper Blade for Cartrends
+// then it has sizes. 12 INCHES PART NUMBER: ...". That shape matched none of
+// the ways a reply was recognised, so four wiper-blade questions sat open
+// while the answer to all of them had already been sent.
+//
+// Only an instruction carrying a PART NUMBER may claim a question this way.
+// A bare sentence still needs a swipe-reply - that is what keeps "isko bolo
+// kal aayega" from being sent to a customer as if it were an answer.
+function claimedByInstruction(text, mine) {
+  const teachings = require('./teachings');
+  const r = teachings.readPlain(text);
+  if (!(r.partNos || []).length) return [];
+  // What the instruction is about: the family it teaches, and the heading
+  // written before the colon.
+  const head = String(text).split(/[:\n]/)[0];
+  const names = [r.subject, head && head.trim().split(/\s+/).length <= 8 ? head : null].filter(Boolean);
+  const out = [];
+  for (const [pid, pe] of mine) {
+    if (RELAY_REASONS.includes(pe.reason)) continue; // not a question about a part
+    const item = new Set(knowledge.familyWords(pe.item || ''));
+    if (!item.size) continue;
+    // Two naming words at least: "blade" alone would claim every question
+    // that mentions one.
+    const named = names.some((n) => {
+      const w = knowledge.familyWords(n);
+      return w.length >= 2 && knowledge.coversWords(w, item);
+    });
+    if (named) out.push(pid);
+  }
+  return out;
+}
+
+// ONE instruction, EVERY question it answers. "16 number" and "17 number"
+// were each asked twice while this range went unanswered; closing only the
+// question that was replied to leaves the rest open for a person who has
+// already told us the answer.
+async function closeSiblings(family) {
+  const done = [];
+  for (const [pid, pe] of [...pending]) {
+    if (RELAY_REASONS.includes(pe.reason)) continue;
+    let v = null;
+    try {
+      const f = knowledge.familyFor(pe.item || '');
+      if (f && f.family && f.family.id === family.id) v = f.variant;
+    } catch (_) {}
+    if (!v) continue;
+    clearTimeout(pe.timer);
+    pending.delete(pid);
+    try {
+      await resolveWithAnswer(pe, v.partNo, 'helper');
+      done.push('#' + pid + '  ' + (v.label || v.key) + ' -> ' + prettyPhone(pe.customerPhone));
+      store.log('escalate', '#' + pid + ' answered by the same instruction -> ' + v.partNo);
+    } catch (err) {
+      // Put it back rather than lose it: unanswered is recoverable, silently
+      // dropped is not.
+      pending.set(pid, pe);
+      store.log('escalate', '#' + pid + ' could not be answered from the range: ' + String((err && err.message) || err).slice(0, 80));
+    }
+  }
+  persist();
+  return done;
 }
 
 // Reply from the helper number (registered on every transport, claims first).
@@ -838,7 +1158,30 @@ async function handleReply(m) {
       id = mine[0][0];
       answer = text;
     } else {
-      return false; // not an answer to anything we asked them - an ordinary message
+      // Named, not numbered: "Cartend wiper blade 18 number: ...".
+      const claimed = claimedByInstruction(text, mine);
+      if (claimed.length) {
+        id = claimed[0];
+        answer = text;
+        explicit = true; // an instruction with a part number in it is for the bot
+      } else {
+        // A business answer — "Yes, if unused and within 7 days" — carries no
+        // part number to recognise it by, and the only-one-open shortcut never
+        // fires while dozens of PART questions are queued behind it. So the
+        // part questions are set aside and the question is asked again of what
+        // is left: exactly one business question open for this person means
+        // this is the answer to it.
+        //
+        // Still only ONE. Two open and it is ambiguous, and a wrong guess here
+        // sends one customer another customer's answer — so it goes back to
+        // needing a swipe-reply.
+        const theirs = mine.filter(([, pe]) => RELAY_REASONS.includes(pe.reason));
+        if (theirs.length !== 1 || chatter(text)) return false;
+        id = theirs[0][0];
+        answer = text;
+        explicit = true;
+        store.log('escalate', `#${id} matched as the only open non-part question for this helper`);
+      }
     }
   }
 
@@ -868,6 +1211,11 @@ async function handleReply(m) {
         `"${e.item}" abhi available nahi hai. Aapke paas alternate part number ho to bhej dijiye.`,
       ),
     );
+    // KEEP IT. Before this, "no" was the one answer that taught the bot
+    // nothing: he said it, the customer was told, and the next person asking
+    // the same thing sent him the identical question again. Remembered for a
+    // window rather than forever — a catalogue changes.
+    if (!RELAY_REASONS.includes(e.reason)) knowledge.markNotCarried(e.partNo || e.item, 'helper');
     store.log('escalate', `#${id} helper said NOT available`);
     await ack(
       e,

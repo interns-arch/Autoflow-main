@@ -133,6 +133,11 @@ function start(bots) {
     res.json({ entry: knowledge.learnAlias(phrase, partNo, 'console') });
   });
 
+  // ---- self-learning knowledge base (Postgres + pgvector), token-protected ----
+  require('./kbRoutes').mount(app);
+  // ---- imported WhatsApp history: examples, part mappings, approval ----
+  require('./historyRoutes').mount(app);
+
   // ---- customers / engagement ----
   app.get('/api/customers', (req, res) => res.json({ customers: store.customers() }));
   app.post('/api/customers', (req, res) => {
