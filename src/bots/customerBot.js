@@ -511,6 +511,21 @@ class CustomerBot {
         customer: who && who.found ? who : null,
         text,
       });
+      // THE AGENT IS WAITING FOR THE SPECIALIST.
+      //
+      // The conversation is parked mid-turn and checkpointed. The customer is
+      // told once, here, in their own language — not by the model, because the
+      // model is not running: it stopped inside the tool. When the specialist
+      // answers, core/escalation resumes that thread and the reply goes out
+      // then.
+      if (res.paused) {
+        return reply(
+          t(
+            'Let me get this checked by our specialist — I will confirm shortly.',
+            'Ye main apne specialist se check karwa leta hoon — thodi der mein confirm karta hoon.',
+          ),
+        );
+      }
       if (res.handled) return res.reply ? reply(res.reply) : true;
       store.log(this.key, 'agent could not answer ' + m.from + ' — falling back to the usual path');
     }

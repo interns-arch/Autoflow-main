@@ -104,6 +104,19 @@ async function main() {
     setInterval(() => kb.backfillEmbeddings().catch(() => {}), 60 * 60 * 1000).unref();
   }
 
+  // THE AGENT'S CHECKPOINTER, set up before the first customer message rather
+  // than inside somebody's turn. It also matters at THIS moment and not later:
+  // a conversation paused waiting for the specialist is only resumable if the
+  // checkpointer that holds it is the durable one, and this is where that is
+  // decided. Never allowed to fail the boot — the deterministic bot is the
+  // whole bot and runs without any of this.
+  require('./agent')
+    .warmUp()
+    .then((on) => {
+      if (on) store.log('boot', 'agent: ready');
+    })
+    .catch((e) => store.log('boot', 'agent could not start: ' + String((e && e.message) || e).slice(0, 90)));
+
   store.log('boot', 'ready. Console: http://localhost:' + config.consolePort);
 }
 

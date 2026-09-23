@@ -16,13 +16,56 @@
 // So: history is remembered, state is re-read.
 const { MemorySaver } = require('@langchain/langgraph');
 
+const config = require('../config');
+const store = require('../store');
 const orders = require('../core/orders');
 const availability = require('../core/availability');
 
-// One process, one store. A restart forgets every open conversation, which
-// matters less than it sounds: the customer's next message re-establishes
-// everything the tools need, and the cart survives in core/orders regardless.
-const checkpointer = new MemorySaver();
+// THE CHECKPOINTER HAS TO SURVIVE A RESTART.
+//
+// This is not a nicety. When the agent asks Prateek sir something, the
+// conversation PAUSES mid-turn and waits for him — and he answers when he
+// answers, which may be after lunch. Every deploy restarts this container. An
+// in-memory checkpointer would drop every paused conversation on the floor:
+// the customer was told "our specialist is looking at this", the specialist
+// answers an hour later, and there is nothing left to resume. They are never
+// told anything again.
+//
+// So the thread goes in Postgres, which is already here for the knowledge
+// base. MemorySaver is kept only for the case where there is no database at
+// all — tests, and a machine with no DATABASE_URL — where nothing is paused
+// anyway because escalation needs the same database to remember its own
+// questions.
+let checkpointer = new MemorySaver();
+let durable = false;
+
+async function setupCheckpointer() {
+  if (durable) return checkpointer;
+  if (!config.kb || !config.kb.databaseUrl) {
+    store.log('agent', 'no DATABASE_URL — conversations are held in memory and will not survive a restart');
+    return checkpointer;
+  }
+  try {
+    const { PostgresSaver } = require('@langchain/langgraph-checkpoint-postgres');
+    const saver = PostgresSaver.fromConnString(config.kb.databaseUrl);
+    // Creates its own tables if they are not there. Safe to call every boot.
+    await saver.setup();
+    checkpointer = saver;
+    durable = true;
+    store.log('agent', 'conversations are checkpointed to Postgres — paused questions survive a restart');
+  } catch (e) {
+    store.log(
+      'agent',
+      'could not reach Postgres for checkpoints, falling back to memory: ' + String((e && e.message) || e).slice(0, 90),
+    );
+  }
+  return checkpointer;
+}
+
+// The live object, whichever it currently is. Read through a function rather
+// than exported directly, because setup() swaps it.
+const currentCheckpointer = () => checkpointer;
+const isDurable = () => durable;
 
 // TRIMMING.
 //
@@ -60,4 +103,4 @@ function cartNote(chatId) {
   );
 }
 
-module.exports = { checkpointer, trimmed, cartNote, KEEP_TURNS };
+module.exports = { setupCheckpointer, currentCheckpointer, isDurable, trimmed, cartNote, KEEP_TURNS };

@@ -12,13 +12,25 @@
 //   route.forBot            (is this message ours to answer at all)
 // Those are cheap, deterministic and have been right in production for
 // months. Handing them to a model would be paying tokens to get worse.
+//
+// THE KNOWLEDGE LOOP runs through here:
+//
+//   ask -> our sources -> the web -> PAUSE, ask the specialist
+//       -> he answers -> resume -> the model writes the reply
+//       -> what was learned goes to the knowledge base
+//       -> the next customer to ask never gets this far
+//
+// The pause is a real LangGraph interrupt: the graph stops inside
+// ask_a_person, the state is checkpointed to Postgres, and resume() puts his
+// words back into the same conversation hours later.
 const { createAgent, dynamicSystemPromptMiddleware, toolCallLimitMiddleware } = require('langchain');
+const { Command } = require('@langchain/langgraph');
 const { ChatGoogleGenerativeAI } = require('@langchain/google-genai');
 
 const config = require('../config');
 const store = require('../store');
 const { SYSTEM } = require('./prompt');
-const { checkpointer, cartNote } = require('./memory');
+const memory = require('./memory');
 
 const parts = require('./tools/parts');
 const commerce = require('./tools/commerce');
@@ -26,11 +38,13 @@ const cart = require('./tools/orders');
 const knowledge = require('./tools/knowledge');
 const fulfilment = require('./tools/fulfilment');
 const escalation = require('./tools/escalation');
+const web = require('./tools/web');
 
 const TOOLS = [
   parts.lookupKnownPart,
   parts.searchCatalogueIndex,
   parts.searchPortalCatalogue,
+  web.searchTheWeb,
   commerce.checkStockAndPrice,
   cart.showCart,
   cart.addToOrder,
@@ -63,6 +77,15 @@ function allowed(phone) {
   return Boolean(p && config.agent.allowFrom.includes(p));
 }
 
+// Called once at boot, so the Postgres checkpointer is ready before the first
+// customer message rather than being set up inside someone's turn.
+async function warmUp() {
+  if (!enabled()) return false;
+  await memory.setupCheckpointer();
+  build();
+  return true;
+}
+
 function build() {
   if (agent) return agent;
   agent = createAgent({
@@ -76,15 +99,12 @@ function build() {
     }),
     tools: TOOLS,
     systemPrompt: SYSTEM,
-    // The conversation, keyed on chat id. See memory.js for why the cart is
-    // deliberately not in here.
-    checkpointer,
+    // The conversation, keyed on chat id. Durable, because a paused question
+    // has to survive a deploy — see memory.js.
+    checkpointer: memory.currentCheckpointer(),
     middleware: [
       // The cart, re-read from core/orders on every single turn.
-      dynamicSystemPromptMiddleware((state, runtime) => {
-        const chatId = threadOf(runtime);
-        return SYSTEM + '\n\n' + cartNote(chatId);
-      }),
+      dynamicSystemPromptMiddleware((state, runtime) => SYSTEM + '\n\n' + memory.cartNote(threadOf(runtime))),
       // A loop that will not settle costs money and leaves the customer
       // waiting. Normal is two to four calls.
       toolCallLimitMiddleware({ runLimit: config.agent.maxToolCalls }),
@@ -99,13 +119,40 @@ function threadOf(runtime) {
   return c.chatId || c.thread_id || null;
 }
 
+function configFor({ chatId, phone, customer, bot }) {
+  return {
+    configurable: {
+      // The memory key AND the identity, in one object. Nothing here is ever
+      // shown to the model: the tools read it, the prompt does not.
+      thread_id: chatId,
+      chatId,
+      phone,
+      customer: customer || null,
+      bot,
+    },
+    recursionLimit: Math.max(8, config.agent.maxToolCalls * 2 + 2),
+  };
+}
+
+// Did this run stop at an interrupt rather than finish?
+function pausedAt(out) {
+  const int = out && out.__interrupt__;
+  if (!int || !int.length) return null;
+  const value = int[0] && int[0].value;
+  return value || {};
+}
+
 // ONE CUSTOMER MESSAGE IN, ONE REPLY OUT.
 //
-// -> { handled, reply }
+// -> { handled, reply, paused }
 //
 //   handled false  the agent could not run at all (the model was down, the
 //                  turn threw). The caller falls back to the deterministic
 //                  path, which is still the whole bot and still works.
+//
+//   paused true    the agent asked the specialist and is now waiting. The
+//                  caller tells the customer someone is reviewing it, and
+//                  says nothing further until resume() fires.
 //
 //   handled true, reply null  the agent ran and deliberately has nothing to
 //                  add — almost always because a tool has ALREADY messaged
@@ -113,36 +160,82 @@ function threadOf(runtime) {
 //                  memory). Sending anything here would be the second half of
 //                  a double reply, so the caller must send nothing.
 //
-// Collapsing those two into a bare null is how a customer ends up answered
-// twice, so they are kept apart.
+// Collapsing those into a bare null is how a customer ends up answered twice,
+// so they are kept apart.
 async function handle({ bot, chatId, phone, customer, text }) {
   const message = String(text || '').trim();
   if (!message) return { handled: false, reply: null };
+  return await run({ bot, chatId, phone, customer }, { messages: [{ role: 'user', content: message }] }, 'turn');
+}
 
+// THE SPECIALIST HAS ANSWERED.
+//
+// Puts his words back into the paused conversation, exactly where it stopped,
+// and lets the model write the customer's reply from them. Called by
+// core/escalation when a reply lands on a question the agent raised.
+//
+// -> true when the customer was answered, false when this thread could not be
+// resumed — in which case escalation answers the old way and the customer is
+// not left with nothing.
+async function resume({ bot, chatId, phone, answer }) {
+  if (!enabled() || !chatId) return false;
+  const said = String(answer || '').trim();
+  if (!said) return false;
+
+  const res = await run({ bot, chatId, phone, customer: null }, new Command({ resume: { answer: said } }), 'resume');
+  if (!res.handled) return false;
+
+  // NO REPLY IS A FAILURE HERE, not a deliberate silence.
+  //
+  // On an ordinary turn "nothing to add" is often right, because a tool has
+  // already messaged the customer. Not on a resume: this customer was told a
+  // specialist was looking, and they are owed an answer. Returning true with
+  // nothing to send would make core/escalation skip its own reply too, and
+  // the customer would wait for ever. So this hands the answer back and lets
+  // escalation deliver it the old way.
+  if (!res.reply) {
+    store.log('agent', chatId + ' resumed but produced no reply — escalation will answer instead');
+    return false;
+  }
+
+  try {
+    await bot.transport.sendToChat(chatId, res.reply);
+  } catch (e) {
+    store.log('agent', 'could not deliver the resumed reply: ' + String((e && e.message) || e).slice(0, 80));
+    return false;
+  }
+  // WHAT WAS JUST LEARNED, KEPT.
+  //
+  // core/escalation already files the specialist's answer with the knowledge
+  // base, which decides for itself whether it is general or belongs to this
+  // customer alone. Nothing is duplicated here; this only notes that the loop
+  // closed, so the log reads as one story.
+  store.log('agent', `${chatId} answered from the specialist's reply`);
+  return true;
+}
+
+async function run(who, input, what) {
   const started = Date.now();
   let out = null;
   try {
-    out = await build().invoke(
-      { messages: [{ role: 'user', content: message }] },
-      {
-        configurable: {
-          // The memory key AND the identity, in one object. Nothing here is
-          // ever shown to the model: the tools read it, the prompt does not.
-          thread_id: chatId,
-          chatId,
-          phone,
-          customer: customer || null,
-          bot,
-        },
-        recursionLimit: Math.max(8, config.agent.maxToolCalls * 2 + 2),
-      },
-    );
+    out = await build().invoke(input, configFor({ ...who }));
   } catch (e) {
-    store.log('agent', 'turn failed: ' + String((e && e.message) || e).slice(0, 140));
-    return { handled: false, reply: null };
+    store.log('agent', what + ' failed: ' + String((e && e.message) || e).slice(0, 140));
+    return { handled: false, reply: null, paused: false };
   }
 
   const messages = (out && out.messages) || [];
+  const calls = messages.filter((m) => (m.getType ? m.getType() : '') === 'tool').map((m) => m.name);
+
+  const stop = pausedAt(out);
+  if (stop) {
+    store.log(
+      'agent',
+      `${who.chatId} ${Date.now() - started}ms, PAUSED for the specialist (#${stop.escalationId || '?'}), tools: ${calls.join(' > ') || 'none'}`,
+    );
+    return { handled: true, reply: null, paused: true, escalationId: stop.escalationId || null };
+  }
+
   // The LAST message is usually the reply, but not always: when the final
   // tool call is the whole answer the model sometimes adds nothing after it.
   // So walk back to the last AI message that actually carries words, rather
@@ -154,13 +247,8 @@ async function handle({ bot, chatId, phone, customer, text }) {
     reply = textOf(m);
   }
 
-  const calls = messages.filter((m) => (m.getType ? m.getType() : '') === 'tool').map((m) => m.name);
-  store.log(
-    'agent',
-    `${chatId} ${Date.now() - started}ms, tools: ${calls.length ? calls.join(' > ') : 'none'}`,
-  );
-
-  return { handled: true, reply: reply || null };
+  store.log('agent', `${who.chatId} ${Date.now() - started}ms, tools: ${calls.length ? calls.join(' > ') : 'none'}`);
+  return { handled: true, reply: reply || null, paused: false };
 }
 
 // Gemini returns content as parts when it feels like it.
@@ -172,4 +260,4 @@ function textOf(msg) {
   return '';
 }
 
-module.exports = { handle, enabled, allowed, TOOLS, _build: build };
+module.exports = { handle, resume, warmUp, enabled, allowed, TOOLS, _build: build };

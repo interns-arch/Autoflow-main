@@ -409,7 +409,7 @@ function candidatesFor(item) {
 
 async function create(
   customerBot,
-  { chatId, item, qty, kind, partNo, reason, customerPhone, photo, audio, docName, about, transcript, customerName, context, customerMessageId },
+  { chatId, item, qty, kind, partNo, reason, customerPhone, photo, audio, docName, about, transcript, customerName, context, customerMessageId, agentThread },
 ) {
   // The gate chain handed this to a person - noted for the shadow log only.
   require('../pipeline/shadow').noteHandoff(reason);
@@ -433,11 +433,25 @@ async function create(
   // person ever seeing it.
   const teachable = !['VOICE', 'DOCUMENT', 'NOT_A_PART', 'RATE'].includes(reason);
 
+  // WHEN THE AGENT IS DRIVING, THIS FUNCTION NEVER TALKS TO THE CUSTOMER.
+  //
+  // Every early exit below used to answer the customer itself, which is right
+  // for the deterministic bot and wrong for the agent: the agent is mid-
+  // conversation and about to answer too, so the customer got the same thing
+  // said twice, in two different voices.
+  //
+  // Measured, 23 Sep: a specialist's part number came back and the customer
+  // received the identical "abhi confirm nahi ho paya" line twice — once from
+  // here, once from the fallback. With the agent driving, what would have
+  // been sent is RETURNED instead, and the agent says it once, properly.
+  const forAgent = Boolean(agentThread);
+
   // Already learned? Then never ask a human again — this is the whole point.
   const learned = teachable ? knowledge.lookupAlias(item) : null;
   if (learned) {
     knowledge.noteAliasHit(item);
     store.log('escalate', `"${item}" already learned -> ${learned}; no human needed`);
+    if (forAgent) return { knownAlready: true, partNo: learned };
     await resolveWithAnswer(
       { customerBot, chatId, customerPhone, item, qty: qty || 1, kind: kind || 'order' },
       learned,
@@ -451,6 +465,7 @@ async function create(
   const taught = teachable ? knowledge.findNote(item) : null;
   if (taught) {
     store.log('escalate', `"${item}" answered before (${taught.id}) - sent that, no human needed`);
+    if (forAgent) return { fromNote: true, note: taught, answerText: taught.answer };
     try {
       await customerBot.transport.sendToChat(chatId, `${item}: ${taught.answer}`);
     } catch (err) {
@@ -536,6 +551,7 @@ async function create(
   if (onPortal) {
     store.log('escalate', `"${item}" found on the portal as ${onPortal.partNo} - answered from there, nobody asked`);
     if (teachable) knowledge.learnAlias(item, onPortal.partNo, 'portal');
+    if (forAgent) return { fromPortal: true, partNo: onPortal.partNo, knownAlready: true };
     try {
       await resolveWithAnswer(
         { customerBot, chatId, item, qty, kind, customerPhone, reason, candidates: [] },
@@ -587,6 +603,13 @@ async function create(
     transcript: transcript || null,
     qty: qty || 1,
     kind: kind || 'order',
+    // THE AGENT'S PAUSED CONVERSATION, when the agent raised this.
+    //
+    // The agent stops mid-turn waiting for the answer, so when it lands it
+    // must go back to that conversation and be turned into a reply there —
+    // not sent to the customer from here. Without this the customer gets
+    // answered twice: once by resolveWithAnswer, once by the agent resuming.
+    agentThread: agentThread || null,
     candidates,
     timer: null,
     askedAt: Date.now(),
@@ -901,7 +924,18 @@ async function teachFromWords(e, id, words, { learn }) {
   const partQuestion = ['NOT_IN_CATALOGUE', 'NO_PART_NUMBER'].includes(e.reason);
   const say = r.customerReply || (partQuestion && teachings.plainCustomerReply(words, e.item, e.chatId)) || words;
   if (say) {
-    await send(say);
+    // THE AGENT ASKED THIS, and is still paused mid-conversation. His words
+    // go back there rather than to the customer from here — the model puts
+    // them in the customer's own language and, if they name a part, prices it
+    // from the portal instead of repeating a figure he typed.
+    //
+    // `words` and not `say`: the original carries the conditions, and the
+    // agent needs all of them. Everyone ELSE waiting on this question still
+    // gets the short `say` directly below, because their conversations were
+    // never paused.
+    const agentTook = await handBackToAgent(e, words);
+    if (!agentTook) await send(say);
+
     // ...and anyone else who asked the same thing while this was open.
     for (const w of e.waiters || []) {
       try {
@@ -955,6 +989,44 @@ async function relayWords(e, id, words) {
 }
 
 // Apply a resolved part number for an escalation and answer the customer.
+// THE SPECIALIST HAS ANSWERED A QUESTION THE AGENT ASKED.
+//
+// The agent stopped mid-conversation waiting for this. His words go back to
+// that paused thread, where the model reads them the way it reads any other
+// tool result and writes the customer a proper reply — in their language,
+// with the price fetched fresh from the portal rather than copied out of his
+// message.
+//
+// -> true when the agent took it, false when it could not, in which case the
+// caller answers the customer the old way. Never throws: a broken agent must
+// not swallow an answer a person took the trouble to give.
+async function handBackToAgent(e, specialistSaid) {
+  if (!e || !e.agentThread) return false;
+  let agent = null;
+  try {
+    agent = require('../agent');
+  } catch (err) {
+    return false;
+  }
+  if (!agent.enabled || !agent.enabled()) return false;
+
+  try {
+    const done = await agent.resume({
+      bot: e.customerBot,
+      chatId: e.agentThread,
+      phone: e.customerPhone,
+      answer: String(specialistSaid || '').trim(),
+    });
+    if (done) {
+      store.log('escalate', `#${e.id} answer handed back to the agent for ${e.agentThread}`);
+      return true;
+    }
+  } catch (err) {
+    store.log('escalate', `#${e.id} agent could not take the answer: ` + String((err && err.message) || err).slice(0, 90));
+  }
+  return false;
+}
+
 async function resolveWithAnswer(e, chosen, source) {
   const orders = require('./orders');
   const availability = require('./availability');
@@ -971,7 +1043,7 @@ async function resolveWithAnswer(e, chosen, source) {
     e.waiters = []; // no re-entry: the clones below must not fan out again
     for (const w of waiters) {
       try {
-        await resolveWithAnswer({ ...e, chatId: w.chatId, customerPhone: w.customerPhone, qty: w.qty, kind: w.kind, waiters: [] }, chosen, 'memory');
+        await resolveWithAnswer({ ...e, chatId: w.chatId, customerPhone: w.customerPhone, qty: w.qty, kind: w.kind, waiters: [], agentThread: null }, chosen, 'memory');
         store.log('escalate', `#${e.id} same answer also sent to ${prettyPhone(w.customerPhone)}`);
       } catch (err) {
         store.log('escalate', `#${e.id} could not answer a waiting customer: ` + String((err && err.message) || err).slice(0, 80));
@@ -984,6 +1056,15 @@ async function resolveWithAnswer(e, chosen, source) {
   // the bot anything.
   const teachable = !['VOICE', 'DOCUMENT', 'NOT_A_PART', 'RATE'].includes(e.reason);
   if (source !== 'memory' && teachable) knowledge.learnAlias(e.item, chosen, source || 'helper');
+
+  // The AGENT asked this one, and is still waiting mid-conversation. Its
+  // thread gets the part number and writes the reply itself; answering from
+  // here as well would be the second of two answers to the same person.
+  //
+  // The waiters above are deliberately handled first and never come through
+  // here with an agentThread — they are different chats, and the clone that
+  // serves them has it cleared.
+  if (await handBackToAgent(e, chosen)) return true;
 
   const asksOnly = asksOnlyFor(e);
   if (e.kind === 'inquiry' && !asksOnly) {

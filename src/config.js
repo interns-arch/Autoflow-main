@@ -375,6 +375,18 @@ const config = {
     // A runaway loop costs money and makes a customer wait. Measured: a
     // normal part-and-price turn is 2 to 4 tool calls.
     maxToolCalls: parseInt(process.env.AGENT_MAX_TOOL_CALLS || '10', 10),
+    // THE OPEN WEB, for finding a part number our own sources do not have.
+    // Grounded search runs through Gemini on the key the bot already holds,
+    // so there is no second vendor and no second bill. Flash rather than
+    // Flash Lite: this call reads search results, which is the one job in
+    // the loop where the bigger model earns its latency.
+    webSearchModel: process.env.AGENT_WEB_SEARCH_MODEL || 'gemini-3.5-flash',
+    webSearchTimeoutMs: parseInt(process.env.AGENT_WEB_SEARCH_TIMEOUT_MS || '20000', 10),
+    // How long a question may sit with the specialist before the paused
+    // conversation is given up on. Longer than escalation's own five-minute
+    // nudge on purpose: a hard part can take him an afternoon, and the
+    // customer has already been told someone is looking.
+    hitlHours: parseInt(process.env.AGENT_HITL_HOURS || '48', 10),
   },
 
   parts: {
