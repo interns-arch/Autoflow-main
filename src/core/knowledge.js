@@ -139,6 +139,18 @@ function learnFamily(subject, variants, source) {
   if (same) Object.assign(same, entry);
   else fams.push(entry);
   store.save();
+
+  // A PART NUMBER WITH A SPACE IN IT survives being learned and then dies on
+  // the way to the portal: "CTWBSI26P-16 Inch" is cut at the space by the
+  // part-number reader, only "CTWBSI26P-16" is sent, and nothing comes back —
+  // one size of eleven answering "checking" while the rest quoted a price.
+  // Learned as an alias of itself, the whole spelling survives the trip.
+  for (const v of entry.variants) {
+    if (!/\s/.test(v.partNo)) continue;
+    learnAlias(v.partNo, v.partNo, source || 'portal');
+    learnAlias(v.partNo.replace(/\s+/g, ''), v.partNo, source || 'portal');
+  }
+
   store.log('knowledge', `family learned: "${entry.subject}" - ${entry.variants.length} variant(s)`);
   return entry;
 }
