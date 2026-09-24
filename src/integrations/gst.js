@@ -148,4 +148,34 @@ function describe(firm) {
     .join(' — ');
 }
 
-module.exports = { lookup, looksValid, isLive, describe, enabled, GSTIN_RE, _readGst: readGst };
+// A GSTIN READ OFF A PHOTOGRAPH, then verified like any other.
+//
+// The reading is done by vision (core/ai.readGstPhoto, which holds the prompt
+// and the reasons). What matters HERE is that nothing the model read is
+// trusted: the shape is checked, and the number then goes to the GST register
+// exactly as a typed one does. A misread character produces "not found",
+// which is a question to the customer, never a wrong account.
+//
+// -> { gstin } | { error: 'none' } | { error: 'shape', saw } | null
+async function readFromImage(base64, mediaType) {
+  if (!base64) return null;
+  const out = await require('../core/ai').readGstPhoto(base64, mediaType);
+  if (!out) return null; // no model, or the call failed
+
+  const raw = String(out.gstin || '').toUpperCase();
+  if (!raw) {
+    store.log('gst', 'no GSTIN in that photo');
+    return { error: 'none' };
+  }
+  if (!looksValid(raw)) {
+    // Something GSTIN-ish but wrong. Worth telling the customer WHAT was
+    // read — they spot "it saw 0 instead of O" at a glance, and that beats
+    // "send it again" with no reason given.
+    store.log('gst', `photo gave "${raw.slice(0, 20)}" which is not a GSTIN shape`);
+    return { error: 'shape', saw: raw.slice(0, 20) };
+  }
+  store.log('gst', `photo read as ${raw} - verifying against the register`);
+  return { gstin: raw };
+}
+
+module.exports = { lookup, looksValid, isLive, describe, enabled, readFromImage, GSTIN_RE, _readGst: readGst };

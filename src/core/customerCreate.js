@@ -65,6 +65,15 @@ function notAnAnswer(field, m, said) {
   if (media) {
     if (field.type === 'photo' && type === 'image') return false;
     if (field.type === 'location' && (type === 'location' || type === 'image')) return false;
+    // A PHOTOGRAPH OF THE GST CERTIFICATE is an answer to "GST number?".
+    //
+    // Nobody types fifteen characters correctly on a phone, so what a dealer
+    // actually sends is a picture of the certificate on the wall, or a
+    // letterhead, or one of their own bills. Refused here, that photo fell
+    // through to the parts handler, was read as a picture of a part, found
+    // nothing, and went to a person as an unidentified item — while the form
+    // sat waiting for a number that had just been sent.
+    if (field.type === 'gst' && type === 'image') return false;
     return true;
   }
   if (!said) return false;
@@ -359,6 +368,42 @@ async function answer(chatId, m, text, t) {
   if (notAnAnswer(field, m, said)) {
     store.log('create', `${chatId}: "${said.slice(0, 50) || '(' + ((m && m.mediaType) || 'media') + ')'}" is not an answer to ${field.key} - passed on, form waits`);
     return null;
+  }
+
+  // A PHOTOGRAPH INSTEAD OF A TYPED GSTIN.
+  //
+  // Read by vision, then treated exactly as if they had typed it: the shape
+  // is checked and the number goes to the GST register like any other. So a
+  // misread character ends in "not found" — a question back to them — and
+  // never in an account opened against the wrong firm.
+  //
+  // A photo that costs them one of their three tries would be unfair when it
+  // is our reading that failed, so a photo we could not read asks again
+  // without counting.
+  if (field.type === 'gst' && m && m.mediaBase64 && /^image\//.test(m.mediaMime || '')) {
+    const read = await require('../integrations/gst').readFromImage(m.mediaBase64, m.mediaMime);
+    if (!read || read.error === 'none') {
+      return {
+        reply: t(
+          'I could not find a GST number in that photo. Send a clearer picture of the certificate, or just type the number.',
+          'Is photo mein GST number nahi mila. Certificate ki saaf photo bhejiye, ya number type kar dijiye.',
+        ),
+        done: false,
+        form,
+      };
+    }
+    if (read.error === 'shape') {
+      return {
+        reply: t(
+          `I read "${read.saw}" from that photo, which is not a GST number. Send a clearer picture, or type it.`,
+          `Photo se "${read.saw}" padha, jo GST number nahi hai. Saaf photo bhejiye, ya type kar dijiye.`,
+        ),
+        done: false,
+        form,
+      };
+    }
+    store.log('create', `${chatId}: GSTIN ${read.gstin} read from a photo`);
+    return fillFromGst(form, read.gstin, t);
   }
 
   // "skip" on an optional field moves on; on a required one it does not.
@@ -1015,5 +1060,5 @@ module.exports = {
   requestIdIn,
   saysAlreadyExists,
   FIELDS,
-  _internals: { GSTIN_RE, PAN_RE, PIN_RE, commercialDefaults, MAX_GST_TRIES },
+  _internals: { GSTIN_RE, PAN_RE, PIN_RE, commercialDefaults, MAX_GST_TRIES, notAnAnswer },
 };

@@ -1141,6 +1141,66 @@ function stampedGps(g) {
   return { lat, lng, address: String(g.address || '').trim().slice(0, 200) || null };
 }
 
+// THE GSTIN OFF A PHOTOGRAPH.
+//
+// Nobody types fifteen characters correctly on a phone. What a dealer actually
+// does is photograph the registration certificate on the wall, or a
+// letterhead, or one of their own bills — and before this that photo was read
+// as a picture of a PART, searched in the catalogue, and sent to a person as
+// an unidentified item.
+//
+// Vision rather than OCR on purpose: this deployment installs no OCR binaries
+// (see the Dockerfile), and a certificate photographed at an angle under a
+// tubelight is exactly what OCR is worst at.
+//
+// WHAT COMES BACK IS A CANDIDATE, NOT A FACT. At this font size 8/B, 0/O, 1/I
+// and 5/S are the whole game. The caller checks the shape and then looks the
+// number up in the GST register, so a misread character produces "not found"
+// — a question to the customer, never a wrong account.
+const GST_PHOTO_PROMPT =
+  'You are reading a photograph for an Indian car-parts dealership. ' +
+  'Find the GSTIN (GST Identification Number) in the image and return it exactly as printed. ' +
+  'A GSTIN is exactly 15 characters: 2 digits, 5 letters, 4 digits, 1 letter, 1 letter or digit, the letter Z, then 1 letter or digit. ' +
+  'It may be labelled GSTIN, GST No or GST Number, and may appear on a GST registration certificate, a letterhead, an invoice or a signboard. ' +
+  'Copy only the characters you can actually see. Do NOT correct, complete or invent any character, and do NOT guess one you cannot read. ' +
+  'Return ONLY JSON: {"gstin":"07AABCU9603R1ZM"} or {"gstin":null} if there is no GSTIN in the image.';
+
+async function readGstPhoto(base64, mediaType) {
+  const g = config.gemini;
+  if (!g.apiKey || !base64) return null;
+  try {
+    const url =
+      'https://generativelanguage.googleapis.com/v1beta/models/' +
+      encodeURIComponent(g.visionModel) +
+      ':generateContent';
+    const RETRY_ON = new Set([500, 502, 503, 504]);
+    let res = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt) await new Promise((r) => setTimeout(r, 1000 * attempt));
+      res = await fetch(url + '?key=' + encodeURIComponent(g.apiKey), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: GST_PHOTO_PROMPT }, { inline_data: { mime_type: mediaType || 'image/jpeg', data: base64 } }] }],
+        }),
+        signal: AbortSignal.timeout(g.timeoutMs),
+      });
+      if (res.ok || !RETRY_ON.has(res.status)) break;
+    }
+    if (!res || !res.ok) throw new Error('HTTP ' + (res && res.status));
+    const data = await res.json();
+    const text = (((data.candidates || [])[0] || {}).content?.parts || []).map((p) => p.text || '').join('');
+    const json = text.match(/\{[\s\S]*\}/);
+    if (!json) throw new Error('no JSON in the reply');
+    const r = JSON.parse(json[0]);
+    const raw = String(r.gstin == null ? '' : r.gstin).replace(/[\s-]/g, '').toUpperCase();
+    return !raw || raw === 'NULL' ? { gstin: null } : { gstin: raw };
+  } catch (e) {
+    store.log('ai', 'GST photo read failed: ' + String((e && e.message) || e).slice(0, 100));
+    return null;
+  }
+}
+
 async function readShopPhoto(base64, mediaType) {
   const g = config.gemini;
   if (!g.apiKey || !base64) return null;
@@ -1193,7 +1253,7 @@ module.exports = {
   // What the gate chain decided is noted for the shadow log (pipeline/shadow).
   // The result is returned untouched.
   parseCustomerMessage: (...args) => parseCustomerMessage(...args).then((r) => require('../pipeline/shadow').noteGate(r)),
-  parseVendorStock, parseOrderImage, parseLinesBlock, readShopPhoto, matchCatalog, CONFIRM_RE, partNumberIn,
+  parseVendorStock, parseOrderImage, parseLinesBlock, readShopPhoto, readGstPhoto, matchCatalog, CONFIRM_RE, partNumberIn,
   // why the last photo could not be read - written into the chat as a note
   imageNote,
   // exported for tests
