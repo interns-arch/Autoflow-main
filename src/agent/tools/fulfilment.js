@@ -10,6 +10,9 @@ const { z } = require('zod');
 
 const customerLookup = require('../../core/customerLookup');
 const customers = require('../../core/customers');
+const availability = require('../../core/availability');
+// Named apart from the tools' own `config` argument (LangChain's run config).
+const appConfig = require('../../config');
 const { contextFrom } = require('../context');
 
 const lookupCustomer = tool(
@@ -102,19 +105,46 @@ const reportShortShipment = tool(
   },
 );
 
+// WHETHER THE PIECES HE NEEDS ARE THERE — yes or no, and nothing else.
+//
+// This used to hand the model the portal's part status: overall stock, and
+// every purchase and sales order for the part across all customers — our
+// internal volume, one sentence away from being repeated to a dealer. The
+// founder, 24 Sep: never show internal stock; only whether the quantity the
+// customer needs is available. So the portal is asked for exactly that
+// quantity, and only the answer comes back.
 const partStatus = tool(
-  async ({ partNumber }) => {
+  async ({ partNumber, qty }, config) => {
+    const ctx = contextFrom(config);
+    const partNo = String(partNumber || '').trim();
+    if (!partNo) return JSON.stringify({ error: 'no part number was given' });
+    const needed = Math.max(1, Math.floor(Number(qty)) || 1);
+    let line = null;
     try {
-      return JSON.stringify(await customerLookup.partStatusFacts(String(partNumber).trim()));
+      [line] = await availability.resolve([{ item: partNo, qty: needed }], ctx.customer);
     } catch (e) {
       return JSON.stringify({ error: 'the portal did not answer', askAPerson: true });
     }
+    const src = (line && line.source) || 'unknown';
+    if (src === 'unidentified') return JSON.stringify({ partNo, found: false, next: 'ask_a_person' });
+    if (src === 'unknown') return JSON.stringify({ partNo, needed, available: null, why: 'not confirmed yet' });
+    return JSON.stringify({
+      partNo: (line && line.partNo) || partNo,
+      needed,
+      // The whole quantity, now. Never how many we have.
+      available: src === 'available',
+      // When it is not all there: when the rest arrives — never how many are short.
+      etaDays: src === 'available' ? null : appConfig.onOrderEtaDays,
+    });
   },
   {
     name: 'part_status',
     description:
-      'Where one PART has got to across this customer\'s open orders — ordered, allocated, billed. Different from check_stock_and_price, which is about buying it now. Use for "wo part kab aayega jo maine order kiya tha".',
-    schema: z.object({ partNumber: z.string().describe('the part number they are asking about') }),
+      'Whether the pieces the customer needs of ONE part are available right now — the answer is yes or no, and when the rest arrives if not. It never tells you how many we have, and you never tell a customer a stock count. Use for "20 piece mil jayenge?", "itne hain?"; for the price, use check_stock_and_price.',
+    schema: z.object({
+      partNumber: z.string().describe('the part number they are asking about'),
+      qty: z.number().optional().describe('how many pieces they need — ask them if they have not said'),
+    }),
   },
 );
 

@@ -19,14 +19,18 @@ const store = require('../../store');
 const { contextFrom } = require('../context');
 
 const checkStockAndPrice = tool(
-  async ({ partNumbers }, config) => {
+  async ({ partNumbers, quantities }, config) => {
     const ctx = contextFrom(config);
     const wanted = (partNumbers || []).map((p) => String(p || '').trim()).filter(Boolean);
     if (!wanted.length) return JSON.stringify({ error: 'no part numbers were given' });
 
     let lines = [];
     try {
-      lines = await availability.resolve(wanted.map((p) => ({ item: p, qty: 1 })), ctx.customer);
+      // AGAINST THE QUANTITY THEY NEED. Asked for one piece, "in stock" is true
+      // with five on the shelf and twenty wanted — and the customer is told
+      // yes. With their quantity, the portal answers for their order.
+      const qtyOf = (i) => Math.max(1, Math.floor(Number((quantities || [])[i])) || 1);
+      lines = await availability.resolve(wanted.map((p, i) => ({ item: p, qty: qtyOf(i) })), ctx.customer);
     } catch (e) {
       store.log('agent', 'stock check failed: ' + String((e && e.message) || e).slice(0, 90));
       return JSON.stringify({ error: 'the dealer portal did not answer', askAPerson: true });
@@ -73,6 +77,10 @@ const checkStockAndPrice = tool(
       'Status: "in_stock"; "part_in_stock_rest_on_order" (some now, the rest in etaDays days); "on_order" — we do not have it today but can get it, so say it arrives in about etaDays days, NEVER that it is not available; "not_recognised_by_portal" — do not tell the customer it does not exist, call ask_a_person; "not_confirmed_yet" — say you are confirming it.',
     schema: z.object({
       partNumbers: z.array(z.string()).describe('exact dealer part numbers, e.g. ["CTWBSI26P-16 Inch", "13780M68P01"]'),
+      quantities: z
+        .array(z.number())
+        .optional()
+        .describe('how many pieces they need of each part, in the same order as partNumbers — give it whenever they have said, so "in_stock" means THEIR quantity is there'),
     }),
   },
 );

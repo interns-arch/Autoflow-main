@@ -112,6 +112,16 @@ const answerGeneralChat = tool(
     // null means "not conversation" — a part number was in it, or there is no
     // model. silent means the message needs no reply at all.
     if (!out) return JSON.stringify({ answered: false, why: 'this is not general conversation — treat it as a part or a policy question' });
+    // A REFUSAL IS NOT A SILENCE. smallTalk marks `refused` when its own
+    // fences threw its answer away (it promised something, or failed) — that
+    // is "no safe answer came back", not "nothing needs saying". Reported as
+    // a silence, "are you a real person or a bot?" got no reply at all.
+    if (out.refused) {
+      return JSON.stringify({
+        answered: false,
+        why: 'no safe general answer came back — answer it yourself from what you know, or treat it as a part or a policy question',
+      });
+    }
     if (out.action === 'silent' || !out.text) {
       return JSON.stringify({ answered: true, gist: null, note: 'nothing needs saying to this — reply with (no reply)' });
     }

@@ -671,30 +671,6 @@ async function shortageFacts(name) {
   };
 }
 
-async function partStatusFacts(partNo) {
-  const portal = require('../integrations/dealerPortal');
-  let s = null;
-  try {
-    s = await portal.partStatus(partNo);
-  } catch (e) {
-    if (e && e.status === 404) return { partNo, found: false };
-    store.log('sales', 'part status ' + partNo + ' failed: ' + String((e && e.message) || e).slice(0, 110));
-    return { partNo, error: 'the portal did not answer' };
-  }
-  if (!s) return { partNo, found: false };
-  const pos = Array.isArray(s.purchase_orders) ? s.purchase_orders : [];
-  const sos = Array.isArray(s.sales_orders) ? s.sales_orders : [];
-  const sum = (arr, k) => arr.reduce((n, x) => n + (Number(x[k]) || 0), 0);
-  const last = (arr, k) => arr.map((x) => x[k]).filter(Boolean).sort().slice(-1)[0];
-  return {
-    partNo: String(s.part_no || partNo),
-    found: true,
-    stock: s.stock && s.stock.bal_qty != null ? s.stock.bal_qty : null,
-    purchaseOrders: { count: pos.length, qty: sum(pos, 'po_qty'), last: last(pos, 'po_date') ? day(last(pos, 'po_date')) : null },
-    salesOrders: { count: sos.length, qty: sum(sos, 'so_qty'), last: last(sos, 'so_date') ? day(last(sos, 'so_date')) : null },
-  };
-}
-
 async function incomingText(t) {
   const portal = require('../integrations/dealerPortal');
   const config = require('../config');
@@ -751,4 +727,4 @@ async function answer(row, intent, t) {
   return ordersFor(row, t);
 }
 
-module.exports = { parse, parseOwn, answer, answerOwn, ownRow, ordersFor, parseBill, sendBill, parseOrderDetail, orderDetail, parseDesk, classifyDesk, trackText, invoiceStatusText, shortageText, partStatusText, incomingText, orderListFacts, trackFacts, invoiceFacts, shortageFacts, partStatusFacts, _internals: { money, day, where, same, cleanName, stageOf } };
+module.exports = { parse, parseOwn, answer, answerOwn, ownRow, ordersFor, parseBill, sendBill, parseOrderDetail, orderDetail, parseDesk, classifyDesk, trackText, invoiceStatusText, shortageText, partStatusText, incomingText, orderListFacts, trackFacts, invoiceFacts, shortageFacts, _internals: { money, day, where, same, cleanName, stageOf } };

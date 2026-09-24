@@ -157,6 +157,26 @@ async function toolChecks() {
   }
   ok('order status returns the portal\'s facts, not a finished message', track && !('reply' in track) && track.stage === 'dispatched' && track.invoiceNo === 'INV-9', JSON.stringify(track));
 
+  // OUR STOCK IS INTERNAL. Asked "are 20 there?", the answer is yes or no for
+  // 20 — never how many we have. The portal is asked for THEIR quantity.
+  let askedQty = null;
+  av.resolve = async (lines) => {
+    askedQty = lines.map((l) => l.qty);
+    return [{ item: lines[0].item, partNo: lines[0].item, source: 'partial', available: 5, mrp: 310 }];
+  };
+  let ps;
+  let st20;
+  try {
+    ps = JSON.parse(await fulfilment.partStatus.invoke({ partNumber: 'X1', qty: 20 }, { configurable: { chatId: 'facts@c.us' } }));
+    st20 = await call(commerce.checkStockAndPrice, { partNumbers: ['X1'], quantities: [20] }, { configurable: { chatId: 'facts@c.us' } });
+  } finally {
+    av.resolve = resolveWas;
+  }
+  ok('the portal is asked about the quantity they need', askedQty && askedQty[0] === 20, JSON.stringify(askedQty));
+  ok('part status says yes or no for their quantity', ps && ps.needed === 20 && ps.available === false && ps.etaDays > 0, JSON.stringify(ps));
+  ok('...and never how many we have (5 on the shelf appears nowhere)', !/"available":\s*5|\b5\b/.test(JSON.stringify(ps)) && !/stock|purchase|sales/i.test(JSON.stringify(ps)), JSON.stringify(ps));
+  ok('the stock check answers for their quantity too, without a count', st20 && st20.parts[0].status === 'part_in_stock_rest_on_order' && !/\b5\b/.test(JSON.stringify(st20)), JSON.stringify(st20));
+
   // THE GUARD THAT MAKES THAT SAFE: a figure no tool gave is never sent.
   const guard = require('../src/agent')._inventedMoney;
   const priced = [{ getType: () => 'tool', content: JSON.stringify({ parts: [{ partNo: '13780M68P01', price: 'MRP Rs.310' }] }) }];
