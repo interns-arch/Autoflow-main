@@ -434,7 +434,7 @@ itself (order placed, human asked, or a reply).
 | Input | Reader | Then |
 |---|---|---|
 | **Voice note** | Gemini (`integrations/speech.js`); Claude takes no audio | 1) if it swipe-replies one of our numbered lists and sounds like an edit → apply it. 2) else `heardOrder`: every part must be in the catalogue, then **read back** → "sahi hai?". 3) else the recording + transcript go to the **voice helper** |
-| **Photo** | Claude vision (`ai.parseOrderImage`); optional local OCR on Windows | Caption part number beats the box's number; caption qty fills missing qty. Desk + "analyse for X" → analysis. Unreadable → helper, **with the photo attached** |
+| **Photo** | Vision — Gemini, then Claude (`ai.parseOrderImage`) | Caption part number beats the box's number; caption qty fills missing qty. Desk + "analyse for X" → analysis. Unreadable → helper, **with the photo attached** |
 | **PDF** | pdfplumber text, else render pages → vision | same line parser as typed text |
 | **Excel / CSV** | `core/sheet.js` grid reader | large orders get an **xlsx reply back**, not a 70-line bubble |
 | **GST invoice photo** | vision says `docType` | refused as an order — "Invoice No 2939" can never become qty 2939 |

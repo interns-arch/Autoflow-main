@@ -230,8 +230,8 @@ function looksLikeList(text) {
 }
 
 function parseLinesBlock(rawText) {
-  // Applied here rather than only in the OCR path: customers copy the spaced
-  // form straight off the label into a typed message too.
+  // Applied to TYPED messages too, not only to what came off a photo:
+  // customers copy the spaced form straight off the label into a message.
   const text = joinSpacedPartNumbers(rawText);
   // Scan tokens when a line holds two or more part numbers (the line parser
   // would glue them into one nonsense item), or when a quantity is written
@@ -756,80 +756,25 @@ async function parseVendorStock(text) {
   return [];
 }
 
-// ---------------- photo orders (OCR chain) ----------------
-// "Customer photograph mein order bheje" — read it with, in order:
-//   1. Python OCR libraries  (scripts/ocr/read_order.py: pytesseract/easyocr)
-//   2. Windows built-in OCR  (scripts/ocr/windows_ocr.ps1 — zero install)
-//   3. Claude vision         (only if ANTHROPIC_API_KEY is set)
-// OCR text is parsed with the deterministic line parser; if that finds
-// nothing and an AI key exists, Claude cleans up the raw OCR text.
-const { execFile } = require('child_process');
-const fs = require('fs');
-const os = require('os');
-const path = require('path');
-
-const OCR_DIR = path.join(__dirname, '..', '..', 'scripts', 'ocr');
-
-function run(cmd, args, timeoutMs) {
-  return new Promise((resolve) => {
-    execFile(cmd, args, { timeout: timeoutMs || 60000, windowsHide: true }, (err, stdout) => {
-      resolve(err ? null : String(stdout || ''));
-    });
-  });
-}
-
-async function ocrImageToText(base64, mediaType) {
-  const ext = (mediaType || 'image/png').split('/')[1].replace('jpeg', 'jpg');
-  const tmp = path.join(os.tmpdir(), 'autoflow-ocr-' + Date.now() + '.' + ext);
-  fs.writeFileSync(tmp, Buffer.from(base64, 'base64'));
-  // Both backends failing looks identical to "OCR is not installed", and the
-  // customer is told the feature is off when in fact it ran and saw nothing.
-  // Log which one was tried and what came back, so a photo that fails on this
-  // machine can be told apart from one that is genuinely unreadable.
-  const bytes = Buffer.from(base64, 'base64').length;
-  try {
-    let text = await run('python', [path.join(OCR_DIR, 'read_order.py'), tmp]);
-    if (text && text.trim()) {
-      store.log('ai', `OCR via python: ${text.trim().length} chars from ${bytes} byte ${ext}`);
-      return text;
-    }
-    if (process.platform === 'win32') {
-      text = await run('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(OCR_DIR, 'windows_ocr.ps1'), '-Path', tmp]);
-      if (text && text.trim()) {
-        store.log('ai', `OCR via windows: ${text.trim().length} chars from ${bytes} byte ${ext}`);
-        return text;
-      }
-    }
-    store.log('ai', `OCR found NO text in a ${bytes} byte ${ext} image (both backends ran)`);
-    return null;
-  } finally {
-    try { fs.unlinkSync(tmp); } catch {}
-  }
-}
-
-// Customers photograph their WHATSAPP SCREEN, so the OCR text carries the
-// chat furniture with it — and a timestamp is just digits to a parser.
-// "3pcs clutch bearing 23820M72R40 11:59 am" was read as quantity ELEVEN for
-// every single line of a 27-item order. Scrub the chrome before parsing.
+// ---------------- photo orders ----------------
+// "Customer photograph mein order bheje" — read by VISION: Gemini first,
+// Claude behind it (see parseOrderImage). There is no local OCR any more and
+// no OCR binary in the image: it was a Windows-only fast path, it was switched
+// off everywhere it actually ran, and a reader that only works on a developer's
+// desk is a reader the customer never benefits from. What it taught us is kept
+// — joinSpacedPartNumbers below — because vision reads a Maruti box label the
+// same spaced way OCR did.
 // Maruti Genuine Parts labels print the part number SPACED: "43401 M 68R00",
 // "17522 M 92TA0". Tokenised as-is, the leading block becomes a quantity and
 // the tail becomes the item — an order for 43,401 hub assemblies of "M 68R00".
-// Every "M68K00" / "OOM81" fragment in the early photo tests came from here.
-// The shape is fixed (5 digits, a letter, 5 more) so gluing it is safe.
+// The shape is fixed (5 digits, a letter, 5 more) so gluing it is safe, and it
+// is needed whoever read the photo: vision reads the label off the box exactly
+// as it is printed.
 function joinSpacedPartNumbers(text) {
   return String(text || '').replace(
     /\b(\d{5})\s*([A-Za-z])\s*([A-Za-z0-9]{5})\b/g,
     (_, a, b, c) => a + b + c
   );
-}
-
-function scrubOcrNoise(text) {
-  return joinSpacedPartNumbers(String(text || ''))
-    .replace(/\b\d{1,2}:\d{2}(:\d{2})?\s*(a\.?m\.?|p\.?m\.?)?/gi, ' ') // 11:59 am · 5:31 pm
-    .replace(/\b\d{1,2}\/\d{1,2}\/\d{2,4}\b/g, ' ') // 31/8/26
-    .replace(/\b(yesterday|today|forwarded|omitted|image|document|voice message)\b/gi, ' ')
-    .replace(/[✓✔]{1,2}/g, ' ') // delivery ticks
-    .replace(/[ \t]+/g, ' ');
 }
 
 // Sanity filter for photo-derived lines: an invoice/bill photo must never
@@ -839,9 +784,9 @@ function sanitizeOrderLines(lines, rawText) {
   // if the text looks like a tax invoice, refuse the whole thing
   if (rawText && /(gst\s*invoice|tax\s*invoice|invoice\s*(no|number|#|-)\s*\d+|hsn|igst|cgst|sgst)/i.test(rawText)) return [];
   return (lines || [])
-    // Maruti prints the part number SPACED on the box: "33400 M 68K31". The
-    // OCR path already joined it; Claude vision reads it off the label the
-    // same way and its lines went through untouched, so "33400 M 68K31 COIL
+    // Maruti prints the part number SPACED on the box: "33400 M 68K31".
+    // Vision reads it off the label exactly as printed, and those lines went
+    // through untouched, so "33400 M 68K31 COIL
     // ASSY,IGNITION" reached the portal as a NAME and the customer was asked
     // "Which vehicle?" about a part number sitting in the photo.
     .map((l) => (l && l.item ? { ...l, item: joinSpacedPartNumbers(l.item) } : l))
@@ -854,8 +799,8 @@ function sanitizeOrderLines(lines, rawText) {
     );
 }
 
-// Returns: lines[] on success, [] if nothing readable, null only when no
-// OCR backend produced text AND no AI key exists (caller apologises politely).
+// Returns: lines[] on success, [] if nothing readable, null only when there is
+// no vision key at all (the caller then apologises politely and asks a person).
 // Why the last photo gave no order lines. The console prints it next to
 // the picture, so "why did it not read my photo?" has an answer without
 // anyone opening the container logs.
@@ -919,41 +864,10 @@ function visionFragment(lines) {
 
 async function parseOrderImage(base64, mediaType) {
   lastImageNote = null;
-  const raw = config.ai.ocr ? await ocrImageToText(base64, mediaType) : null;
-  const ocrText = raw ? scrubOcrNoise(raw) : raw;
-  if (ocrText) {
-    const lines = sanitizeOrderLines(parseLinesBlock(ocrText), ocrText);
-    if (lines.length) {
-      store.log('ai', `photo order read via OCR: ${lines.length} line(s)`);
-      return lines;
-    }
-    if (modelAvailable()) {
-      try {
-        const r = await claude(
-          'This is raw OCR text from a photo of an auto-parts order (may be messy/Hinglish). ' +
-            'Reply ONLY with JSON: {"lines":[{"item":str,"qty":int}]}. If it is not an order, reply {"lines":[]}.',
-          ocrText
-        );
-        const clean = r && Array.isArray(r.lines) ? sanitizeOrderLines(r.lines, ocrText) : [];
-        if (clean.length) {
-          store.log('ai', `photo order read via OCR + Claude: ${clean.length} line(s)`);
-          return clean;
-        }
-      } catch (e) {
-        store.log('ai', 'OCR-text cleanup failed: ' + e.message);
-      }
-    }
-    // OCR produced text, but nothing usable came out of it. That is not a
-    // reason to give up: a label OCR read as three characters of noise is
-    // exactly what vision handles well. Falling through here instead of
-    // returning meant the best reader we have was skipped whenever the worst
-    // one managed to emit a single character.
-    store.log('ai', `OCR text (${ocrText.trim().length} chars) held no order — trying vision`);
-  }
   // GEMINI FIRST, Claude behind it.
   //
-  // 21 Sep: the Anthropic key was revoked, and with local OCR off that left
-  // no reader at all — every photo went to a person. Gemini reads a label
+  // 21 Sep: the Anthropic key was revoked, and with the old local OCR off that
+  // left no reader at all — every photo went to a person. Gemini reads a label
   // just as well (3s on the test fixture) and its key is the one that works,
   // so it leads and Claude catches what it cannot do. A photo that Gemini
   // reads but finds no part in is a finished answer, not a failure: it
@@ -1004,9 +918,9 @@ async function parseOrderImage(base64, mediaType) {
         // an unreadable photo to a person.
         if (r.plate) clean.plate = require('../integrations/vahan').plateIn(String(r.plate)) || null;
         lastImageNote = clean.length ? null : "the photo was read, but no part number is visible in it";
-        // Say what happened either way. Without this the log went silent after
-        // "OCR found NO text", which reads as "Claude was never called" when in
-        // fact it looked at the photo and found no order in it — two completely
+        // Say what happened either way. Without this the log fell silent
+        // whenever nothing was found, which reads as "the model was never
+        // called" when in fact it looked at the photo and saw no order — two
         // different problems with the same symptom on the customer's screen.
         store.log(
           'ai',
@@ -1025,7 +939,7 @@ async function parseOrderImage(base64, mediaType) {
     return [];
   }
   lastImageNote = "there is no AI key on this machine, so photos cannot be read";
-  store.log('ai', 'no OCR text and no vision key — photo cannot be read');
+  store.log('ai', 'no vision key on this machine — the photo cannot be read');
   return null;
 }
 
@@ -1149,9 +1063,9 @@ function stampedGps(g) {
 // as a picture of a PART, searched in the catalogue, and sent to a person as
 // an unidentified item.
 //
-// Vision rather than OCR on purpose: this deployment installs no OCR binaries
-// (see the Dockerfile), and a certificate photographed at an angle under a
-// tubelight is exactly what OCR is worst at.
+// Vision, and only vision: a certificate photographed at an angle under a
+// tubelight is exactly what a character recogniser is worst at, which is most
+// of why the local one was taken out.
 //
 // WHAT COMES BACK IS A CANDIDATE, NOT A FACT. At this font size 8/B, 0/O, 1/I
 // and 5/S are the whole game. The caller checks the shape and then looks the

@@ -256,16 +256,6 @@ const config = {
     // and writes what it WOULD have decided to /shared/shadow.jsonl. It answers
     // nobody. AI_SHADOW=true switches it on (pipeline/shadow).
     shadow: (process.env.AI_SHADOW || '').toLowerCase() === 'true',
-    // The production image ships no tesseract and no PowerShell (see the
-    // Dockerfile: OCR is CPU-heavy and this host has none spare). Spawning two
-    // processes per photo that can only fail costs seconds of the customer's
-    // wait for nothing. On Windows the local OCR is real and stays on.
-    // AI_OCR=on / off overrides either way.
-    ocr: (process.env.AI_OCR || '').toLowerCase() === 'on'
-      ? true
-      : (process.env.AI_OCR || '').toLowerCase() === 'off'
-        ? false
-        : process.platform === 'win32',
   },
 
   // GSTIN -> the firm (integrations/gst, gstinapi.in). Fills in the half of

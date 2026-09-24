@@ -34,12 +34,12 @@ process.env.ODOO_DB = '';
 process.env.ODOO_USERNAME = '';
 process.env.ODOO_API_KEY = '';
 process.env.GEMINI_API_KEY = ''; // voice notes are not transcribed in the suite
-// The photo tests read the fixture with LOCAL OCR — with both AI keys blanked
-// above there is no vision path, so this is the only reader left. It used to
-// be inherited: config defaults ai.ocr to true on win32, so the suite passed
-// here and would have failed on Linux. Pinned so the result no longer depends
-// on the machine, or on whatever AI_OCR happens to say in .env.
-process.env.AI_OCR = 'on';
+// The photo tests have no reader: both AI keys are blanked above and the
+// local character recogniser is gone (it was Windows-only and never ran in
+// production). So parseOrderImage is stood in for where a photo has to be
+// read — exactly as section [48] already did — with what the old reader
+// actually returned for scripts/fixtures/test_order.png. The suite is about
+// what the bot does with the lines, not about who read them off the picture.
 process.env.ORDER_CONFIRM_ENABLED = 'true'; // mock portal — safe to punch here
 
 const path = require('path');
@@ -472,6 +472,17 @@ async function main() {
   // "2pc" / "3pise". The part is in the image, the number in the caption.
   console.log('\n[5d] photo + caption');
   const png = fs.readFileSync(path.join(__dirname, 'fixtures', 'test_order.png')).toString('base64');
+  // What the reader gives back for THIS fixture, recorded from the real thing
+  // while it still existed: "Brake Pad - 5 / Oil Filter - 10 / Air Filter - 2".
+  // Vision reads the same picture in production; here it is pinned so the
+  // result cannot depend on a key, a network, or which machine this runs on.
+  const ai5d = require('../src/core/ai');
+  const readWas5d = ai5d.parseOrderImage;
+  ai5d.parseOrderImage = async () => [
+    { item: 'Brake Pad', qty: 5 },
+    { item: 'Oil Filter', qty: 10 },
+    { item: 'Air Filter', qty: 2 },
+  ];
   customer.transport.outbox.length = 0;
   await customer.transport.injectIncoming({
     from: CUST, chatId: 'sim-' + CUST, chatName: '', isGroup: false,
@@ -484,6 +495,7 @@ async function main() {
   // caption must NOT overwrite them — a number the customer wrote inside the
   // picture beats a loose one in the caption.
   check('image quantities win over the caption', /Brake Pad x ?5/i.test(photoMsg));
+  ai5d.parseOrderImage = readWas5d;
   // And the caption-only path is unit-tested directly:
   check('bare caption quantities parsed', ai.bareQty('3pise') === 3 && ai.bareQty('2pc') === 2 && ai.bareQty('Ye hai ji') === null);
 
@@ -598,7 +610,7 @@ async function main() {
   console.log('\n[7f] conversation quality');
   const clarify2 = require('../src/core/clarify');
 
-  // (a) OCR reading the same label twice, one character apart, must not put
+  // (a) the same label read twice, one character apart, must not put
   //     two lines in the cart once the portal has named them the same part.
   const dupOrder = { id: 'ORD-DUP', lines: [] };
   orders.addLines(dupOrder, [{ item: '17521m52TOO', partNo: '17521M52T00', qty: 10, source: 'unavailable', available: 0 }], { replace: true });
@@ -705,7 +717,7 @@ async function main() {
   });
   const askMsg = customer.transport.outbox.map((o) => o.text).join('\n');
   check('the customer number is on the question', /\+91 98919 89965/.test(askMsg));
-  // The reader needs the number the bot extracted, not the raw OCR line it
+  // The reader needs the number the bot extracted, not the raw line it
   // came from — doing that extraction again is the bot's job, not theirs.
   check('the extracted part number is shown', /33400M68K31/.test(askMsg));
   check('the raw wording is shown too, for a misread digit', /COIL ASSY IGNITION/.test(askMsg));
@@ -859,7 +871,7 @@ async function main() {
   console.log('\n[7l] unreadable photo -> the helper, with the photo attached');
   const PCUST = '919845008800';
   const PCHAT = 'sim-' + PCUST;
-  // 1x1 png. No OCR and no AI key in this suite, so this is unreadable by
+  // 1x1 png. No reader and no AI key in this suite, so this is unreadable by
   // definition — exactly the case being tested.
   const tinyPng = Buffer.from(
     'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
@@ -4556,9 +4568,7 @@ async function main() {
   console.log('\n[51] a label finished by hand: "33400 M" + "68P10"');
   const ai51 = require('../src/core/ai');
   const keyWas51 = config.ai.apiKey;
-  const ocrWas51 = config.ai.ocr;
   config.ai.apiKey = 'test-key';
-  config.ai.ocr = false;
   const calls51 = [];
   ai51._setClaude(async (system, user) => {
     if (!Array.isArray(user)) return { intent: 'other' };
@@ -4580,7 +4590,6 @@ async function main() {
   } finally {
     ai51._setClaude(null);
     config.ai.apiKey = keyWas51;
-    config.ai.ocr = ocrWas51;
   }
 
   // 13 Sep, 22:26-22:30, live, the founder testing as admin:

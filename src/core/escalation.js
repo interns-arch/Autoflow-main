@@ -630,7 +630,7 @@ async function create(
     chatId,
     item,
     // The part number the bot managed to extract, when it got one. Showing the
-    // raw OCR line ("COIL ASSY IGNITION 33400 M 68K31") instead made the reader
+    // raw line off the photo ("COIL ASSY IGNITION 33400 M 68K31") instead made the reader
     // do the extraction the bot had already done.
     partNo: partNo || null,
     // Why this could not be answered — decides which of the three questions

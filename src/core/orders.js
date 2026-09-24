@@ -103,7 +103,7 @@ function addLines(order, resolvedLines, { replace = false } = {}) {
     // overwrite ORDER 179's. Only typed items merge by name, which is what a
     // customer listing more parts in chat actually means.
     // Match on the PART NUMBER the portal resolved, not only on the customer's
-    // wording. The same label photographed twice can come out of OCR as
+    // wording. The same label photographed twice can be read back as
     // "17521m52TOO" and "17521M52T00" — one character apart, the same part —
     // and the cart ended up holding both. Once the portal has named them, they
     // are the same line.

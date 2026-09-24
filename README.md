@@ -73,21 +73,16 @@ simulator and data admin.
   auto-captured from orders, or added in the console)
 - **Cross-selling**: after each confirmed order the bot suggests related
   items (map editable in the console, e.g. Brake Pad → Brake Fluid)
-- **Photo orders** (✅ tested end-to-end, 26 Aug 2026): customer sends the
-  order as a photograph → OCR reads it into order lines and the normal
-  draft/confirm flow continues. Measured: photo → parsed lines in ~1 second.
+- **Photo orders**: customer sends the order as a photograph → vision reads
+  it into order lines and the normal draft/confirm flow continues.
 
-  **The chain, in order (first hit wins):**
-  1. Python OCR libraries (`scripts/ocr/read_order.py` — `pytesseract` or
-     `easyocr`, both optional; exits silently when not installed)
-  2. **Windows built-in OCR** (`scripts/ocr/windows_ocr.ps1`) — the WinRT
-     `Windows.Media.Ocr` engine that ships inside Windows 10/11. **Zero
-     installs, zero API keys, works offline.** This is the engine that runs
-     in practice; verified reading printed order text correctly.
-  3. Claude vision — only if `ANTHROPIC_API_KEY` is set, and only for photos
-     the OCR engines could not read at all (e.g. handwriting).
+  **The reader: Gemini vision first, Claude vision behind it.** There is no
+  local OCR — the old Windows-only chain (`pytesseract` / `easyocr` / WinRT)
+  never ran in production, where the image ships no OCR binary, and has been
+  taken out. A photo with no vision key available goes to a person, with the
+  photo attached.
 
-  **After OCR, the same deterministic line parser as typed orders** handles
+  **After reading, the same deterministic line parser as typed orders** handles
   `Brake Pad - 5`, `Spark Plug x 4`, `10 x Brake Pad`, `Oil Filter x 2 @
   rs 350`, unit words, and Hinglish variants — so a photo order and a typed
   order produce identical drafts.
