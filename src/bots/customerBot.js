@@ -577,7 +577,7 @@ class CustomerBot {
       (m.buttonId && customerCreate.declinedCreate(text)) ||
       customerCreate.wantsToStart(text) ||
       customerCreate.wantsSomeoneElse(text) ||
-      (discountSetup.CHANGE_RE.test(text) && !discountSetup.pending(m.chatId)) ||
+      (discountSetup.wantsSetup(text) && !discountSetup.pending(m.chatId)) ||
       vahan.isOnlyPlate(text);
 
     if (!notForTheAgent && agent.enabled() && agent.allowed(m.from)) {
@@ -645,7 +645,7 @@ class CustomerBot {
 
     // AN EXISTING CUSTOMER'S DISCOUNT, CHANGED. Asked for in words; the
     // change goes to the Sales Head before the portal is touched.
-    if (discountSetup.CHANGE_RE.test(text) && !discountSetup.pending(m.chatId)) {
+    if (discountSetup.wantsSetup(text) && !discountSetup.pending(m.chatId)) {
       store.log(this.key, `${m.from} asked to change a discount: "${text.slice(0, 60)}"`);
       return this.startDiscountChange(m, text, reply, t);
     }

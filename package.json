@@ -22,7 +22,8 @@
     "test:loop": "node scripts/test-loop.js",
     "test:aliases": "node scripts/test-part-aliases.js",
     "test:gst": "node scripts/test-gst.js",
-    "test:watext": "node scripts/test-watext.js"
+    "test:watext": "node scripts/test-watext.js",
+    "test:discount": "node scripts/test-discount.js"
   },
   "dependencies": {
     "@langchain/core": "^1.2.12",

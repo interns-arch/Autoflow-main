@@ -46,7 +46,7 @@ function which(quoted, id) {
 const whose = (q) => (q.dir === 'us' ? 'OUR' : 'THEIR OWN');
 
 // The notes for one message, and the words themselves, as one block.
-function envelope(m, { text, quoted } = {}) {
+function envelope(m, { text, quoted, attachment } = {}) {
   const notes = [];
 
   if (m.forwarded) {
@@ -99,8 +99,37 @@ function envelope(m, { text, quoted } = {}) {
   if (m.sticker) notes.push('[Sent a sticker]');
   if (m.unsupported) notes.push('[Sent something WhatsApp could not show us]');
 
+  // WHAT AN ATTACHMENT SAID. Photos, documents and voice notes are read before
+  // the agent sees the message (pipeline/media.readForAgent) and arrive here
+  // as what they contain — never as a reply somebody else already wrote.
+  if (attachment) notes.push(describeAttachment(attachment));
+
   const words = m.edit ? m.edit.text : text;
   return [...notes, String(words || '').trim()].filter(Boolean).join('\n');
+}
+
+function describeAttachment(a) {
+  const listed = (lines) =>
+    lines
+      .slice(0, 60)
+      .map((l, i) => `${i + 1}. ${l.item}${l.qtyMissing ? ' (no quantity given)' : ' x ' + l.qty}`)
+      .join('\n') + (lines.length > 60 ? `\n… and ${lines.length - 60} more` : '');
+  if (a.kind === 'voice') {
+    return a.transcript
+      ? '[Sent a VOICE NOTE. What it says is below — written down by machine, so a part number in it may be misheard]'
+      : '[Sent a voice note we could not make out. If it matters, ask_a_person with reason "voice_note" — the recording goes with it]';
+  }
+  if (a.kind === 'photo') {
+    if (a.forForm) return '[Sent a photo]';
+    if (a.lines && a.lines.length) return `[Sent a PHOTO. It reads as ${a.lines.length} order line(s):\n${listed(a.lines)}]`;
+    return `[Sent a photo; no part number could be read from it${a.note ? ' (' + a.note + ')' : ''}. If they want something from it, ask_a_person — the photo goes with it]`;
+  }
+  if (a.kind === 'document') {
+    const name = a.fileName ? ` "${clip(a.fileName, 60)}"` : '';
+    if (a.lines && a.lines.length) return `[Sent a document${name}. It lists ${a.lines.length} order line(s):\n${listed(a.lines)}]`;
+    return `[Sent a document${name}; nothing in it could be read as an order${a.note ? ' (' + a.note + ')' : ''}]`;
+  }
+  return '[Sent an attachment]';
 }
 
 // One line for the conversation log, so the chat's own record — which the
@@ -140,8 +169,23 @@ function markSeen(chatId) {
 }
 
 // The whole input for one agent turn.
-function forAgent(m, { text, quoted, before } = {}) {
-  return [catchUp(m.chatId, before), envelope(m, { text, quoted })].filter(Boolean).join('\n\n');
+function forAgent(m, { text, quoted, before, attachment } = {}) {
+  return [catchUp(m.chatId, before), envelope(m, { text, quoted, attachment })].filter(Boolean).join('\n\n');
 }
 
-module.exports = { envelope, forLog, catchUp, markSeen, forAgent, isEvent };
+// THE PHOTO BEING TALKED ABOUT. A question about a photo reaches a person
+// with the photo, or he is asked to name a part from the words "label photo".
+// Held per chat, the way core/voiceNote holds a recording.
+const photos = new Map();
+function holdPhoto(chatId, photo) {
+  if (chatId && photo && photo.base64) photos.set(chatId, { ...photo, at: Date.now() });
+}
+function heldPhoto(chatId) {
+  const p = photos.get(chatId);
+  return p && Date.now() - p.at < 30 * 60 * 1000 ? { base64: p.base64, mime: p.mime } : null;
+}
+function dropPhoto(chatId) {
+  photos.delete(chatId);
+}
+
+module.exports = { envelope, forLog, catchUp, markSeen, forAgent, isEvent, holdPhoto, heldPhoto, dropPhoto, describeAttachment };

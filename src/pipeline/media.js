@@ -27,6 +27,66 @@ const voiceNote = require('../core/voiceNote');
 
 const NOT_MEDIA = Symbol('not media');
 
+// READ, DO NOT ANSWER — for the agent.
+//
+// handleMedia below reads an attachment AND replies to it with fixed text,
+// which is right for the staff tooling it still serves. A customer's message
+// is answered by the agent, which writes every word itself; so for customers
+// the attachment is only READ here, with the same readers, and its contents
+// go to the agent as facts (agent/incoming.describeAttachment).
+//
+// -> { text, attachment }. `text` is what the customer said in words — a
+// caption, or what a voice note says. Nothing here sends a message.
+async function readForAgent(bot, m) {
+  const incoming = require('../agent/incoming');
+  const caption = (m.body || '').trim() || null;
+
+  if (['ptt', 'audio'].includes(m.mediaType)) {
+    if (!m.mediaBase64) return { text: caption, attachment: { kind: 'voice', transcript: null } };
+    const transcript = await speech.transcribe(m.mediaBase64, m.mediaMime).catch(() => null);
+    // Held, so that if the agent asks a person about it, the recording goes too.
+    voiceNote.hold(m.chatId, { base64: m.mediaBase64, mime: m.mediaMime || 'audio/ogg', transcript: transcript || undefined });
+    if (transcript) lang.note(m.chatId, transcript);
+    store.log(bot.key, transcript ? `voice note read for the agent: "${transcript.slice(0, 60)}"` : 'voice note could not be transcribed');
+    return { text: transcript || null, attachment: { kind: 'voice', transcript: transcript || null } };
+  }
+
+  if (!m.mediaBase64) return { text: caption, attachment: null };
+
+  if (/pdf/i.test(m.mediaMime || '')) {
+    const doc = await documents.readPdf(m.mediaBase64).catch(() => null);
+    let lines = [];
+    if (doc && doc.how === 'text') lines = documents.orderLinesFrom(doc) || [];
+    else if (doc && doc.how === 'render' && doc.images.length) {
+      for (const img of doc.images) {
+        const page = await ai.parseOrderImage(fs.readFileSync(img).toString('base64'), 'image/png');
+        if (page && page.length) lines = lines.concat(page);
+      }
+      documents.cleanupRendered(doc.images);
+    }
+    return { text: caption, attachment: { kind: 'document', fileName: m.fileName || null, lines, note: doc ? null : 'the PDF could not be opened' } };
+  }
+
+  if (sheet.isSheet(m.mediaMime, m.fileName)) {
+    const lines = sheet.parseOrderSheet(Buffer.from(m.mediaBase64, 'base64')) || [];
+    return { text: caption, attachment: { kind: 'document', fileName: m.fileName || null, lines, note: lines.length ? null : 'no part numbers in the sheet' } };
+  }
+
+  if (/^image\//.test(m.mediaMime || '')) {
+    incoming.holdPhoto(m.chatId, { base64: m.mediaBase64, mime: m.mediaMime });
+    // A photo sent while an account form is open is the shop photograph the
+    // form asked for, not an order: it goes to the form, unread.
+    if (require('../core/customerCreate').pending(m.chatId)) return { text: caption, attachment: { kind: 'photo', forForm: true } };
+    const lines = (await ai.parseOrderImage(m.mediaBase64, m.mediaMime)) || [];
+    return { text: caption, attachment: { kind: 'photo', lines, note: lines.length ? null : ai.imageNote() } };
+  }
+
+  if (m.mediaType === 'document') {
+    return { text: caption, attachment: { kind: 'document', fileName: m.fileName || null, lines: [], note: 'a kind of file we cannot read' } };
+  }
+  return { text: caption, attachment: null };
+}
+
 async function handleMedia(bot, m, reply, t) {
   // A voice note is transcribed and then treated as what it is: a message
   // the customer spoke instead of typing. Only a note we could NOT read goes
@@ -404,4 +464,4 @@ async function handleMedia(bot, m, reply, t) {
   return NOT_MEDIA;
 }
 
-module.exports = { handleMedia, NOT_MEDIA };
+module.exports = { handleMedia, readForAgent, NOT_MEDIA };

@@ -170,11 +170,51 @@ function approvalText(req) {
   );
 }
 
-// "discount change karna hai", "mera discount badhao", "Kalra ka discount update"
-const CHANGE_RE =
-  /\bdiscount\b.{0,40}\b(change|chnage|badal\w*|update|badha\w*|kam\s*kar\w*|increase|decrease|set|lagao|lagana|laga\s*do|naya|new|revise)\b|\b(change|badal\w*|update|badha\w*|increase|revise)\b.{0,40}\bdiscount\b/i;
+// ASKING FOR A DISCOUNT TO BE SET UP.
+//
+// "discount change karna hai", "mera discount badhao", "Kalra ka discount
+// update", "mera discount setup kardo".
+//
+// That last one used to miss, and missing is expensive: the message fell
+// through to small talk, which answered "seniors se confirm karke bataunga"
+// — a sentence that promises a callback nobody has been asked to make. The
+// customer thinks it is in hand; nothing has been filed and nobody has been
+// told. Live, 24 Sep.
+//
+// The hole was "\bset\b", which does not match "setup": \b needs a non-word
+// character after "set", and "u" is a word character. So the verbs are listed
+// properly now, including the ways people actually ask for one to be MADE
+// rather than changed — banao, chahiye, lagwana, karwana.
+const VERB =
+  '(?:change|chnage|badal\\w*|update|badha\\w*|kam\\s*kar\\w*|increase|decrease|revise|' +
+  'set\\s*up|setup|set|lagao|lagana|laga\\s*do|lagw\\w*|naya|new|' +
+  'bana\\w*|banw\\w*|karw\\w*|kar\\s*do|kardo|karo|karna|chahiye|chaiye|de\\s*do|dedo)';
+
+const WANTS_RE = new RegExp(
+  '\\bdiscount\\b.{0,40}\\b' + VERB + '\\b|\\b' + VERB + '\\b.{0,40}\\bdiscount\\b',
+  'i',
+);
+
+// A QUESTION IS NOT A REQUEST.
+//
+// "discount kitna hai", "kitna milega", "aapki discount policy kya hai" are
+// asking what the discount IS. Starting a nine-question setup on those would
+// answer nothing they asked and take over the conversation — and "chahiye" in
+// the verbs above makes that easy to trip, so the guard earns its place.
+const ASKING_RE = /\b(kitna|kitni|kitne|how\s*much|what\s*is|kya\s*hai|kya\s*h|policy|milega|milta|hota\s*hai)\b/i;
+
+// -> true when this message is asking for a discount rule to be set up or
+// changed, and is not merely asking what the discount is.
+function wantsSetup(text) {
+  const s = String(text || '');
+  return WANTS_RE.test(s) && !ASKING_RE.test(s);
+}
+
+// Kept for anything still testing the raw pattern; wantsSetup is the one to
+// call, because it carries the question guard with it.
+const CHANGE_RE = WANTS_RE;
 
 module.exports = {
   open, get, pending, save, cancel, STEPS, SKIP, LATER, YES, NO, readNumber, readDuration, ruleName, describe, toPortal,
-  requests, file, find, drop, forAccount, approvalText, pctFromPrice, priceAt, money, CHANGE_RE,
+  requests, file, find, drop, forAccount, approvalText, pctFromPrice, priceAt, money, CHANGE_RE, wantsSetup,
 };
