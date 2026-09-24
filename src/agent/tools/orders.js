@@ -32,10 +32,11 @@ function cartState(order) {
       name: availability.displayName(l),
       qty: l.qty,
       status: l.source || 'unknown',
-      price: availability.priceOf(l) || null,
+      price: availability.priceOf(l).replace(/^\s*—\s*/, '') || null,
     })),
-    // Ready to send as it stands, numbered the way the customer expects.
-    summary: orders.summary(order),
+    // No ready-made summary: the agent lists the cart itself, from these
+    // lines, numbered the way the customer expects. It adds no total — a sum
+    // it worked out is a figure no tool gave it.
   });
 }
 

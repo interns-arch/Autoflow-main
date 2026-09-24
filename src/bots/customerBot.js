@@ -2796,15 +2796,17 @@ class CustomerBot {
 
     let out = true;
     // THE AGENT IS WAITING FOR THE SPECIALIST. The conversation is parked
-    // mid-turn and checkpointed; the customer is told once, here, because the
-    // model is not running — it stopped inside the tool. The answer goes out
-    // when he replies (agent.resume).
+    // mid-turn and checkpointed. The customer gets the line the MODEL wrote
+    // when it asked — sent from here, because the model is not running any
+    // more. The fixed line is only for a model that left it out. The answer
+    // goes out when he replies (agent.resume).
     if (res.paused) {
       out = await reply(
-        t(
-          'Let me get this checked by our specialist — I will confirm shortly.',
-          'Ye main apne specialist se check karwa leta hoon — thodi der mein confirm karta hoon.',
-        ),
+        res.holding ||
+          t(
+            'Let me get this checked by our specialist — I will confirm shortly.',
+            'Ye main apne specialist se check karwa leta hoon — thodi der mein confirm karta hoon.',
+          ),
       );
     } else if (res.reply) {
       out = await reply(res.reply);

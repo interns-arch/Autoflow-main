@@ -111,7 +111,9 @@ async function answer(question, ctx = {}) {
     };
   }
 
-  const text = await phrase(found.entry, question, ctx.chatId);
+  // ctx.raw: the approved words as stored, for a caller that writes the reply
+  // itself (the agent). Everyone else gets them rephrased for the customer.
+  const text = ctx.raw ? String(found.entry.answer || '').trim() : await phrase(found.entry, question, ctx.chatId);
   await repository.noteUsed(found.entry.id);
   kblog.event('knowledge_answered', {
     knowledge_id: found.entry.id,

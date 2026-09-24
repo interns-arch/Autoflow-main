@@ -537,6 +537,164 @@ async function partStatusText(partNo, t) {
   ].join('\n');
 }
 
+// ------------------------------------------------------------------ facts
+//
+// THE SAME PORTAL CALLS AS THE *Text FUNCTIONS ABOVE, RETURNED AS DATA.
+//
+// The template path sends those texts as they stand. The agent does not: it
+// is given the facts and writes the reply itself, in the customer's words and
+// language — a salesman reading his screen, not a screen being forwarded. So
+// these carry no sentences, no translator and no formatting, only what the
+// portal said. The *Text functions are left exactly as they were; each fact
+// function reads the same fields as the text beside it.
+//
+// Every one returns { error } instead of throwing, so a tool can pass the
+// failure on without a try/catch of its own.
+
+// Where an order has got to, as the words `where()` uses, without `t`.
+function stageOf(o) {
+  if (o.dispatched_at) return { stage: 'dispatched', on: day(o.dispatched_at) || null };
+  if (o.invoice_no) return { stage: 'billed', invoiceNo: o.invoice_no };
+  if (/cancel/i.test(String(o.status || ''))) return { stage: 'cancelled' };
+  if (String(o.do_status || '').toLowerCase() === 'confirmed') return { stage: 'confirmed, not dispatched yet' };
+  return { stage: 'not allocated yet' };
+}
+
+async function orderListFacts(row) {
+  const portal = require('../integrations/dealerPortal');
+  let rows = [];
+  try {
+    rows = await portal.recentOrders(row.name, { limit: 8 });
+  } catch (e) {
+    store.log('sales', 'orders lookup failed for ' + row.name + ': ' + String((e && e.message) || e).slice(0, 120));
+    return { error: 'the portal did not answer' };
+  }
+  const mine = rows.filter((o) => same(o.customer_name, row.name) || same(o.buyer_name, row.name));
+  const list = (mine.length ? mine : rows).slice(0, 5);
+  return {
+    customer: row.name,
+    orders: list.map((o) => ({
+      orderId: o.order_id,
+      salesOrder: o.odoo_so_name || null,
+      date: day(o.order_date) || null,
+      items: Array.isArray(o.lines) ? o.lines.length : null,
+      ...stageOf(o),
+    })),
+  };
+}
+
+async function trackFacts(orderId) {
+  const portal = require('../integrations/dealerPortal');
+  const config = require('../config');
+  let tr = null;
+  let disp = null;
+  try {
+    tr = await portal.trackOrder(orderId);
+  } catch (e) {
+    if (e && e.status === 404) return { orderId, found: false };
+    store.log('sales', 'track ' + orderId + ' failed: ' + String((e && e.message) || e).slice(0, 110));
+  }
+  try {
+    disp = await portal.dispatchFor(orderId, config.dealerPortal.sourceBranchDealerId || null);
+  } catch (e) {
+    store.log('sales', 'dispatch lookup ' + orderId + ' failed: ' + String((e && e.message) || e).slice(0, 110));
+  }
+  const o = tr && Array.isArray(tr.orders) ? tr.orders.find((x) => String(x.order_id) === String(orderId)) || tr.orders[0] : null;
+  if (!o && !disp) return { orderId, error: 'the portal did not answer' };
+  const stage = (disp && disp.tracker_status) || (o && o.tracker_status) || (o && o.status) || null;
+  return {
+    orderId,
+    found: true,
+    customer: (o && (o.customer_name || o.buyer_name)) || null,
+    stage,
+    dispatchedOn: disp && disp.dispatched_at ? day(disp.dispatched_at) : null,
+    deliveryMode: (tr && tr.delivery_mode) || null,
+    transporter: (disp && disp.transporter) || (tr && tr.transporter) || null,
+    invoiceNo: (disp && disp.invoice_no) || null,
+    payment: (o && o.payment_status && String(o.payment_status).toLowerCase()) || null,
+    proofOfDelivery: disp
+      ? disp.pod_id || disp.pod_outcome_type
+        ? { status: disp.pod_outcome_type || 'uploaded', on: disp.pod_uploaded_at ? day(disp.pod_uploaded_at) : null }
+        : 'not yet'
+      : null,
+    items: (o && o.line_count) || null,
+    totalQty: (o && o.total_qty) || null,
+    // The order's own total on the portal — theirs, and repeatable as given.
+    total: o && Number(o.total_amount) ? '₹' + money(o.total_amount) : null,
+  };
+}
+
+async function invoiceFacts(orderId) {
+  const portal = require('../integrations/dealerPortal');
+  let s = null;
+  try {
+    s = await portal.invoiceStatus(orderId);
+  } catch (e) {
+    if (e && e.status === 404) return { orderId, found: false };
+    store.log('sales', 'invoice status ' + orderId + ' failed: ' + String((e && e.message) || e).slice(0, 110));
+    return { orderId, error: 'the portal did not answer' };
+  }
+  if (!s) return { orderId, found: false };
+  const billed = Boolean(s.invoiced || s.invoice_no);
+  return {
+    orderId,
+    found: true,
+    billed,
+    invoiceNo: s.invoice_no || null,
+    state: (billed ? s.odoo_invoice_state : s.invoice_status) || null,
+  };
+}
+
+async function shortageFacts(name) {
+  const portal = require('../integrations/dealerPortal');
+  let rows = [];
+  try {
+    rows = await portal.shortages();
+  } catch (e) {
+    store.log('sales', 'shortage list failed: ' + String((e && e.message) || e).slice(0, 110));
+    return { error: 'the portal did not answer' };
+  }
+  const words = name ? String(name).toLowerCase().split(/\s+/).filter((w) => w.length >= 2) : [];
+  const short = rows.filter((r) => (Number(r.shortfall) || 0) > 0);
+  const mine = words.length ? short.filter((r) => words.every((w) => String(r.customer_name || '').toLowerCase().includes(w))) : short;
+  const list = [...mine].sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || ''))).slice(0, 10);
+  return {
+    customer: (list[0] && list[0].customer_name) || name || null,
+    total: mine.length,
+    shortages: list.map((r) => ({
+      date: day(r.created_at) || null,
+      partNo: r.part_no,
+      ordered: Number(r.requested_qty) || 0,
+      supplied: Number(r.available_qty) || 0,
+      short: Number(r.shortfall) || 0,
+    })),
+  };
+}
+
+async function partStatusFacts(partNo) {
+  const portal = require('../integrations/dealerPortal');
+  let s = null;
+  try {
+    s = await portal.partStatus(partNo);
+  } catch (e) {
+    if (e && e.status === 404) return { partNo, found: false };
+    store.log('sales', 'part status ' + partNo + ' failed: ' + String((e && e.message) || e).slice(0, 110));
+    return { partNo, error: 'the portal did not answer' };
+  }
+  if (!s) return { partNo, found: false };
+  const pos = Array.isArray(s.purchase_orders) ? s.purchase_orders : [];
+  const sos = Array.isArray(s.sales_orders) ? s.sales_orders : [];
+  const sum = (arr, k) => arr.reduce((n, x) => n + (Number(x[k]) || 0), 0);
+  const last = (arr, k) => arr.map((x) => x[k]).filter(Boolean).sort().slice(-1)[0];
+  return {
+    partNo: String(s.part_no || partNo),
+    found: true,
+    stock: s.stock && s.stock.bal_qty != null ? s.stock.bal_qty : null,
+    purchaseOrders: { count: pos.length, qty: sum(pos, 'po_qty'), last: last(pos, 'po_date') ? day(last(pos, 'po_date')) : null },
+    salesOrders: { count: sos.length, qty: sum(sos, 'so_qty'), last: last(sos, 'so_date') ? day(last(sos, 'so_date')) : null },
+  };
+}
+
 async function incomingText(t) {
   const portal = require('../integrations/dealerPortal');
   const config = require('../config');
@@ -593,4 +751,4 @@ async function answer(row, intent, t) {
   return ordersFor(row, t);
 }
 
-module.exports = { parse, parseOwn, answer, answerOwn, ownRow, ordersFor, parseBill, sendBill, parseOrderDetail, orderDetail, parseDesk, classifyDesk, trackText, invoiceStatusText, shortageText, partStatusText, incomingText, _internals: { money, day, where, same, cleanName } };
+module.exports = { parse, parseOwn, answer, answerOwn, ownRow, ordersFor, parseBill, sendBill, parseOrderDetail, orderDetail, parseDesk, classifyDesk, trackText, invoiceStatusText, shortageText, partStatusText, incomingText, orderListFacts, trackFacts, invoiceFacts, shortageFacts, partStatusFacts, _internals: { money, day, where, same, cleanName, stageOf } };

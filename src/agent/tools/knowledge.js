@@ -25,6 +25,10 @@ const answerBusinessQuestion = tool(
     const res = await kb.answer(String(question || '').trim(), {
       chatId: ctx.chatId,
       customerId: (ctx.customer && (ctx.customer.buyerId || ctx.customer.accountId)) || null,
+      // The approved words as a person wrote them, not a rewrite: the agent
+      // writes the customer's reply itself, and a second model rephrasing it
+      // first would only be one more place for a condition to go missing.
+      raw: true,
     });
     if (!res.answered) {
       return JSON.stringify({
@@ -33,8 +37,11 @@ const answerBusinessQuestion = tool(
         askAPerson: true,
       });
     }
-    // Send this as it stands. Do not add to it, and do not "improve" a figure.
-    return JSON.stringify({ answered: true, reply: res.text });
+    return JSON.stringify({
+      answered: true,
+      approvedAnswer: res.text,
+      note: 'This is what a person approved. Say it in your own words, in the customer\'s language, keeping every number, condition and exception exactly — add nothing, soften nothing.',
+    });
   },
   {
     name: 'answer_business_question',
@@ -106,12 +113,13 @@ const answerGeneralChat = tool(
     // model. silent means the message needs no reply at all.
     if (!out) return JSON.stringify({ answered: false, why: 'this is not general conversation — treat it as a part or a policy question' });
     if (out.action === 'silent' || !out.text) {
-      return JSON.stringify({ answered: true, reply: null, note: 'nothing needs saying to this — send nothing' });
+      return JSON.stringify({ answered: true, gist: null, note: 'nothing needs saying to this — reply with (no reply)' });
     }
     return JSON.stringify({
       answered: true,
-      reply: out.text,
-      note: 'Send this as it stands, or say the same thing in your own words. Do not add a price, a stock figure or a delivery date to it.',
+      // The substance, not the words to send: the agent writes the reply.
+      gist: out.text,
+      note: 'This is WHAT to say, not the words to send. Write the reply yourself, in your own voice and the customer\'s language. Keep what it says; add no price, stock figure or delivery date.',
     });
   },
   {

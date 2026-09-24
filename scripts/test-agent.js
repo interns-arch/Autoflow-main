@@ -123,6 +123,48 @@ async function toolChecks() {
     cfg2.agent.allowFrom = saved;
   }
 
+  // ---------------------------------------- tools hand over FACTS, not words
+  //
+  // The agent writes every word the customer reads. A tool that returns a
+  // finished sentence gets forwarded instead of understood, so none may.
+  console.log('\nTOOLS RETURN FACTS — THE AGENT WRITES THE WORDS (offline)\n');
+  const av = require('../src/core/availability');
+  const resolveWas = av.resolve;
+  av.resolve = async () => [
+    { item: 'X1', partNo: 'X1', source: 'available', mrp: 310, pricedForCustomer: false },
+    { item: 'X2', partNo: 'X2', source: 'unavailable', mrp: 599, pricedForCustomer: false },
+  ];
+  let stock;
+  try {
+    stock = await call(commerce.checkStockAndPrice, { partNumbers: ['X1', 'X2'] }, { configurable: { chatId: 'facts@c.us' } });
+  } finally {
+    av.resolve = resolveWas;
+  }
+  const [s1, s2] = (stock && stock.parts) || [];
+  ok('a stock check returns no ready-made sentence', stock && stock.parts.every((p) => !('line' in p)), JSON.stringify(stock));
+  ok('...but the facts: status, price, and when an on-order part arrives', s1 && s1.status === 'in_stock' && /310/.test(s1.price) && s2.status === 'on_order' && s2.etaDays > 0, JSON.stringify(stock));
+  ok('"unavailable" is never handed over as a word the model could repeat', !/unavailable|not available/i.test(JSON.stringify(stock)));
+
+  const lookup = require('../src/core/customerLookup');
+  const trackWas = lookup.trackFacts;
+  lookup.trackFacts = async (id) => ({ orderId: id, found: true, stage: 'dispatched', dispatchedOn: '23 Sep', invoiceNo: 'INV-9' });
+  const fulfilment = require('../src/agent/tools/fulfilment');
+  let track;
+  try {
+    track = JSON.parse(await fulfilment.orderStatus.invoke({ orderId: '486' }, { configurable: { chatId: 'facts@c.us' } }));
+  } finally {
+    lookup.trackFacts = trackWas;
+  }
+  ok('order status returns the portal\'s facts, not a finished message', track && !('reply' in track) && track.stage === 'dispatched' && track.invoiceNo === 'INV-9', JSON.stringify(track));
+
+  // THE GUARD THAT MAKES THAT SAFE: a figure no tool gave is never sent.
+  const guard = require('../src/agent')._inventedMoney;
+  const priced = [{ getType: () => 'tool', content: JSON.stringify({ parts: [{ partNo: '13780M68P01', price: 'MRP Rs.310' }] }) }];
+  ok('a price the tool gave may be written in any form', guard('MRP ₹310 hai, kitne chahiye?', priced, '').length === 0 && guard('310/- ka hai', priced, '').length === 0);
+  ok('a price no tool gave is caught', guard('₹299 mein de denge', priced, '').join() === '299');
+  ok('a total the model multiplied out is caught', guard('5 piece ka ₹1,550 hoga', priced, '').join() === '1550');
+  ok('quantities are not money', guard('Kitne chahiye? 5 ya 10?', priced, '').length === 0);
+
   // -------------------------------------------- the context: summary + last 20
   //
   // A dealer's chat runs for months and the checkpointer keeps all of it. The
@@ -374,6 +416,15 @@ const CASES = [
     say: 'aap log sunday ko khule hote ho?',
     check: (reply) => reply.length <= 260 && reply.split('\n').filter((l) => l.trim()).length <= 3,
     why: 'a one-line question got a paragraph',
+  },
+  // THE AGENT WRITES THE WORDS: a price reply is its own sentence built from
+  // the tool's figure — not the old template line passed through.
+  {
+    name: 'a price reply is written by the agent, not a template passed through',
+    say: '13780M68P01 ka rate kya hai',
+    check: (reply, tools) =>
+      tools.includes('check_stock_and_price') && !/ - (hai|available) — /i.test(reply) && reply.length > 0,
+    why: 'forwarded a template line instead of writing the reply',
   },
   // WHATSAPP FEATURES: the notes agent/incoming puts in front of a message,
   // exactly as the bot builds them.

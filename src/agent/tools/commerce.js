@@ -12,6 +12,8 @@
 const { tool } = require('langchain');
 const { z } = require('zod');
 
+// Named apart from the tools' own `config` argument (LangChain's run config).
+const appConfig = require('../../config');
 const availability = require('../../core/availability');
 const store = require('../../store');
 const { contextFrom } = require('../context');
@@ -30,19 +32,36 @@ const checkStockAndPrice = tool(
       return JSON.stringify({ error: 'the dealer portal did not answer', askAPerson: true });
     }
 
+    // FACTS, NOT A SENTENCE. This used to hand back a finished line ("… - hai
+    // — MRP Rs.310") and the model forwarded it; now the model writes the
+    // reply itself. The facts are the ones that line was built from, with the
+    // statuses named for what they MEAN to the customer — "unavailable" read
+    // as "not available", which is the one thing the founder said never to
+    // say: we can get it, and the answer is when.
+    const eta = appConfig.onOrderEtaDays;
     return JSON.stringify({
-      parts: lines.map((l) => ({
-        partNo: l.partNo || l.item,
-        name: availability.displayName(l),
-        // 'available' | 'partial' | 'unavailable' (we can get it) |
-        // 'unidentified' (the portal does not know this number) | 'unknown'
-        status: l.source || 'unknown',
-        // Already-formatted and already-censored. Repeat it as it stands;
-        // never invent a figure, and never convert or discount it.
-        price: availability.priceOf(l) || null,
-        // A finished line in the customer's own language, safe to send.
-        line: availability.describe(l, ctx.chatId),
-      })),
+      parts: lines.map((l) => {
+        const src = l.source || 'unknown';
+        return {
+          partNo: l.partNo || l.item,
+          name: availability.displayName(l),
+          status:
+            src === 'available'
+              ? 'in_stock'
+              : src === 'partial'
+                ? 'part_in_stock_rest_on_order'
+                : src === 'unavailable'
+                  ? 'on_order'
+                  : src === 'unidentified'
+                    ? 'not_recognised_by_portal'
+                    : 'not_confirmed_yet',
+          // Already correct for THIS customer and already censored: the only
+          // money that may be stated. Quote it exactly; never convert,
+          // discount or multiply it.
+          price: availability.priceOf(l).replace(/^\s*—\s*/, '') || null,
+          etaDays: src === 'unavailable' || src === 'partial' ? eta : null,
+        };
+      }),
     });
   },
   {
@@ -50,8 +69,8 @@ const checkStockAndPrice = tool(
     description:
       'Ask the dealer portal whether we have these parts and what they cost. ALWAYS call this once you have a part number — the customer should get the price without having to ask for it. ' +
       'Takes exact part numbers only, never a description; get the number from lookup_known_part, search_catalogue_index or search_portal_catalogue first. Several numbers in one call is cheaper than one call each. ' +
-      'The "price" field is already correct for THIS customer and is the only money you may state. If it is null, say nothing about price. Never calculate, discount or convert a price yourself. ' +
-      'Status "unidentified" means the portal does not recognise the number — do not tell the customer it does not exist; ask a person with ask_a_person.',
+      'Returns FACTS per part; you write the reply. The "price" field is already correct for THIS customer and is the only money you may state — quote it exactly as given. If it is null, say nothing about price. Never calculate, discount, total or convert a price yourself. ' +
+      'Status: "in_stock"; "part_in_stock_rest_on_order" (some now, the rest in etaDays days); "on_order" — we do not have it today but can get it, so say it arrives in about etaDays days, NEVER that it is not available; "not_recognised_by_portal" — do not tell the customer it does not exist, call ask_a_person; "not_confirmed_yet" — say you are confirming it.',
     schema: z.object({
       partNumbers: z.array(z.string()).describe('exact dealer part numbers, e.g. ["CTWBSI26P-16 Inch", "13780M68P01"]'),
     }),

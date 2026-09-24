@@ -50,14 +50,17 @@ const flightKey = (chatId, item) => String(chatId) + '|' + String(item).toLowerC
 // When the thread is resumed with the specialist's words, execution re-enters
 // and interrupt() RETURNS them. Nothing below this line runs until then —
 // which may be hours, and may be on the other side of a deploy.
-function waitForSpecialist(key, escalationId, what) {
+function waitForSpecialist(key, escalationId, what, tellCustomer) {
   const fromSpecialist = interrupt({
     kind: 'ask_a_person',
     escalationId,
     item: what,
-    // The customer is told this by the caller, not by the model — the model
-    // is not running while this is paused.
     holding: true,
+    // What the customer is told while this waits — written by the MODEL, in
+    // their language, when it called this tool. The model is not running
+    // once paused, so the line travels here and the caller sends it. Empty
+    // only if the model left it out; the caller has a plain line for that.
+    tellCustomer: String(tellCustomer || '').trim().slice(0, 300) || null,
   });
 
   inFlight.delete(key);
@@ -86,7 +89,7 @@ function waitForSpecialist(key, escalationId, what) {
 }
 
 const askAPerson = tool(
-  async ({ item, qty, reason, whatYouTried, webCandidates }, config) => {
+  async ({ item, qty, reason, whatYouTried, webCandidates, tellCustomer }, config) => {
     const ctx = contextFrom(config);
     const bot = (config && config.configurable && config.configurable.bot) || null;
     if (!bot) return JSON.stringify({ asked: false, why: 'no way to reach a person from here' });
@@ -195,7 +198,7 @@ const askAPerson = tool(
     // could not be tied to the escalation it was waiting on.
     const escalationId = typeof created === 'number' ? created : created.alreadyOpen || null;
     inFlight.add(key);
-    return waitForSpecialist(key, escalationId, what);
+    return waitForSpecialist(key, escalationId, what, tellCustomer);
   },
   {
     name: 'ask_a_person',
@@ -203,7 +206,7 @@ const askAPerson = tool(
       'Hand this question to the specialist at the shop and WAIT for his answer. The customer is told a specialist is reviewing it, and this conversation pauses — possibly for hours — until he replies. ' +
       'This is the LAST resort. Use it only after lookup_known_part, search_catalogue_index, search_portal_catalogue AND search_the_web have all come back with nothing, or when check_stock_and_price returned status "unidentified", or when answer_business_question found nothing approved. ' +
       'Tell it what you already tried, so he is confirming rather than starting from scratch. ' +
-      'You do not need to write a holding message yourself — the customer is told automatically. Say nothing else alongside it, and never guess at the answer.',
+      'Write the customer\'s holding line yourself in tellCustomer — it is sent the moment this pauses, because you are not running while it waits. Say nothing else alongside it, and never guess at the answer.',
     schema: z.object({
       item: z.string().describe('what the customer asked for, in their own words — this is what the specialist will read'),
       qty: z.number().int().optional().describe('how many they want, if they said'),
@@ -221,6 +224,10 @@ const askAPerson = tool(
         .array(z.string())
         .optional()
         .describe('part numbers the web suggested that the portal did not recognise — worth him seeing'),
+      tellCustomer: z
+        .string()
+        .optional()
+        .describe('ALWAYS give this: the one short line the customer gets NOW, while he checks — in THEIR language and your own voice, e.g. "Ek minute, senior se confirm karke batata hoon." No promise of a time, no guess at the answer, no price.'),
     }),
   },
 );

@@ -262,7 +262,15 @@ async function run(who, input, what) {
       'agent',
       `${who.chatId} ${Date.now() - started}ms, PAUSED for the specialist (#${stop.escalationId || '?'}), tools: ${calls.join(' > ') || 'none'}`,
     );
-    return { handled: true, reply: null, paused: true, escalationId: stop.escalationId || null };
+    // The holding line the MODEL wrote when it called ask_a_person. The
+    // caller sends it; the model is not running any more to send it itself.
+    return {
+      handled: true,
+      reply: null,
+      paused: true,
+      escalationId: stop.escalationId || null,
+      holding: stop.tellCustomer || null,
+    };
   }
 
   // The LAST message is usually the reply, but not always: when the final
@@ -277,6 +285,22 @@ async function run(who, input, what) {
   }
 
   store.log('agent', `${who.chatId} ${Date.now() - started}ms, tools: ${calls.length ? calls.join(' > ') : 'none'}`);
+  // EVERY PRICE IN THE REPLY CAME FROM A TOOL.
+  //
+  // The model writes every word now — tools hand it facts, not sentences — so
+  // it also writes the price. That is only safe if the price it writes is one
+  // the portal gave it. A figure found nowhere in what the tools returned (or
+  // in the live cart) is one it made up, rounded or multiplied: "5 x ₹310 =
+  // ₹1,550" is exactly the total the prompt forbids. Such a reply is not
+  // sent; the caller answers the old way instead, whose prices come straight
+  // from the portal. A guard like this can only lose a reply, never produce a
+  // wrong one.
+  const invented = inventedMoney(reply, messages, memory.cartNote(who.chatId));
+  if (invented.length) {
+    store.log('agent', `${who.chatId} reply NOT sent — it states ${invented.join(', ')}, which no tool gave it: "${reply.slice(0, 100)}"`);
+    return { handled: false, reply: null, paused: false };
+  }
+
   // "(no reply)": the model decided there is nothing to say — a reaction taken
   // back, a sticker after the deal. Handled, and nothing is sent.
   if (/^\(?\s*no reply\s*\)?\.?$/i.test(reply)) return { handled: true, reply: null, paused: false };
@@ -284,6 +308,28 @@ async function run(who, input, what) {
 }
 
 // Gemini returns content as parts when it feels like it.
+// Money in a reply: "₹450", "Rs 1,050", "Rs.310", "MRP 599", "450 rupees",
+// "INR 99". The numbers, with separators removed.
+const MONEY = /(?:₹|\brs\.?|\binr\b|\bmrp\b(?:\s*(?:₹|rs\.?))?)\s*:?\s*(\d[\d,]*(?:\.\d+)?)|(\d[\d,]*(?:\.\d+)?)\s*(?:\/-|rupees?\b|rs\b)/gi;
+const norm = (n) => String(Number(String(n).replace(/,/g, '')));
+
+// Every money figure in `reply` that appears in none of the tool results in
+// this conversation, nor in the live cart. [] when the reply is clean.
+function inventedMoney(reply, messages, cart) {
+  const said = [];
+  for (const m of String(reply || '').matchAll(MONEY)) said.push(norm(m[1] || m[2]));
+  if (!said.length) return [];
+  const known = new Set();
+  const collect = (text) => {
+    for (const n of String(text || '').match(/\d[\d,]*(?:\.\d+)?/g) || []) known.add(norm(n));
+  };
+  for (const msg of messages || []) {
+    if ((msg.getType ? msg.getType() : '') === 'tool') collect(textOf(msg));
+  }
+  collect(cart);
+  return [...new Set(said.filter((n) => !known.has(n)))];
+}
+
 function textOf(msg) {
   if (!msg) return '';
   const c = msg.content;
@@ -292,4 +338,4 @@ function textOf(msg) {
   return '';
 }
 
-module.exports = { handle, resume, warmUp, enabled, allowed, TOOLS, _build: build };
+module.exports = { handle, resume, warmUp, enabled, allowed, TOOLS, _build: build, _inventedMoney: inventedMoney };

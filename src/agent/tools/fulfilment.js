@@ -2,15 +2,15 @@
 // AFTER THE ORDER: where is it, what was billed, what is short.
 //
 // Every one of these is a read against the dealer portal, and each returns
-// text that core/customerLookup has already built and already phrased in the
-// customer's language. Pass it through; do not rebuild it, and do not add a
-// date or a status of your own to it.
+// what the portal said as FACTS — stage, dates, bill number, quantities. The
+// agent writes the reply from them in the customer's language, and adds no
+// date or status the facts do not carry.
 const { tool } = require('langchain');
 const { z } = require('zod');
 
 const customerLookup = require('../../core/customerLookup');
 const customers = require('../../core/customers');
-const { contextFrom, translatorFor } = require('../context');
+const { contextFrom } = require('../context');
 
 const lookupCustomer = tool(
   async (_input, config) => {
@@ -41,42 +41,43 @@ const lookupCustomer = tool(
   },
 );
 
+// THESE RETURN FACTS, NEVER SENTENCES. The agent reads what the portal said
+// and writes the reply itself, in the customer's language — the same
+// customerLookup calls the template path turns into its own fixed texts.
 const orderStatus = tool(
   async ({ orderId }, config) => {
     const ctx = contextFrom(config);
-    const t = translatorFor(ctx.chatId);
     const id = String(orderId || '').trim();
     try {
-      if (id) return JSON.stringify({ reply: await customerLookup.trackText(id, t) });
-      // No order named: show them their recent ones so they can pick.
+      if (id) return JSON.stringify(await customerLookup.trackFacts(id));
+      // No order named: their recent ones, so they can say which.
       const who = await customers.resolve(ctx.phone);
-      if (!who || !who.found) return JSON.stringify({ reply: null, why: 'this number has no account, so there are no orders to show' });
-      return JSON.stringify({ reply: await customerLookup.ordersFor(who, t) });
+      if (!who || !who.found) return JSON.stringify({ orders: [], why: 'this number has no account, so there are no orders to show' });
+      return JSON.stringify(await customerLookup.orderListFacts(who));
     } catch (e) {
-      return JSON.stringify({ reply: null, why: 'the portal did not answer', askAPerson: true });
+      return JSON.stringify({ error: 'the portal did not answer', askAPerson: true });
     }
   },
   {
     name: 'order_status',
     description:
       'Where an order has got to — dispatched, billed, pending. Give the order number when the customer names one; leave it out to list their recent orders so they can say which one they mean. ' +
-      'The "reply" it returns is ready to send as it stands. Never invent a delivery date.',
+      'Returns the FACTS (stage, dates, bill number, transporter, proof of delivery); you write the reply from them. Never invent a delivery date.',
     schema: z.object({ orderId: z.string().optional().describe('the order number the customer named, if any') }),
   },
 );
 
 const invoiceStatus = tool(
-  async ({ orderId }, config) => {
-    const ctx = contextFrom(config);
+  async ({ orderId }) => {
     try {
-      return JSON.stringify({ reply: await customerLookup.invoiceStatusText(String(orderId).trim(), translatorFor(ctx.chatId)) });
+      return JSON.stringify(await customerLookup.invoiceFacts(String(orderId).trim()));
     } catch (e) {
-      return JSON.stringify({ reply: null, why: 'the portal did not answer', askAPerson: true });
+      return JSON.stringify({ error: 'the portal did not answer', askAPerson: true });
     }
   },
   {
     name: 'invoice_status',
-    description: 'Whether an order has been invoiced, and its bill details. Needs the order number. Use for "bill bheja?", "invoice number kya hai". The reply is ready to send.',
+    description: 'Whether an order has been invoiced, and its bill number. Needs the order number. Use for "bill bheja?", "invoice number kya hai". Returns the facts; you write the reply.',
     schema: z.object({ orderId: z.string().describe('the order number') }),
   },
 );
@@ -84,13 +85,12 @@ const invoiceStatus = tool(
 const reportShortShipment = tool(
   async (_input, config) => {
     const ctx = contextFrom(config);
-    const t = translatorFor(ctx.chatId);
     try {
       const who = await customers.resolve(ctx.phone);
-      if (!who || !who.found) return JSON.stringify({ reply: null, why: 'this number has no account', askAPerson: true });
-      return JSON.stringify({ reply: await customerLookup.shortageText(who.name, t) });
+      if (!who || !who.found) return JSON.stringify({ error: 'this number has no account', askAPerson: true });
+      return JSON.stringify(await customerLookup.shortageFacts(who.name));
     } catch (e) {
-      return JSON.stringify({ reply: null, why: 'the portal did not answer', askAPerson: true });
+      return JSON.stringify({ error: 'the portal did not answer', askAPerson: true });
     }
   },
   {
@@ -103,12 +103,11 @@ const reportShortShipment = tool(
 );
 
 const partStatus = tool(
-  async ({ partNumber }, config) => {
-    const ctx = contextFrom(config);
+  async ({ partNumber }) => {
     try {
-      return JSON.stringify({ reply: await customerLookup.partStatusText(String(partNumber).trim(), translatorFor(ctx.chatId)) });
+      return JSON.stringify(await customerLookup.partStatusFacts(String(partNumber).trim()));
     } catch (e) {
-      return JSON.stringify({ reply: null, why: 'the portal did not answer', askAPerson: true });
+      return JSON.stringify({ error: 'the portal did not answer', askAPerson: true });
     }
   },
   {
