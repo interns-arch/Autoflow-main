@@ -28,60 +28,75 @@ const sha = (s) => crypto.createHash('sha256').update(s).digest('hex');
 // catalogue UPDATES the rows it carries rather than duplicating them, which is
 // what makes re-importing after a catalogue change safe.
 async function importFile(filePath, opts = {}) {
-  if (!enabled()) throw new Error('DATABASE_URL is not set — nowhere to put the catalogue');
-  const buf = fs.readFileSync(filePath);
-  const parsed = parse.parseCatalogue(buf.toString('utf8'));
-  if (parsed.error) throw new Error(parsed.error);
-  if (!parsed.rows.length) throw new Error('no usable rows. Columns seen: ' + parsed.header.join(', '));
+  if (!enabled()) throw new Error('DATABASE_URL is not set - nowhere to put the catalogue');
 
   const fileName = path.basename(filePath);
   const stats = {
-    rowsRead: parsed.rows.length,
-    skipped: parsed.skipped,
+    rowsRead: 0,
+    skipped: 0,
     inserted: 0,
     updated: 0,
     embedded: 0,
     embedFailed: 0,
-    header: parsed.header,
+    header: [],
   };
 
+  // READ IN PIECES, NOT ALL AT ONCE.
+  //
+  // This used to slurp the file into a string and parse every row into memory
+  // before storing anything. A real export is 272,000 rows and 56 MB, and it
+  // died with "JavaScript heap out of memory" inside a 512 MB container,
+  // having imported nothing. Rows now go to the database as they are read, and
+  // memory stays flat however big the catalogue gets.
+  const hash = crypto.createHash('sha256');
+  const reader = parse.rowReader();
+  const seen = new Set();
+  let col = null;
+
+  const store_ = async (r) => {
+    if (!col) {
+      // The first row is the header. A file whose columns cannot be read is
+      // refused HERE, before a quarter of a million rows go in against the
+      // wrong ones.
+      const h = parse.readHeader(r);
+      if (h.error) throw new Error(h.error);
+      col = h.col;
+      stats.header = h.header;
+      return;
+    }
+    const p = parse.rowToPart(r, col);
+    if (!p || seen.has(p.normPartNo)) {
+      stats.skipped++; // unusable, or the same part listed twice in one export
+      return;
+    }
+    seen.add(p.normPartNo);
+    stats.rowsRead++;
+    await upsertPart(p, fileName, stats);
+    if (opts.onRow && stats.rowsRead % 5000 === 0) opts.onRow(stats.rowsRead);
+  };
+
+  const stream = fs.createReadStream(filePath, { encoding: 'utf8', highWaterMark: 1 << 20 });
+  for await (const chunk of stream) {
+    hash.update(chunk, 'utf8');
+    for (const r of reader.push(chunk)) await store_(r);
+  }
+  for (const r of reader.end()) await store_(r);
+
+  if (!col) throw new Error('the file is empty');
+  if (!stats.rowsRead) throw new Error('no usable rows. Columns seen: ' + stats.header.join(', '));
+
+  // The import record is written AFTER the rows, because the row count is not
+  // known until the file has been read.
   const res = await db.query(
     'INSERT INTO bot_parts_imports (file_name, file_hash, rows_read) VALUES ($1,$2,$3) RETURNING id',
-    [fileName, sha(buf), parsed.rows.length],
+    [fileName, hash.digest('hex'), stats.rowsRead],
     null,
   );
   const importId = res && res.rows[0] ? res.rows[0].id : null;
 
-  // Rows first, embeddings after. A catalogue of a hundred thousand parts is
-  // hours of embedding calls, and the rows are useful immediately: an exact
+  // Rows first, embeddings after. A catalogue of a quarter of a million parts
+  // is hours of embedding calls, and the rows are useful immediately: an exact
   // part-number lookup needs no vector at all.
-  for (const p of parsed.rows) {
-    const searchable = parse.searchableText(p);
-    const r = await db.query(
-      `INSERT INTO bot_parts (part_no, norm_part_no, name, brand, fitment, category, searchable, source_file, active)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,true)
-       ON CONFLICT (norm_part_no) DO UPDATE
-         SET part_no = EXCLUDED.part_no,
-             name = EXCLUDED.name,
-             brand = COALESCE(EXCLUDED.brand, bot_parts.brand),
-             fitment = COALESCE(EXCLUDED.fitment, bot_parts.fitment),
-             category = COALESCE(EXCLUDED.category, bot_parts.category),
-             -- the text changed, so whatever was embedded is stale
-             embedding = CASE WHEN bot_parts.searchable IS DISTINCT FROM EXCLUDED.searchable
-                              THEN NULL ELSE bot_parts.embedding END,
-             searchable = EXCLUDED.searchable,
-             source_file = EXCLUDED.source_file,
-             active = true,
-             updated_at = now()
-       RETURNING (xmax = 0) AS inserted`,
-      [p.partNo, p.normPartNo, p.name, p.brand, p.fitment, p.category, searchable, fileName],
-      null,
-    );
-    if (!r || !r.rows[0]) continue;
-    if (r.rows[0].inserted) stats.inserted++;
-    else stats.updated++;
-  }
-
   if (opts.embed !== false) {
     stats.embedded = await embedPending(opts.embedLimit || Infinity, (n) => {
       if (opts.onProgress) opts.onProgress(n);
@@ -96,6 +111,38 @@ async function importFile(filePath, opts = {}) {
   }
   store.log('parts', `catalogue import ${fileName}: +${stats.inserted} new, ${stats.updated} updated`);
   return stats;
+}
+
+// ONE PART, WRITTEN OR UPDATED.
+//
+// Keyed on the normalised part number, so a later export of the same catalogue
+// updates what it carries instead of duplicating it. A row whose words changed
+// loses its vector on purpose — whatever was embedded describes the old text.
+async function upsertPart(p, fileName, stats) {
+  const searchable = parse.searchableText(p);
+  const r = await db.query(
+    `INSERT INTO bot_parts (part_no, norm_part_no, name, brand, fitment, category, searchable, source_file, active)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,true)
+     ON CONFLICT (norm_part_no) DO UPDATE
+       SET part_no = EXCLUDED.part_no,
+           name = EXCLUDED.name,
+           brand = COALESCE(EXCLUDED.brand, bot_parts.brand),
+           fitment = COALESCE(EXCLUDED.fitment, bot_parts.fitment),
+           category = COALESCE(EXCLUDED.category, bot_parts.category),
+           -- the text changed, so whatever was embedded is stale
+           embedding = CASE WHEN bot_parts.searchable IS DISTINCT FROM EXCLUDED.searchable
+                            THEN NULL ELSE bot_parts.embedding END,
+           searchable = EXCLUDED.searchable,
+           source_file = EXCLUDED.source_file,
+           active = true,
+           updated_at = now()
+     RETURNING (xmax = 0) AS inserted`,
+    [p.partNo, p.normPartNo, p.name, p.brand, p.fitment, p.category, searchable, fileName],
+    null,
+  );
+  if (!r || !r.rows[0]) return;
+  if (r.rows[0].inserted) stats.inserted++;
+  else stats.updated++;
 }
 
 // Embed whatever has no vector yet. Safe to stop and re-run — it picks up

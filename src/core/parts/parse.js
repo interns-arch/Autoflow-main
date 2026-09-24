@@ -49,6 +49,74 @@ function parseCsv(text) {
   return rows.filter((r) => r.some((f) => String(f).trim()));
 }
 
+// THE SAME RULES, ONE CHUNK AT A TIME.
+//
+// parseCsv above holds the whole file as a string and every row as an array.
+// A real catalogue export is 272,000 rows and 56 MB, and that is how the
+// import died: "JavaScript heap out of memory", inside a container capped at
+// 512 MB, having stored nothing at all.
+//
+// This is the identical tokenizer driven incrementally, so the file is read in
+// pieces and rows are handed out as they complete. Memory stays flat whatever
+// the catalogue's size. It matters beyond today: the catalogue is re-exported
+// whenever prices or stock lines change, and an importer that only works on
+// small files is one nobody can use twice.
+//
+// A quoted field may contain a newline, which is why this cannot be a
+// line-by-line reader.
+function rowReader() {
+  let row = [];
+  let field = '';
+  let inQuotes = false;
+  let first = true;
+
+  const complete = (r) => r.some((f) => String(f).trim());
+
+  return {
+    // -> the rows that COMPLETED inside this chunk (often none, sometimes many)
+    push(chunk) {
+      const out = [];
+      let s = String(chunk == null ? '' : chunk);
+      if (first) {
+        s = s.replace(/^﻿/, ''); // Excel writes a BOM
+        first = false;
+      }
+      for (let i = 0; i < s.length; i++) {
+        const c = s[i];
+        if (inQuotes) {
+          if (c === '"') {
+            if (s[i + 1] === '"') {
+              field += '"';
+              i++;
+            } else inQuotes = false;
+          } else field += c;
+          continue;
+        }
+        if (c === '"') inQuotes = true;
+        else if (c === ',' || c === '\t') {
+          row.push(field);
+          field = '';
+        } else if (c === '\n') {
+          row.push(field);
+          if (complete(row)) out.push(row);
+          row = [];
+          field = '';
+        } else if (c !== '\r') field += c;
+      }
+      return out;
+    },
+    // Whatever the last line left behind, when the file did not end in a newline.
+    end() {
+      if (!field.length && !row.length) return [];
+      row.push(field);
+      const last = row;
+      row = [];
+      field = '';
+      return complete(last) ? [last] : [];
+    },
+  };
+}
+
 const norm = (h) => String(h || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
 
 // header name -> what it is. First match wins, so the more specific spellings
@@ -120,43 +188,68 @@ function parseCatalogue(text) {
   const seen = new Set();
 
   for (const r of raw.slice(1)) {
-    const get = (i) => (i === undefined ? '' : String(r[i] == null ? '' : r[i]).trim());
-    const rawName = get(col.name);
-    let partNo = get(col.partNo);
-    let name = rawName;
-
-    // No part-number column: it is inside the name, after the #.
-    if (!partNo && rawName) {
-      const inName = partNoInName(rawName);
-      if (inName) {
-        partNo = inName;
-        name = stripPartNo(rawName);
-      }
-    } else if (rawName) {
-      name = stripPartNo(rawName);
-    }
-
-    if (!partNo || normPartNo(partNo).length < 3) {
-      skipped++;
+    const p = rowToPart(r, col);
+    if (!p || seen.has(p.normPartNo)) {
+      skipped++; // unusable, or the same part listed twice in one export
       continue;
     }
-    const key = normPartNo(partNo);
-    if (seen.has(key)) {
-      skipped++; // the same part listed twice in one export
-      continue;
-    }
-    seen.add(key);
-
-    out.push({
-      partNo,
-      normPartNo: key,
-      name: name || partNo,
-      brand: get(col.brand) || null,
-      fitment: get(col.fitment) || null,
-      category: get(col.category) || null,
-    });
+    seen.add(p.normPartNo);
+    out.push(p);
   }
   return { rows: out, header, skipped };
+}
+
+// ONE ROW OF THE EXPORT -> one part, or null when it carries no usable part
+// number. Shared by the in-memory reader above and the streaming one, so a
+// 200-row file and a 272,000-row file cannot drift into reading the same
+// columns differently.
+function rowToPart(r, col) {
+  const get = (i) => (i === undefined ? '' : String(r[i] == null ? '' : r[i]).trim());
+  const rawName = get(col.name);
+  let partNo = get(col.partNo);
+  let name = rawName;
+
+  // No part-number column: it is inside the name, after the #.
+  if (!partNo && rawName) {
+    const inName = partNoInName(rawName);
+    if (inName) {
+      partNo = inName;
+      name = stripPartNo(rawName);
+    }
+  } else if (rawName) {
+    name = stripPartNo(rawName);
+  }
+
+  if (!partNo || normPartNo(partNo).length < 3) return null;
+
+  return {
+    partNo,
+    normPartNo: normPartNo(partNo),
+    name: name || partNo,
+    brand: get(col.brand) || null,
+    fitment: get(col.fitment) || null,
+    category: get(col.category) || null,
+  };
+}
+
+// Is this header usable, and which column is which? Pulled out so the
+// streaming reader can check the first row and fail loudly before it has
+// inserted a quarter of a million rows against the wrong columns.
+function readHeader(headerRow) {
+  const header = (headerRow || []).map((h) => String(h).trim());
+  const col = mapHeader(header);
+  if (col.partNo === undefined && col.name === undefined) {
+    return {
+      header,
+      col: null,
+      error:
+        'no part-number or name column found. Columns present: ' +
+        header.join(', ') +
+        '. Expected one of: ' +
+        [...COLUMNS.partNo, ...COLUMNS.name].slice(0, 8).join(', '),
+    };
+  }
+  return { header, col, error: null };
 }
 
 // What gets embedded. Part number included on purpose: customers type it, and
@@ -167,4 +260,4 @@ function searchableText(p) {
   return [p.partNo, p.name, p.brand, p.fitment, p.category].filter(Boolean).join(' | ');
 }
 
-module.exports = { parseCatalogue, parseCsv, searchableText, partNoInName, stripPartNo, normPartNo, mapHeader };
+module.exports = { parseCatalogue, parseCsv, rowReader, rowToPart, readHeader, searchableText, partNoInName, stripPartNo, normPartNo, mapHeader };
