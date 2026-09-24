@@ -67,21 +67,75 @@ async function setupCheckpointer() {
 const currentCheckpointer = () => checkpointer;
 const isDurable = () => durable;
 
-// TRIMMING.
+// THE CONTEXT WINDOW.
 //
-// A dealer's chat runs for months. Sending all of it every turn is slow and
-// expensive, and the model only ever needs the recent run-up. Tool messages
-// must stay attached to the AI message that called them, so the window is cut
-// at a clean boundary rather than at a fixed count.
-const KEEP_TURNS = 12;
+// A dealer's chat runs for months. LangGraph's checkpointer keeps every
+// message and every tool result of it for ever, and hands the whole thing to
+// the model on every single turn — so the fiftieth message of the day carries
+// the other forty-nine with it, and the bill and the latency grow all
+// afternoon while the model reads a part number it settled at breakfast.
+//
+// So the model is shown a WINDOW, and the thread keeps everything. This runs
+// in wrapModelCall (see index.js), which changes what is SENT and never what
+// is stored: the checkpoint still holds the whole conversation, so a paused
+// question resumes with its full history and nothing a customer said is
+// thrown away.
+//
+// COUNTED IN TURNS, NOT MESSAGES. One customer turn is rarely one message:
+// "cartend ka horan 5 set" becomes a human message, an AI message asking for
+// a tool, four tool results and a reply — seven. A window of twelve MESSAGES,
+// which is what this file used to say, is therefore a window of one and a half
+// questions, and the customer who asks "aur iska rate?" is answered by a model
+// that can no longer see what "iska" was.
+//
+// A tool result must stay with the AI message that asked for it — Gemini
+// rejects a history that opens on a function response — so the cut is always
+// made at a customer message, never at a fixed offset.
+const KEEP_TURNS = config.agent.contextTurns;
+const HARD_CAP = config.agent.contextMaxMessages;
 
-function trimmed(messages) {
+function typeOf(m) {
+  if (!m) return '';
+  if (typeof m.getType === 'function') return m.getType();
+  if (typeof m._getType === 'function') return m._getType();
+  return String(m.type || m.role || '');
+}
+
+// Where the window starts: the index of the KEEP_TURNS-th customer message
+// counting back from the end, or 0 when the conversation is shorter than that.
+function startOfWindow(list, keepTurns) {
+  let seen = 0;
+  for (let i = list.length - 1; i >= 0; i--) {
+    if (typeOf(list[i]) !== 'human') continue;
+    if (++seen >= keepTurns) return i;
+  }
+  return 0;
+}
+
+function windowed(messages) {
   const list = messages || [];
-  if (list.length <= KEEP_TURNS) return list;
-  // Walk back to the most recent human message at or before the window, so
-  // the slice never starts on an orphaned tool result.
-  let cut = list.length - KEEP_TURNS;
-  while (cut > 0 && (list[cut].getType ? list[cut].getType() : list[cut]._getType()) !== 'human') cut--;
+  if (list.length <= 2) return list;
+
+  let cut = startOfWindow(list, KEEP_TURNS);
+
+  // A RUNAWAY SINGLE TURN. Six turns is normally a few dozen messages, but a
+  // loop that searched, priced, searched again and asked the web can put
+  // twenty in one turn on its own. The cap is the backstop, and it is applied
+  // the same way — forward to the next customer message, never mid-turn.
+  if (list.length - cut > HARD_CAP) {
+    const floor = list.length - HARD_CAP;
+    for (let i = floor; i < list.length; i++) {
+      if (typeOf(list[i]) === 'human') {
+        cut = i;
+        break;
+      }
+    }
+  }
+
+  // Nothing to cut, or nothing safe to cut to: send it as it is. A window that
+  // opens on a tool result is refused by the model, and a refused turn is
+  // worse than an expensive one.
+  if (cut <= 0 || typeOf(list[cut]) !== 'human') return list;
   return list.slice(cut);
 }
 
@@ -103,4 +157,4 @@ function cartNote(chatId) {
   );
 }
 
-module.exports = { setupCheckpointer, currentCheckpointer, isDurable, trimmed, cartNote, KEEP_TURNS };
+module.exports = { setupCheckpointer, currentCheckpointer, isDurable, windowed, cartNote, KEEP_TURNS, HARD_CAP };

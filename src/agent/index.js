@@ -23,7 +23,7 @@
 // The pause is a real LangGraph interrupt: the graph stops inside
 // ask_a_person, the state is checkpointed to Postgres, and resume() puts his
 // words back into the same conversation hours later.
-const { createAgent, dynamicSystemPromptMiddleware, toolCallLimitMiddleware } = require('langchain');
+const { createAgent, createMiddleware, dynamicSystemPromptMiddleware, toolCallLimitMiddleware } = require('langchain');
 const { Command } = require('@langchain/langgraph');
 const { ChatGoogleGenerativeAI } = require('@langchain/google-genai');
 
@@ -64,6 +64,16 @@ const TOOLS = [
 ];
 
 let agent = null;
+// WHICH checkpointer the cached agent holds.
+//
+// setupCheckpointer swaps a MemorySaver for the Postgres one at boot, and
+// build() caches the agent for the life of the process. A customer message
+// landing in the seconds BEFORE that swap — warmUp is fire-and-forget, and the
+// relay starts polling immediately — built an agent around the in-memory saver
+// and kept it for ever, while the boot log said "checkpointed to Postgres".
+// Every question paused for the specialist would then be lost on the next
+// deploy, silently, which is the one failure this design exists to rule out.
+let builtWith = null;
 
 function enabled() {
   return Boolean(config.agent.enabled && config.gemini && config.gemini.apiKey);
@@ -101,7 +111,8 @@ async function warmUp() {
 }
 
 function build() {
-  if (agent) return agent;
+  if (agent && builtWith === memory.currentCheckpointer()) return agent;
+  builtWith = memory.currentCheckpointer();
   agent = createAgent({
     model: new ChatGoogleGenerativeAI({
       model: config.agent.model,
@@ -115,17 +126,35 @@ function build() {
     systemPrompt: SYSTEM,
     // The conversation, keyed on chat id. Durable, because a paused question
     // has to survive a deploy — see memory.js.
-    checkpointer: memory.currentCheckpointer(),
+    checkpointer: builtWith,
     middleware: [
       // The cart, re-read from core/orders on every single turn.
       dynamicSystemPromptMiddleware((state, runtime) => SYSTEM + '\n\n' + memory.cartNote(threadOf(runtime))),
       // A loop that will not settle costs money and leaves the customer
       // waiting. Normal is two to four calls.
       toolCallLimitMiddleware({ runLimit: config.agent.maxToolCalls }),
+      // THE CONTEXT WINDOW. The thread keeps every message ever sent; the model
+      // is shown the last few turns of it. Done in wrapModelCall — which
+      // changes the REQUEST and never the state — so the checkpoint stays whole
+      // and a question paused this morning still resumes with its history.
+      contextWindow,
     ],
   });
   return agent;
 }
+
+// THE LAST FEW TURNS, NOT THE LAST FEW MONTHS. See memory.windowed().
+const contextWindow = createMiddleware({
+  name: 'ContextWindow',
+  wrapModelCall: (request, handler) => {
+    const all = (request && request.messages) || [];
+    const few = memory.windowed(all);
+    if (few.length !== all.length) {
+      store.log('agent', `context window: ${few.length} of ${all.length} message(s) sent to the model`);
+    }
+    return handler({ ...request, messages: few });
+  },
+});
 
 // The chat id, wherever this version of LangGraph happens to put it.
 function threadOf(runtime) {

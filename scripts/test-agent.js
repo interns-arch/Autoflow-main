@@ -122,6 +122,73 @@ async function toolChecks() {
   } finally {
     cfg2.agent.allowFrom = saved;
   }
+
+  // -------------------------------------------------- the context window
+  //
+  // A dealer's chat runs for months and the checkpointer keeps all of it. What
+  // the MODEL sees is the last few turns — and the rules that make that safe
+  // rather than merely cheap are all about where the cut lands.
+  console.log('\nCONTEXT WINDOW (offline — no model)\n');
+  const agentMemory = require('../src/agent/memory');
+  const cfg3 = require('../src/config');
+
+  // The shapes a real thread is made of. A tool result must never lead.
+  const human = (t) => ({ getType: () => 'human', content: t });
+  const ai = (t) => ({ getType: () => 'ai', content: t });
+  const toolMsg = (t) => ({ getType: () => 'tool', content: t, name: 'check_stock_and_price' });
+  // One customer question, as it really arrives: a message, a tool call, its
+  // result, and the reply. Four messages for one turn — which is why the
+  // window counts turns and not messages.
+  const turn = (n) => [human('question ' + n), ai('calling a tool'), toolMsg('{"parts":[]}'), ai('answer ' + n)];
+
+  const short = [...turn(1), ...turn(2)];
+  ok('a short conversation is sent whole', agentMemory.windowed(short).length === short.length);
+
+  const long = [];
+  for (let i = 1; i <= 20; i++) long.push(...turn(i));
+  const win = agentMemory.windowed(long);
+  ok(
+    'a long one is cut down',
+    win.length < long.length && win.length > 0,
+    win.length + ' of ' + long.length,
+  );
+  ok(
+    'it opens on a customer message, never on a tool result',
+    win[0].getType() === 'human',
+    'it opened on a ' + win[0].getType() + ' — Gemini refuses a history that starts on a function response',
+  );
+  ok(
+    'it keeps the configured number of turns',
+    win.filter((m) => m.getType() === 'human').length === cfg3.agent.contextTurns,
+    win.filter((m) => m.getType() === 'human').length + ' turns, expected ' + cfg3.agent.contextTurns,
+  );
+  ok('the newest message survives the cut', win[win.length - 1] === long[long.length - 1]);
+  ok(
+    'every tool result still follows the message that asked for it',
+    win.every((m, i) => m.getType() !== 'tool' || (win[i - 1] && win[i - 1].getType() === 'ai')),
+  );
+
+  // ONE TURN THAT WENT ROUND AND ROUND. Six turns is normally a few dozen
+  // messages; a single turn that searched, priced, searched again and asked
+  // the web can be twenty on its own, and the cap is what bounds that.
+  const runaway = [human('find me this part')];
+  for (let i = 0; i < 90; i++) runaway.push(ai('tool'), toolMsg('{}'));
+  runaway.push(human('aur iska rate?'), ai('the price'));
+  const capped = agentMemory.windowed(runaway);
+  ok(
+    'a runaway turn is capped',
+    capped.length <= agentMemory.HARD_CAP + 4,
+    capped.length + ' messages, cap is ' + agentMemory.HARD_CAP,
+  );
+  ok('...and the cap still cuts at a customer message', capped[0].getType() === 'human');
+
+  // The window changes what is SENT, never what is stored — so it must not
+  // touch the array it was given.
+  const before = long.length;
+  agentMemory.windowed(long);
+  ok('it never edits the thread it was handed', long.length === before);
+
+  ok('an empty thread is not a crash', agentMemory.windowed([]).length === 0 && agentMemory.windowed(null).length === 0);
 }
 
 // ------------------------------------------------------------ the agent

@@ -375,6 +375,19 @@ const config = {
     // A runaway loop costs money and makes a customer wait. Measured: a
     // normal part-and-price turn is 2 to 4 tool calls.
     maxToolCalls: parseInt(process.env.AGENT_MAX_TOOL_CALLS || '10', 10),
+
+    // THE CONTEXT WINDOW — how much of the conversation the model is shown.
+    //
+    // In CUSTOMER TURNS, because a turn is not a message: one part question
+    // becomes a human message, a tool call, its results and a reply. Six turns
+    // is roughly the last twenty minutes of a live chat, which is what "iska
+    // rate kya hai" needs and more than "kal wala bhej do" ever gets.
+    //
+    // The thread itself keeps everything — this only decides what is SENT. See
+    // agent/memory.js.
+    contextTurns: parseInt(process.env.AGENT_CONTEXT_TURNS || '6', 10),
+    // The backstop for one turn that went round and round on its own.
+    contextMaxMessages: parseInt(process.env.AGENT_CONTEXT_MAX_MESSAGES || '60', 10),
     // THE OPEN WEB, for finding a part number our own sources do not have.
     // Grounded search runs through Gemini on the key the bot already holds,
     // so there is no second vendor and no second bill. Flash rather than
