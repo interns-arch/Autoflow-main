@@ -382,15 +382,21 @@ async function answer(chatId, m, text, t) {
   // without counting.
   if (field.type === 'gst' && m && m.mediaBase64 && /^image\//.test(m.mediaMime || '')) {
     const read = await require('../integrations/gst').readFromImage(m.mediaBase64, m.mediaMime);
+
+    // NO GSTIN IN IT? THEN IT WAS NEVER FOR THE FORM.
+    //
+    // 22 Sep, live: with the form open, a customer sent a photo of two parts
+    // and asked what they cost. A form that eats every photo answers nothing
+    // they asked and burns a try doing it. So the form claims a photo only
+    // when a GST number is actually in it; anything else is passed on exactly
+    // as before, and the form goes on waiting.
+    //
+    // This also covers the photo that simply could not be read — a failed
+    // vision call is indistinguishable from a picture of a gearbox, and
+    // guessing between them is how the wrong one gets claimed.
     if (!read || read.error === 'none') {
-      return {
-        reply: t(
-          'I could not find a GST number in that photo. Send a clearer picture of the certificate, or just type the number.',
-          'Is photo mein GST number nahi mila. Certificate ki saaf photo bhejiye, ya number type kar dijiye.',
-        ),
-        done: false,
-        form,
-      };
+      store.log('create', `${chatId}: a photo at the GST step held no GST number - passed on, form waits`);
+      return null;
     }
     if (read.error === 'shape') {
       return {
