@@ -74,36 +74,14 @@ class CloudTransport {
     return id;
   }
 
-  // REPLY BUTTONS. Up to three, each with an id we get back when it is
-  // tapped — the customer taps instead of typing, and we read an exact
-  // string instead of guessing at "haan ok kardo".
+  // NO REPLY BUTTONS. This transport used to send them, and they were taken
+  // out on purpose: the bot talks like a person at a parts counter, and a
+  // person asks a question and reads the answer. Every question that carried
+  // buttons already asked itself in words and reads a typed reply.
   //
-  // Cloud API only. The linked (QR) transport cannot send these at all, so
-  // the base class falls back to writing the choices out as text and the
-  // caller must accept either — see transport.js.
-  async sendButtons(number, text, buttons) {
-    const to = store.normPhone(number);
-    const three = (buttons || []).slice(0, 3).map((b) => ({
-      type: 'reply',
-      // 20 characters is the Cloud API's limit on a button title; a longer
-      // one is rejected for the whole message, not trimmed.
-      reply: { id: String(b.id).slice(0, 256), title: String(b.title).slice(0, 20) },
-    }));
-    if (!three.length) return this.sendText(number, text);
-    const data = await this._post(`${config.cloud.phoneNumberId}/messages`, {
-      messaging_product: 'whatsapp',
-      to,
-      type: 'interactive',
-      interactive: {
-        type: 'button',
-        // 1024 characters on the body of an interactive message.
-        body: { text: String(text).slice(0, 1024) },
-        action: { buttons: three },
-      },
-    });
-    store.log(this.botKey, `send -> ${to} [cloud, ${three.length} button(s)]: ${String(text).slice(0, 100).replace(/\n/g, ' | ')}`);
-    return (data && data.messages && data.messages[0] && data.messages[0].id) || null;
-  }
+  // The INBOUND side still understands a tap (see the webhook parser below),
+  // because buttons already sent sit in customers' chats and can be tapped
+  // days later.
 
   // Send a FILE. Two steps: upload the bytes to get a media id, then send a
   // message referencing it. A 71-line order does not belong in a chat bubble —

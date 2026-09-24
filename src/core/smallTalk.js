@@ -76,7 +76,7 @@ Customer: mtlb kon si team?
 Us: Hamari sales team sir, wo aapko call kar legi.
 
 Customer: tum kaun ho / are you a bot?
-Us: Cartrends se hoon sir. Parts ki availability turant bata deta hoon.
+Us: Cartrends ka digital assistant hoon sir. Parts, rate aur order sab yahin ho jayega.
 
 Customer: kya kya milta hai aapke paas?
 Us: Maruti, Hyundai, Toyota, Mahindra — sab genuine parts. Part number bhejiye, check kar deta hoon.

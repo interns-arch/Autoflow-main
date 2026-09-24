@@ -86,6 +86,18 @@ const nudges = new Map();
 // On disk (core/chatState): a restart between the question and the yes must
 // not turn that yes into an order.
 const pendingCancel = require('../core/chatState').slot('cancelAsk');
+// "You already have an account — is this one for someone else?", just asked.
+//
+// That question used to carry two buttons, and the button carried the meaning:
+// a tap on "Nahi, rehne do" was the only "no" ever read as an answer to it,
+// because a bare "nahi" typed into a chat is an answer to whatever ELSE is open
+// — a cart, a closest-match part — and stealing it here would break those.
+// There are no buttons any more; the customer just answers. So the question is
+// remembered for a few minutes, and "haan" / "nahi" typed while it is the open
+// question are read as the answer to it. Any other message means they have
+// moved on, and the question is dropped.
+const createAsk = require('../core/chatState').slot('createAsk');
+const CREATE_ASK_MS = 10 * 60 * 1000;
 
 // Every message of a chat by its WhatsApp id, for a while - the last 40 each
 // way. WhatsApp tells us WHICH message a swipe-reply quotes, never what it
@@ -528,7 +540,21 @@ class CustomerBot {
     //
     // Whoever asked the question answers it. Once those close, the chat is
     // the agent's like any other.
-    const oldQuestionOpen = Boolean(askQty.get(m.chatId) || clarify.get(m.chatId) || voiceOrder.get(m.chatId));
+    // The "someone else's account?" question, if it is the one open.
+    const askedCreate = createAsk.get(m.chatId);
+    let createAnswer = null;
+    if (askedCreate) {
+      if (Date.now() - (askedCreate.at || 0) > CREATE_ASK_MS) createAsk.delete(m.chatId);
+      else if (customerCreate.wantsSomeoneElse(text) || NEAR_YES.test(text)) createAnswer = 'yes';
+      else if (customerCreate.declinedCreate(text) || NEAR_NO.test(text)) createAnswer = 'no';
+      // Anything else: they have moved on. A "haan" ten messages later is
+      // about something else entirely.
+      else createAsk.delete(m.chatId);
+    }
+
+    const oldQuestionOpen = Boolean(
+      askQty.get(m.chatId) || clarify.get(m.chatId) || voiceOrder.get(m.chatId) || createAnswer,
+    );
 
     const notForTheAgent =
       oldQuestionOpen ||
@@ -573,16 +599,18 @@ class CustomerBot {
     // The other button on "you already have an account". Only meaningful
     // when we just asked - "nahi" on its own is an answer to whatever else
     // is open, and stealing it here would break every other question.
-    if (m.buttonId && customerCreate.declinedCreate(text)) {
-      return reply(t('Theek hai sir. Part number bhejiye, check kar deta hoon.', 'Theek hai sir. Part number bhejiye, check kar deta hoon.'));
+    if ((m.buttonId && customerCreate.declinedCreate(text)) || createAnswer === 'no') {
+      createAsk.delete(m.chatId);
+      return reply(t('No problem. Send me a part number whenever you need one.', 'Theek hai. Jab bhi koi part chahiye, bata dijiye.'));
     }
 
-    if (customerCreate.wantsToStart(text) || customerCreate.wantsSomeoneElse(text)) {
+    if (createAnswer === 'yes' || customerCreate.wantsToStart(text) || customerCreate.wantsSomeoneElse(text)) {
+      createAsk.delete(m.chatId);
       // A SALES AGENT is never told they already have an account: opening
       // one for a customer standing at their counter is their job, and the
       // account goes on the portal under their name.
       const agent = customerCreate.agentName(m.from);
-      const forElse = customerCreate.wantsSomeoneElse(text);
+      const forElse = createAnswer === 'yes' || customerCreate.wantsSomeoneElse(text);
 
       if (!agent && !forElse) {
         const already = await customers.resolve(m.from).catch(() => ({ found: null }));
@@ -606,18 +634,15 @@ class CustomerBot {
           // Saying only "you already have one" ends a conversation that
           // was about to open an account.
           store.log(this.key, `${m.from} asked to create an account but already has one (${already.name})`);
-          const msg = t(
-            `You already have an account with us${already.name ? ' — ' + already.name : ''}. Opening one for someone else?`,
-            `Aapka account already hai${already.name ? ' — ' + already.name : ''}. Kisi aur ka account banana hai kya?`,
+          // Asked as a question and answered in words: "haan" or "nahi" in the
+          // next few minutes is read as the answer (see createAsk above).
+          createAsk.set(m.chatId, { at: Date.now() });
+          return reply(
+            t(
+              `You already have an account with us${already.name ? ' — ' + already.name : ''}. Is this one for someone else?`,
+              `Aapka account pehle se hai${already.name ? ' — ' + already.name : ''}. Kisi aur ke liye banana hai?`,
+            ),
           );
-          if (this.transport.sendButtons) {
-            await this.transport.sendButtons(m.from, msg, [
-              { id: 'CREATE_FOR_OTHER', title: 'Kisi aur ka' },
-              { id: 'CREATE_NO', title: 'Nahi, rehne do' },
-            ]);
-            return true;
-          }
-          return reply(msg + t('\n\nReply "kisi aur ka" to open one.', '\n\n"kisi aur ka" likh dijiye to bana dete hain.'));
         }
       }
       store.log(this.key, `${m.from} asked to open an account${forElse ? ' for someone else' : ''}${agent ? ' (agent: ' + agent + ')' : ''}`);
@@ -2230,22 +2255,9 @@ class CustomerBot {
       `*${q.partNo}*${packNote}${q.name ? ' — ' + q.name : ''}\n` +
       `${price ? price + ' · ' : ''}${stock}\n\n` +
       t(`${q.qty} ${unit} of this one?`, `Yahi chahiye, ${q.qty} ${unit}?`);
-    const text = lead ? lead + '\n\n' + body : body;
-    const group = String(m.chatId || '').endsWith('@g.us') || m.isGroup;
-    if (this.transport.sendButtons && !group) {
-      try {
-        const id = await this.transport.sendButtons(m.from, text, [
-          { id: 'NEAR_YES', title: t('Yes', 'Haan') },
-          { id: 'NEAR_NO', title: t('No', 'Nahi') },
-        ]);
-        conversation.record(m.chatId, 'us', text);
-        rememberMsg(m.chatId, id, 'us', text);
-        return true;
-      } catch (e) {
-        store.log(this.key, 'near-match buttons failed, sending text: ' + String((e && e.message) || e).slice(0, 80));
-      }
-    }
-    return reply(text + '\n\n' + t('Reply Yes or No', 'Haan ya Nahi likhiye'));
+    // It already ends in the question ("Yahi chahiye, 5 pcs?"), and a person
+    // answers a question: no "Reply Yes or No" under it, and no buttons.
+    return reply(lead ? lead + '\n\n' + body : body);
   }
 
   async answerNear(m, yes, reply, t) {
@@ -2770,22 +2782,16 @@ class CustomerBot {
   // portal is touched (founder, 22 Sep). A part-wise rule is set by the
   // lowest price the part may be sold at: the portal's MRP is shown, the
   // price is asked, and the percentage is worked out from the two.
-  async askDiscount(m, text, buttons, t) {
-    const group = String(m.chatId || '').endsWith('@g.us') || m.isGroup;
-    if (buttons && this.transport.sendButtons && !group) {
-      try {
-        const id = await this.transport.sendButtons(m.from, text, buttons);
-        conversation.record(m.chatId, 'us', text);
-        rememberMsg(m.chatId, id, 'us', text);
-        return true;
-      } catch (e) {
-        store.log(this.key, 'discount buttons failed, sending text: ' + String((e && e.message) || e).slice(0, 80));
-      }
-    }
-    const out = buttons ? text + '\n\n' + buttons.map((b) => '• ' + b.title).join('\n') : text;
-    const id = await this.transport.sendToChat(m.chatId, out);
-    conversation.record(m.chatId, 'us', out);
-    rememberMsg(m.chatId, id, 'us', out);
+  // Every question in this flow already asks itself in words — "Brand wise ya
+  // Part wise?", "Ye rule approval ke liye bhejun?" — and every step reads a
+  // typed answer. So the question goes out as it is: no buttons, and no menu
+  // of bullet points under it. Callers still pass `buttons`; it is ignored
+  // here, so the step logic, and a tap on an old button still sitting in
+  // someone's chat, keep working.
+  async askDiscount(m, text) {
+    const id = await this.transport.sendToChat(m.chatId, text);
+    conversation.record(m.chatId, 'us', text);
+    rememberMsg(m.chatId, id, 'us', text);
     return true;
   }
 
@@ -3153,7 +3159,11 @@ class CustomerBot {
         ]);
       }
       case 'more': {
-        if (discountSetup.YES.test(said) || m.buttonId === 'DSC_MORE_YES') {
+        // "done", "bas", "itna hi" mean STOP here, even though "done" is a yes
+        // at the confirm step. With a button it never mattered which word was
+        // typed; answered in words, "done" would have started another rule.
+        const finished = /^(done|bas|bas itna|itna hi|that'?s all|no more|enough)\b/i.test(said) || m.buttonId === 'DSC_MORE_NO';
+        if (!finished && (discountSetup.YES.test(said) || m.buttonId === 'DSC_MORE_YES')) {
           return next('type', t('Brand-wise or part-wise?', 'Brand wise ya Part wise?'), this.discountTypeButtons(t));
         }
         discountSetup.cancel(m.chatId);

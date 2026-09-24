@@ -2337,6 +2337,10 @@ async function main() {
   check('...a number with no match goes to a person', /71799Z99Z99/.test(asked20) && /Checking 71799Z99Z99|71799Z99Z99 check kar raha/i.test(near20.said));
   check('...who sees the customer\'s name and the whole list', /Mock Customer/.test(asked20) && /_Their message:_[\s\S]*71761m67LA0 4 pcs/.test(asked20));
   check('...and the part that WAS found is already in the order', (orders.findDraft('sim-919000000210') || { lines: [] }).lines.length === 1);
+  check(
+    '...asked as a plain question — no "Reply Yes or No" under it',
+    !/Reply Yes or No|Haan ya Nahi likhiye/i.test(near20.said),
+  );
   const near20b = await rate20('919000000210', 'haan');
   check('"haan" adds the close match with the quantity asked', (orders.findDraft('sim-919000000210').lines.find((l) => /71761M67LA05PK/.test(l.partNo || l.item)) || {}).qty === 4);
   check('...and the next one is asked', /\(2\/2\)/.test(near20b.said) && /71791M85S005PK/.test(near20b.said));
@@ -2493,6 +2497,35 @@ async function main() {
       const id23 = dscIn20(await say20(CUST22, 'Haan', 'DSC_YES'));
       await say20(APPR20, 'NO ' + id23);
       check('"NO DSC-…" changes nothing', (await portal.listDiscountRules())[0].discount_value === 15);
+
+      // ---- the same flow with NOTHING TAPPED ----
+      // The bot sends no buttons any more, so every step above has to work
+      // typed. No buttonId anywhere below.
+      const AGENT24 = '919000000303';
+      const form24 = {
+        chatId: 'sim-' + AGENT24,
+        byName: 'Shubham',
+        answers: { requestId: 'WA-DSC24', phone: '919000000304', name: 'SHARMA AUTO', businessType: 'retailer', contactPerson: 'Sharma', email: 's@example.com', gstNo: '06CIYPK2053H1ZZ', city: 'Gurgaon', state: 'Haryana', pin: '122001', address: 'Shop 4' },
+      };
+      cc20.park(form24);
+      customer.transport.outbox.length = 0;
+      await customer.startDiscountSetup({ chatId: form24.chatId, from: AGENT24 }, form24, tt20);
+      const ask24 = text20(customer.transport.outbox);
+      check('typed only: the question is a question, with no menu of bullets under it', /Brand wise ya Part wise/.test(ask24) && !/•/.test(ask24));
+      await say20(AGENT24, 'Brand wise');
+      // Only a "Brand wise" that was understood makes the next word a brand.
+      check('...typed "Brand wise" is understood', /CARTRENDS — kitna discount/.test(text20(await say20(AGENT24, 'cartrend'))));
+      await say20(AGENT24, '10');
+      for (let i = 0; i < 4; i++) await say20(AGENT24, 'skip');
+      await say20(AGENT24, '3 mahine');
+      const sent24 = await say20(AGENT24, 'haan');
+      check('...typed "haan" sends it for approval', Boolean(dscIn20(sent24)));
+      const done24 = text20(await say20(AGENT24, 'done'));
+      check(
+        '...and typed "done" at "another rule?" FINISHES — it does not start another',
+        /Ho gaya|Done —/.test(done24) && !/Brand wise ya Part wise/.test(done24),
+        done24.slice(0, 120),
+      );
     } finally {
       cr20.approvers = apprWas20;
       dpCfg20.listPriceAccountId = listWas20;
@@ -2503,6 +2536,48 @@ async function main() {
         { part_no: '71791M85S005PK', name: 'BUMPER | ERTIGA/SWIFT | FRONT LOWER', quantity: 26, price: 500, mrp: 560, vendor: 'K' },
       ]);
     }
+  }
+
+  // ---- [20c] no buttons: asked in words, answered in words ----
+  // The bot talks like the man at the counter. It sends no WhatsApp buttons,
+  // so a question that used to carry them has to understand a typed answer —
+  // and must not steal a "haan" that belongs to something else.
+  console.log('\n[20c] no buttons: asked in words, answered in words');
+  {
+    const { CloudTransport } = require('../src/wa/cloudTransport');
+    check(
+      'no transport can send a WhatsApp button',
+      typeof customer.transport.sendButtons === 'undefined' && typeof CloudTransport.prototype.sendButtons === 'undefined',
+    );
+    const cc20c = require('../src/core/customerCreate');
+    const say20c = async (from, body) => {
+      customer.transport.outbox.length = 0;
+      await customer.transport.injectIncoming({ from, chatId: 'sim-' + from, isGroup: false, body, mediaType: 'chat' });
+      return customer.transport.outbox.map((o) => o.text || '').join('\n');
+    };
+    // The mock portal knows every number, so each of these is "already a
+    // customer" — exactly the branch that used to send two buttons.
+    const U1 = '919000000401';
+    const q1 = await say20c(U1, 'create customer');
+    check(
+      'an existing customer asking for an account is asked in words',
+      /for someone else\?|Kisi aur ke liye banana hai\?/.test(q1) && !/•|likh dijiye|Reply "/.test(q1),
+      q1.slice(0, 120),
+    );
+    const no1 = await say20c(U1, 'nahi');
+    check('..."nahi" typed back is read as the answer to it', /part number whenever|Jab bhi koi part chahiye/.test(no1), no1.slice(0, 120));
+    await say20c(U1, 'create customer');
+    const yes1 = await say20c(U1, 'haan');
+    check('..."haan" typed back opens one for someone else', /Whose account|Kiska account/.test(yes1), yes1.slice(0, 120));
+    cc20c.cancel('sim-' + U1);
+
+    // They asked, then moved on. A "haan" later belongs to something else.
+    const U2 = '919000000402';
+    await say20c(U2, 'create customer');
+    await say20c(U2, 'kya aap sunday ko khule hain');
+    const late2 = await say20c(U2, 'haan');
+    check('...once they move on, a later "haan" does not open an account', !/Whose account|Kiska account/.test(late2), late2.slice(0, 120));
+    cc20c.cancel('sim-' + U2);
   }
 
   // "2 box" is two boxes, whatever each holds; "4 pcs" is four pieces.
