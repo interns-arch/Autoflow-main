@@ -53,6 +53,7 @@ const TOOLS = [
   cart.confirmOrder,
   cart.cancelOrder,
   knowledge.answerBusinessQuestion,
+  knowledge.answerGeneralChat,
   knowledge.findSimilarPastQuestion,
   fulfilment.lookupCustomer,
   fulfilment.orderStatus,
@@ -73,8 +74,21 @@ function enabled() {
 // that turning the flag on by accident cannot put a model in front of a
 // paying customer.
 function allowed(phone) {
+  const list = config.agent.allowFrom;
+  if (!list.length) return false; // the default: nobody, even when enabled
+
+  // EVERYONE. AGENT_ALLOW_FROM=* means every customer's message is written by
+  // the model rather than by a template.
+  //
+  // It is spelled as a deliberate, ugly wildcard rather than "empty means all"
+  // because the two mistakes are not equally bad: an empty list that meant
+  // everyone would put a model in front of every paying customer the first
+  // time somebody set AGENT_ENABLED while experimenting. An empty list means
+  // nobody, and turning it on for the whole shop has to be typed out.
+  if (list.includes('*')) return true;
+
   const p = store.normPhone(phone || '');
-  return Boolean(p && config.agent.allowFrom.includes(p));
+  return Boolean(p && list.includes(p));
 }
 
 // Called once at boot, so the Postgres checkpointer is ready before the first

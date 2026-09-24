@@ -502,7 +502,43 @@ class CustomerBot {
     // the bot behaves as it always has. If the agent RAN but has nothing to
     // add — because a tool has already messaged the customer — nothing more
     // is sent, because the alternative is answering the same person twice.
-    if (agent.enabled() && agent.allowed(m.from)) {
+    // THREE THINGS ARE NOT A CONVERSATION, and stay deterministic however
+    // wide the agent is switched on:
+    //
+    //   opening an account   a twelve-question form that collects a shop
+    //                        photograph and a dropped pin. The model has no
+    //                        tool for it and would answer with sympathy.
+    //   changing a discount  goes to a Sales Head for approval before the
+    //                        portal is touched. Not the model's to grant.
+    //   a number plate       "DL7CW1692" is a car. It goes to VAHAN, and the
+    //                        answer is remembered so the next message can say
+    //                        "is gaadi ka bumper".
+    //
+    // Each is a handler a few lines below this one, and each would be
+    // silently lost the moment AGENT_ALLOW_FROM was widened. Naming them here
+    // is the difference between "every sales message is written by the model"
+    // and "three features quietly stopped working".
+    //
+    // AND a question the OLD path already asked, which this message is the
+    // answer to. The day the agent is switched on for everybody, some
+    // conversations are mid-sentence: "kitne chahiye?" is on screen, or a
+    // numbered list is waiting to be picked from. The agent knows nothing
+    // about those — they were never in its thread — so it would read "2" as
+    // a brand new message and the customer would have to start again.
+    //
+    // Whoever asked the question answers it. Once those close, the chat is
+    // the agent's like any other.
+    const oldQuestionOpen = Boolean(askQty.get(m.chatId) || clarify.get(m.chatId) || voiceOrder.get(m.chatId));
+
+    const notForTheAgent =
+      oldQuestionOpen ||
+      (m.buttonId && customerCreate.declinedCreate(text)) ||
+      customerCreate.wantsToStart(text) ||
+      customerCreate.wantsSomeoneElse(text) ||
+      (discountSetup.CHANGE_RE.test(text) && !discountSetup.pending(m.chatId)) ||
+      vahan.isOnlyPlate(text);
+
+    if (!notForTheAgent && agent.enabled() && agent.allowed(m.from)) {
       const who = await customers.resolve(m.from).catch(() => null);
       const res = await agent.handle({
         bot: this,

@@ -14,6 +14,7 @@ const { z } = require('zod');
 
 const kb = require('../../core/kb');
 const history = require('../../core/history');
+const smallTalk = require('../../core/smallTalk');
 const { contextFrom } = require('../context');
 
 const answerBusinessQuestion = tool(
@@ -78,4 +79,49 @@ const findSimilarPastQuestion = tool(
   },
 );
 
-module.exports = { answerBusinessQuestion, findSimilarPastQuestion };
+// EVERYTHING ELSE A DEALER SAYS.
+//
+// Not every message is a part or a policy. "Kaise ho bhai", "aap log Sunday
+// khulte ho?", "delivery karte ho?" — the bot has always had an answer for
+// these, written by core/smallTalk against a brief that has been tuned on the
+// live line for months.
+//
+// It nearly got thrown away. With the agent answering every message, that
+// module sat below the agent and was never reached, so questions the bot used
+// to handle in one second went to the specialist instead — and with no
+// approved knowledge yet, that is every single one of them. Wrapping it keeps
+// the behaviour and keeps the guardrails, which are the important part: the
+// brief forbids stating a price, a stock figure or a delivery date, and
+// fenceFails throws the answer away if it does.
+const answerGeneralChat = tool(
+  async ({ message }, config) => {
+    const ctx = contextFrom(config);
+    let out = null;
+    try {
+      out = await smallTalk.respond(ctx.chatId, String(message || '').trim(), ctx.phone, { noHuman: true });
+    } catch (e) {
+      return JSON.stringify({ answered: false, why: 'could not be answered conversationally' });
+    }
+    // null means "not conversation" — a part number was in it, or there is no
+    // model. silent means the message needs no reply at all.
+    if (!out) return JSON.stringify({ answered: false, why: 'this is not general conversation — treat it as a part or a policy question' });
+    if (out.action === 'silent' || !out.text) {
+      return JSON.stringify({ answered: true, reply: null, note: 'nothing needs saying to this — send nothing' });
+    }
+    return JSON.stringify({
+      answered: true,
+      reply: out.text,
+      note: 'Send this as it stands, or say the same thing in your own words. Do not add a price, a stock figure or a delivery date to it.',
+    });
+  },
+  {
+    name: 'answer_general_chat',
+    description:
+      'Answer ordinary conversation and general questions about the shop that are not covered by approved knowledge — greetings, "kaise ho", "aap log Sunday khulte ho", "delivery karte ho", small complaints, thanks. ' +
+      'Use it AFTER answer_business_question comes back with nothing, and BEFORE ask_a_person: most of these never needed a colleague, and escalating them all would bury him. ' +
+      'It will not state a price, a stock figure or a delivery date, and neither may you. If it says this is not general conversation, treat the message as a part question instead.',
+    schema: z.object({ message: z.string().describe('the customer\'s message, exactly as they wrote it') }),
+  },
+);
+
+module.exports = { answerBusinessQuestion, findSimilarPastQuestion, answerGeneralChat };

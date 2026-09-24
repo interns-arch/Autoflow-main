@@ -765,7 +765,15 @@ async function create(
   // bot losing the thread — which is exactly what it looked like on the live
   // line today.
   const NO_FALLBACK = ['NOT_A_PART', 'DOCUMENT', 'VOICE'];
-  if (!NO_FALLBACK.includes(e.reason)) {
+  // AND NEVER WHEN THE AGENT IS DRIVING.
+  //
+  // The agent has already told this customer that a specialist is reviewing
+  // it, and it owns the next thing they hear. A timeout message from here is
+  // a second voice arriving five minutes later — live, that was an English
+  // "do you deliver to Gurgaon?" answered with "Exact part number bhej
+  // dijiye". The specialist is still being waited on either way; the customer
+  // simply is not nagged while it happens.
+  if (!NO_FALLBACK.includes(e.reason) && !e.agentThread) {
     // last line of defence: a rejected promise inside a timer is unhandled and
     // would crash the process minutes after the message that started it
     e.timer = setTimeout(() => {

@@ -100,6 +100,28 @@ async function toolChecks() {
   // rate that is not the customer's.
   const memory = require('../src/agent/memory');
   ok('the cart note for an empty cart says so', memory.cartNote('nobody@c.us').includes('empty'));
+
+  // WHO REACHES THE MODEL.
+  //
+  // The default has to be nobody, because the failure is silent and expensive:
+  // a flag set while experimenting would otherwise put a model in front of
+  // every paying customer. "Everyone" has to be typed out.
+  const agentMod = require('../src/agent');
+  const cfg2 = require('../src/config');
+  const saved = cfg2.agent.allowFrom;
+  try {
+    cfg2.agent.allowFrom = [];
+    ok('an empty allow-list means nobody, not everybody', !agentMod.allowed('919999492550'));
+
+    cfg2.agent.allowFrom = ['919999492550'];
+    ok('a listed number is allowed', agentMod.allowed('919999492550'));
+    ok('an unlisted number is not', !agentMod.allowed('917355374975'));
+
+    cfg2.agent.allowFrom = ['*'];
+    ok('"*" means every customer', agentMod.allowed('917355374975') && agentMod.allowed('919999492550'));
+  } finally {
+    cfg2.agent.allowFrom = saved;
+  }
 }
 
 // ------------------------------------------------------------ the agent

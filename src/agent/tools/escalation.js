@@ -125,7 +125,21 @@ const askAPerson = tool(
         item: what,
         qty: Number(qty) || 1,
         kind: 'order',
-        reason: reason === 'no_part_number' ? 'NO_PART_NUMBER' : 'NOT_IN_CATALOGUE',
+        // WHAT KIND OF QUESTION THIS IS decides what the customer hears if
+        // the specialist is slow. A part question that times out asks them
+        // for the exact part number, which is helpful. The same line after
+        // "do you deliver to Gurgaon?" is the bot losing the thread — seen
+        // exactly that, live: an English delivery question answered five
+        // minutes later with "Exact part number bhej dijiye".
+        //
+        // NOT_A_PART is on escalation's no-fallback list, so a business
+        // question waits quietly instead.
+        reason:
+          reason === 'business_question'
+            ? 'NOT_A_PART'
+            : reason === 'no_part_number'
+              ? 'NO_PART_NUMBER'
+              : 'NOT_IN_CATALOGUE',
         context,
         // Marks this as the agent's question, so that when the answer lands
         // core/escalation hands it back to THIS paused conversation instead
@@ -194,8 +208,11 @@ const askAPerson = tool(
       item: z.string().describe('what the customer asked for, in their own words — this is what the specialist will read'),
       qty: z.number().int().optional().describe('how many they want, if they said'),
       reason: z
-        .enum(['not_in_catalogue', 'no_part_number'])
-        .describe('"not_in_catalogue" when nothing matched anywhere; "no_part_number" when you know the part but not its number'),
+        .enum(['not_in_catalogue', 'no_part_number', 'business_question'])
+        .describe(
+          '"not_in_catalogue" when nothing matched anywhere; "no_part_number" when you know the part but not its number; ' +
+            '"business_question" when it is not about a part at all — delivery, payment, timings, returns, GST',
+        ),
       whatYouTried: z
         .string()
         .optional()
