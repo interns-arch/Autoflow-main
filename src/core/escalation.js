@@ -1341,7 +1341,11 @@ async function handleReply(m) {
     // "#12 55810M75J30", "E12 55810M75J30" or "12 55810M75J30" — the message
     // says #12, older ones said E12, and people type neither about half the
     // time. All three are accepted.
-    const mm = text.match(/^[#E]?(\d+)[\s.:)-]+([\s\S]+)$/i);
+    // Stripped of WhatsApp markup first. The bot writes the question as
+    // "*#12*", and a person answering by copying what they were shown sends
+    // the asterisks back — see core/waText, and the nine minutes it cost on
+    // 24 Sep when the same habit blocked a customer's approval.
+    const mm = require('./waText').unformat(text).match(/^[#E]?(\d+)[\s.:)-]+([\s\S]+)$/i);
     const mine = [...pending.entries()].filter(([, pe]) => askedThem(pe));
     if (mm && pending.has(parseInt(mm[1], 10)) && askedThem(pending.get(parseInt(mm[1], 10)))) {
       id = parseInt(mm[1], 10);
