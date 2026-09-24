@@ -109,11 +109,28 @@ async function main() {
       require('./core/parts').aliases.embedPending().catch(() => {});
     };
     setInterval(catchUp, 60 * 60 * 1000).unref();
-    // What a person has ALREADY taught, brought across once: those phrases were
-    // answered at somebody's desk and are the last ones that should have to be
-    // asked again.
-    require('./core/parts')
-      .aliases.seedFromLearnedAliases()
+    // The phrase memory — the same database, its own table (migration 004), and
+    // its own line in the log because it can be missing on its own: new code on
+    // a server whose migration has not been run yet answers exactly as it did
+    // before, and this is the only place that says so out loud.
+    const partAliases = require('./core/parts').aliases;
+    partAliases
+      .health()
+      .then((h) => {
+        store.log(
+          'boot',
+          h.ok
+            ? `phrase memory: ready, ${h.remembered} phrase(s) a person taught (${h.embedded} searchable)`
+            : 'phrase memory: NOT USABLE — ' + h.reason + ' (the same questions will go to a person, as before)',
+        );
+        // What a person has ALREADY taught, brought across once: those phrases
+        // were answered at somebody's desk and are the last ones that should
+        // have to be asked again.
+        return h.ok ? partAliases.seedFromLearnedAliases() : 0;
+      })
+      .then((n) => {
+        if (n) store.log('boot', 'phrase memory: brought across ' + n + ' phrase(s) already learned');
+      })
       .catch(() => {});
   }
 

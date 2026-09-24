@@ -401,6 +401,22 @@ async function seedFromLearnedAliases() {
   return n;
 }
 
+// Is the phrase memory usable RIGHT NOW? Read once at boot, so "the table is
+// not there" is a line in the startup log rather than a surprise in the middle
+// of a busy afternoon — and so that a deploy can be checked in one glance.
+//
+// The bot runs perfectly well without it: every query below falls back to null,
+// which means "ask a person", which is what happened before this existed.
+async function health() {
+  if (!enabled()) return { ok: false, reason: 'DATABASE_URL not set' };
+  const there = await db.query("SELECT to_regclass('public.bot_part_aliases') AS t", []);
+  if (!there) return { ok: false, reason: 'cannot reach the database' };
+  if (!there.rows[0] || !there.rows[0].t) return { ok: false, reason: 'schema missing — run: npm run migrate' };
+  const n = await db.query('SELECT count(*)::int AS n, count(embedding)::int AS e FROM bot_part_aliases', []);
+  const row = (n && n.rows[0]) || { n: 0, e: 0 };
+  return { ok: true, remembered: row.n, embedded: row.e };
+}
+
 async function stats() {
   const r = await db.query(
     `SELECT count(*)::int AS total,
@@ -423,4 +439,4 @@ async function list(limit = 100) {
   return (r && r.rows) || [];
 }
 
-module.exports = { enabled, remember, recall, forget, seedFromLearnedAliases, embedPending, stats, list, normPhrase, worthRemembering, saysTheSameThing };
+module.exports = { enabled, remember, recall, forget, health, seedFromLearnedAliases, embedPending, stats, list, normPhrase, worthRemembering, saysTheSameThing };
