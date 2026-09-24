@@ -23,7 +23,8 @@
 // The pause is a real LangGraph interrupt: the graph stops inside
 // ask_a_person, the state is checkpointed to Postgres, and resume() puts his
 // words back into the same conversation hours later.
-const { createAgent, createMiddleware, dynamicSystemPromptMiddleware, toolCallLimitMiddleware } = require('langchain');
+const { createAgent, createMiddleware, toolCallLimitMiddleware } = require('langchain');
+const { z } = require('zod');
 const { Command } = require('@langchain/langgraph');
 const { ChatGoogleGenerativeAI } = require('@langchain/google-genai');
 
@@ -128,38 +129,18 @@ function build() {
     // has to survive a deploy — see memory.js.
     checkpointer: builtWith,
     middleware: [
-      // The cart, re-read from core/orders on every single turn.
-      dynamicSystemPromptMiddleware((state, runtime) => SYSTEM + '\n\n' + memory.cartNote(threadOf(runtime))),
       // A loop that will not settle costs money and leaves the customer
       // waiting. Normal is two to four calls.
       toolCallLimitMiddleware({ runLimit: config.agent.maxToolCalls }),
-      // THE CONTEXT WINDOW. The thread keeps every message ever sent; the model
-      // is shown the last few turns of it. Done in wrapModelCall — which
-      // changes the REQUEST and never the state — so the checkpoint stays whole
-      // and a question paused this morning still resumes with its history.
-      contextWindow,
+      // WHAT THE MODEL SEES besides the prompt: the live cart (re-read from
+      // core/orders every turn), notes on who the customer is, a running
+      // summary of everything older, and the last 20 messages word for word.
+      // The checkpoint keeps every message; this only shapes what is SENT, so
+      // a question paused this morning still resumes with its history.
+      memory.contextMiddleware({ createMiddleware, z }),
     ],
   });
   return agent;
-}
-
-// THE LAST FEW TURNS, NOT THE LAST FEW MONTHS. See memory.windowed().
-const contextWindow = createMiddleware({
-  name: 'ContextWindow',
-  wrapModelCall: (request, handler) => {
-    const all = (request && request.messages) || [];
-    const few = memory.windowed(all);
-    if (few.length !== all.length) {
-      store.log('agent', `context window: ${few.length} of ${all.length} message(s) sent to the model`);
-    }
-    return handler({ ...request, messages: few });
-  },
-});
-
-// The chat id, wherever this version of LangGraph happens to put it.
-function threadOf(runtime) {
-  const c = (runtime && (runtime.configurable || (runtime.config && runtime.config.configurable))) || {};
-  return c.chatId || c.thread_id || null;
 }
 
 function configFor({ chatId, phone, customer, bot }) {
@@ -242,7 +223,12 @@ async function resume({ bot, chatId, phone, answer }) {
   }
 
   try {
-    await bot.transport.sendToChat(chatId, res.reply);
+    const id = await bot.transport.sendToChat(chatId, res.reply);
+    // In the chat's own history like any other reply: the template path can
+    // see it, a swipe-reply onto it can be read, and the next catch-up does
+    // not repeat it back to the agent as news.
+    if (typeof bot.recordOutgoing === 'function') bot.recordOutgoing(chatId, id, res.reply);
+    require('./incoming').markSeen(chatId);
   } catch (e) {
     store.log('agent', 'could not deliver the resumed reply: ' + String((e && e.message) || e).slice(0, 80));
     return false;
@@ -291,6 +277,9 @@ async function run(who, input, what) {
   }
 
   store.log('agent', `${who.chatId} ${Date.now() - started}ms, tools: ${calls.length ? calls.join(' > ') : 'none'}`);
+  // "(no reply)": the model decided there is nothing to say — a reaction taken
+  // back, a sticker after the deal. Handled, and nothing is sent.
+  if (/^\(?\s*no reply\s*\)?\.?$/i.test(reply)) return { handled: true, reply: null, paused: false };
   return { handled: true, reply: reply || null, paused: false };
 }
 

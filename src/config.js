@@ -366,17 +366,20 @@ const config = {
     // normal part-and-price turn is 2 to 4 tool calls.
     maxToolCalls: parseInt(process.env.AGENT_MAX_TOOL_CALLS || '10', 10),
 
-    // THE CONTEXT WINDOW — how much of the conversation the model is shown.
-    //
-    // In CUSTOMER TURNS, because a turn is not a message: one part question
-    // becomes a human message, a tool call, its results and a reply. Six turns
-    // is roughly the last twenty minutes of a live chat, which is what "iska
-    // rate kya hai" needs and more than "kal wala bhej do" ever gets.
-    //
-    // The thread itself keeps everything — this only decides what is SENT. See
+    // THE CONTEXT — a running summary, and the last K messages word for word.
+    // The thread itself keeps everything; this only decides what is SENT. See
     // agent/memory.js.
-    contextTurns: parseInt(process.env.AGENT_CONTEXT_TURNS || '6', 10),
-    // The backstop for one turn that went round and round on its own.
+    //
+    // K counts messages, tool calls included, and the cut always lands on a
+    // customer message so no turn is split — so the window holds AT LEAST K.
+    contextKeepMessages: parseInt(process.env.AGENT_CONTEXT_KEEP_MESSAGES || '20', 10),
+    // How many messages leave the window before the summary is rewritten.
+    // One at a time would be a summarising call on every turn.
+    summaryBatch: parseInt(process.env.AGENT_SUMMARY_BATCH || '6', 10),
+    // Writing a summary is reading, not judgement: the cheap model does it.
+    summaryModel: (process.env.AGENT_SUMMARY_MODEL || process.env.AGENT_MODEL || 'gemini-3.5-flash-lite').trim(),
+    // The backstop: a summary that keeps failing, or one turn that went round
+    // and round, never makes the request longer than this.
     contextMaxMessages: parseInt(process.env.AGENT_CONTEXT_MAX_MESSAGES || '60', 10),
     // THE OPEN WEB, for finding a part number our own sources do not have.
     // Grounded search runs through Gemini on the key the bot already holds,

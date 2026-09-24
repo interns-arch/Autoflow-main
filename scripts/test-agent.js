@@ -123,72 +123,172 @@ async function toolChecks() {
     cfg2.agent.allowFrom = saved;
   }
 
-  // -------------------------------------------------- the context window
+  // -------------------------------------------- the context: summary + last 20
   //
-  // A dealer's chat runs for months and the checkpointer keeps all of it. What
-  // the MODEL sees is the last few turns — and the rules that make that safe
-  // rather than merely cheap are all about where the cut lands.
-  console.log('\nCONTEXT WINDOW (offline — no model)\n');
+  // A dealer's chat runs for months and the checkpointer keeps all of it. The
+  // MODEL sees a running summary of the old part and the last K messages word
+  // for word. Where the cut lands, and what may never go into the summary, are
+  // what make that safe rather than merely cheap.
+  console.log('\nCONTEXT: summary + last K (offline — no model)\n');
   const agentMemory = require('../src/agent/memory');
-  const cfg3 = require('../src/config');
+  const K = agentMemory.KEEP;
 
-  // The shapes a real thread is made of. A tool result must never lead.
   const human = (t) => ({ getType: () => 'human', content: t });
-  const ai = (t) => ({ getType: () => 'ai', content: t });
+  const ai = (t, calls) => ({ getType: () => 'ai', content: t, tool_calls: calls || [] });
   const toolMsg = (t) => ({ getType: () => 'tool', content: t, name: 'check_stock_and_price' });
-  // One customer question, as it really arrives: a message, a tool call, its
-  // result, and the reply. Four messages for one turn — which is why the
-  // window counts turns and not messages.
-  const turn = (n) => [human('question ' + n), ai('calling a tool'), toolMsg('{"parts":[]}'), ai('answer ' + n)];
+  // One customer question as it really arrives: four messages, not one.
+  const turn = (n) => [
+    human('question ' + n),
+    ai('', [{ name: 'check_stock_and_price', args: { partNumbers: ['P' + n] } }]),
+    toolMsg('{"parts":[{"partNo":"P' + n + '","price":"MRP ₹450"}]}'),
+    ai('answer ' + n),
+  ];
+  const thread = (n) => {
+    const out = [];
+    for (let i = 1; i <= n; i++) out.push(...turn(i));
+    return out;
+  };
 
-  const short = [...turn(1), ...turn(2)];
-  ok('a short conversation is sent whole', agentMemory.windowed(short).length === short.length);
+  const short = thread(2);
+  ok('a short conversation is sent whole', agentMemory.windowed(short, 0).length === short.length);
 
-  const long = [];
-  for (let i = 1; i <= 20; i++) long.push(...turn(i));
-  const win = agentMemory.windowed(long);
-  ok(
-    'a long one is cut down',
-    win.length < long.length && win.length > 0,
-    win.length + ' of ' + long.length,
-  );
-  ok(
-    'it opens on a customer message, never on a tool result',
-    win[0].getType() === 'human',
-    'it opened on a ' + win[0].getType() + ' — Gemini refuses a history that starts on a function response',
-  );
-  ok(
-    'it keeps the configured number of turns',
-    win.filter((m) => m.getType() === 'human').length === cfg3.agent.contextTurns,
-    win.filter((m) => m.getType() === 'human').length + ' turns, expected ' + cfg3.agent.contextTurns,
-  );
-  ok('the newest message survives the cut', win[win.length - 1] === long[long.length - 1]);
-  ok(
-    'every tool result still follows the message that asked for it',
-    win.every((m, i) => m.getType() !== 'tool' || (win[i - 1] && win[i - 1].getType() === 'ai')),
-  );
+  const long = thread(30); // 120 messages
+  const p0 = agentMemory.plan(long, 0);
+  ok('a long one with no summary yet asks for one', Boolean(p0.fold) && p0.fold[0] === 0 && p0.fold[1] === p0.start);
+  const win = agentMemory.windowed(long, p0.start);
+  ok(`once summarised, the window holds at least K=${K} messages`, win.length >= K && win.length < long.length, win.length + ' sent');
+  ok('...and not many more than K (whole turns only)', win.length < K + 4, win.length + ' sent');
+  ok('it opens on a customer message, never on a tool result', win[0].getType() === 'human');
+  ok('every tool result still follows the message that asked for it', win.every((m, i) => m.getType() !== 'tool' || (win[i - 1] && win[i - 1].getType() === 'ai')));
+  ok('the newest message is in the window', win[win.length - 1] === long[long.length - 1]);
 
-  // ONE TURN THAT WENT ROUND AND ROUND. Six turns is normally a few dozen
-  // messages; a single turn that searched, priced, searched again and asked
-  // the web can be twenty on its own, and the cap is what bounds that.
-  const runaway = [human('find me this part')];
-  for (let i = 0; i < 90; i++) runaway.push(ai('tool'), toolMsg('{}'));
-  runaway.push(human('aur iska rate?'), ai('the price'));
-  const capped = agentMemory.windowed(runaway);
-  ok(
-    'a runaway turn is capped',
-    capped.length <= agentMemory.HARD_CAP + 4,
-    capped.length + ' messages, cap is ' + agentMemory.HARD_CAP,
-  );
-  ok('...and the cap still cuts at a customer message', capped[0].getType() === 'human');
+  // THE GAP. Messages that have left the window but are not yet worth a
+  // summarising call must stay in view — not fall between the two.
+  const done = p0.start;
+  const grown = long.concat(turn(31)); // four more messages: fewer than a batch
+  const p1 = agentMemory.plan(grown, done);
+  ok('a few new messages do not cost a summarising call', p1.fold === null, JSON.stringify(p1));
+  ok('...and the ones that left the window stay in view until they are summarised', p1.start === done);
+  const grown2 = grown.concat(turn(32), turn(33));
+  const p2 = agentMemory.plan(grown2, done);
+  ok('a batch later, the summary is brought up to date', Boolean(p2.fold) && p2.fold[0] === done);
 
-  // The window changes what is SENT, never what is stored — so it must not
-  // touch the array it was given.
+  // THE SUMMARY, with a stand-in for the model.
+  let seenByModel = '';
+  agentMemory._setSummarizer(async (system, user) => {
+    seenByModel = user;
+    return JSON.stringify({
+      summary: 'Asked for P1 x5, rate ₹450, MRP 599, then Rs. 1,050 for P2. Wants 12% off.',
+      notes: 'Sharma Auto, Karol Bagh. Buys Cartrends. MRP 120 on filters.',
+    });
+  });
+  const sum = await agentMemory.summarize({ summary: '', notes: '', messages: long.slice(0, 8) });
+  ok('the summariser is given the messages that left the view', /Customer: question 1/.test(seenByModel) && /we looked up: check_stock_and_price/.test(seenByModel));
+  ok('no price survives into the summary, however it was written', sum && !/₹|\b450\b|\b599\b|1,050|12%/.test(sum.summary), sum && sum.summary);
+  ok('...nor into the notes about the customer', sum && !/\b120\b/.test(sum.notes) && /Sharma Auto/.test(sum.notes), sum && sum.notes);
+  ok('part numbers and quantities are left alone', sum && /P1 x5/.test(sum.summary));
+  agentMemory._setSummarizer(async () => {
+    throw new Error('model down');
+  });
+  ok('a summary that cannot be written is not a crash — the old one stays', (await agentMemory.summarize({ summary: 'old', notes: '', messages: long.slice(0, 8) })) === null);
+  agentMemory._setSummarizer(async () => 'not json at all');
+  ok('...nor is a summary that comes back garbled', (await agentMemory.summarize({ summary: 'old', notes: '', messages: long.slice(0, 8) })) === null);
+
+  // THE MIDDLEWARE, driven the way the agent drives it.
+  const { createMiddleware } = require('langchain');
+  const { SystemMessage } = require('@langchain/core/messages');
+  const { z } = require('zod');
+  const { SYSTEM } = require('../src/agent/prompt');
+  const mw = agentMemory.contextMiddleware({ createMiddleware, z });
+  agentMemory._setSummarizer(async () => JSON.stringify({ summary: 'Earlier: asked for P1 x5 for a Swift.', notes: 'Name: Sharma. Buys Cartrends.' }));
+  const update = await mw.beforeModel({ messages: long, summary: '', notes: '', summarizedThrough: 0 }, {});
+  ok('before the model runs, the summary is written into the conversation state', update && /P1 x5/.test(update.summary) && update.summarizedThrough === p0.start, JSON.stringify(update));
+  let sent = null;
+  await mw.wrapModelCall(
+    {
+      messages: long,
+      state: { messages: long, ...update },
+      systemMessage: new SystemMessage(SYSTEM),
+      runtime: { configurable: { chatId: 'nobody@c.us', customer: { name: 'SHARMA AUTO' } } },
+    },
+    async (req) => {
+      sent = req;
+      return ai('ok');
+    },
+  );
+  const sys = sent && String(sent.systemMessage.content);
+  ok('the model is sent the window, not the whole thread', sent && sent.messages.length === win.length);
+  ok('...with the summary', /EARLIER IN THIS CONVERSATION[\s\S]*P1 x5/.test(sys));
+  ok('...and the notes on who the customer is', /WHAT WE KNOW ABOUT THIS CUSTOMER[\s\S]*SHARMA AUTO[\s\S]*Buys Cartrends/.test(sys));
+  ok('...and the live cart', /CART: empty|CART \(live/.test(sys));
+  const marker = SYSTEM.slice(0, 60);
+  ok('the system prompt goes ONCE — it used to be sent twice on every call', sys.split(marker).length - 1 === 1, 'found ' + (sys.split(marker).length - 1) + ' copies');
+  agentMemory._setSummarizer(null);
+
   const before = long.length;
-  agentMemory.windowed(long);
+  agentMemory.windowed(long, 0);
   ok('it never edits the thread it was handed', long.length === before);
-
   ok('an empty thread is not a crash', agentMemory.windowed([]).length === 0 && agentMemory.windowed(null).length === 0);
+
+  // ------------------------------------ WhatsApp, as Meta's webhook sends it
+  console.log('\nWHATSAPP FEATURES (offline — payloads shaped as Meta documents them)\n');
+  const { CloudTransport } = require('../src/wa/cloudTransport');
+  const got = [];
+  const tr = new CloudTransport('customer', 'test');
+  tr.onMessage(async (m) => {
+    got.push(m);
+    return true;
+  });
+  const hook = (msg) => tr.handleWebhook({ entry: [{ changes: [{ field: 'messages', value: { messages: [{ from: '919000000777', timestamp: '1', ...msg, id: 'wamid.T' + Math.random() }] } }] }] });
+  await hook({ type: 'reaction', reaction: { message_id: 'wamid.OURS', emoji: '👍' } });
+  await hook({ type: 'edit', edit: { original_message_id: 'wamid.OLD', message: { type: 'text', text: { body: '13780M68P01 25 pcs' } } } });
+  await hook({ type: 'revoke', revoke: { original_message_id: 'wamid.OLD' } });
+  await hook({ type: 'text', text: { body: 'ye list dekho' }, context: { forwarded: true } });
+  await hook({ type: 'video', video: { caption: 'ye wala part', id: 'v1' } });
+  await hook({ type: 'text', text: { body: '2' }, context: { from: '919289015775', id: 'wamid.OURS' } });
+  const [rx, ed, rv, fw, vd, sw] = got;
+  ok('a reaction arrives as a reaction, with the message it is on', rx && rx.reaction && rx.reaction.emoji === '👍' && rx.reaction.messageId === 'wamid.OURS');
+  ok('an EDIT arrives with its new words — and an empty body, so it is never read as a fresh order', ed && ed.edit && /25 pcs/.test(ed.edit.text) && !ed.body);
+  ok('a deletion arrives as a deletion', rv && rv.revoke && rv.revoke.originalId === 'wamid.OLD' && !rv.body);
+  ok('a forwarded message says it was forwarded', fw && fw.forwarded === 'forwarded' && fw.body === 'ye list dekho');
+  ok('the words under a video are kept, and known to be a caption', vd && vd.body === 'ye wala part' && vd.caption === 'ye wala part');
+  ok('a swipe-reply carries the message it answers', sw && sw.contextId === 'wamid.OURS');
+
+  // ---------------------------------------- what the agent is actually shown
+  console.log('\nWHAT THE AGENT READS (offline)\n');
+  const incoming = require('../src/agent/incoming');
+  const quoted = (id) => ({ 'wamid.OURS': { dir: 'us', text: 'CTWBSI26P-16 Inch — MRP ₹599, stock hai. Kitne chahiye?' }, 'wamid.OLD': { dir: 'customer', text: '13780M68P01 20 pcs' } })[id] || null;
+  const e1 = incoming.envelope(sw, { text: '2', quoted });
+  ok('a swipe-reply shows the message it answers', /Swipe-reply to OUR earlier message: "CTWBSI26P-16 Inch/.test(e1) && /\n2$/.test(e1), e1);
+  ok('...and says so plainly when that message is gone', /no longer have on record/.test(incoming.envelope({ contextId: 'wamid.GONE' }, { text: 'haan', quoted })));
+  ok('a reaction names the emoji and the message', /Reacted 👍 to OUR message "CTWBSI26P-16/.test(incoming.envelope(rx, { quoted })));
+  const e4 = incoming.envelope(ed, { quoted });
+  ok('an edit shows the old words and the new', /EDITED their earlier message "13780M68P01 20 pcs"/.test(e4) && /25 pcs$/.test(e4), e4);
+  ok('a deletion is marked as taken back', /DELETED their earlier message "13780M68P01 20 pcs"/.test(incoming.envelope(rv, { quoted })));
+  ok('a forward is marked as someone else\'s words', /Forwarded — someone else wrote this/.test(incoming.envelope(fw, { text: fw.body, quoted })));
+  ok('a caption is marked as a caption', /video \(we cannot watch videos\); the words below were written UNDER it/.test(incoming.envelope(vd, { text: vd.body, quoted })));
+  ok('a plain message goes through untouched', incoming.envelope({ body: 'hello' }, { text: 'hello', quoted }) === 'hello');
+  ok('the chat log says what it was, not just the words', incoming.forLog({ mediaType: 'image', body: '3pise' }) === '(photo) 3pise' && /reacted 👍/.test(incoming.forLog(rx)));
+
+  // THE CATCH-UP: what happened in the chat while the agent was not the one
+  // answering — a photo read by the order desk — is put in front of the next
+  // message it does see, once.
+  const conversation = require('../src/core/conversation');
+  const CU = 'catchup-test@c.us';
+  conversation.clear(CU);
+  conversation.record(CU, 'customer', '(photo) 3pise');
+  conversation.record(CU, 'us', '11 part mil gaye, order mein daal diye.');
+  await new Promise((r) => setTimeout(r, 5));
+  const nowAt = Date.now();
+  conversation.record(CU, 'customer', 'iska rate kya hai');
+  const cu = incoming.forAgent({ chatId: CU }, { text: 'iska rate kya hai', before: nowAt });
+  ok('what the order desk handled reaches the agent', /order desk[\s\S]*Customer: \(photo\) 3pise[\s\S]*Us: 11 part mil gaye/.test(cu), cu);
+  ok('...without the message being answered right now in it twice', (cu.match(/iska rate kya hai/g) || []).length === 1);
+  incoming.markSeen(CU);
+  ok('once the agent has spoken, it is not told the same thing again', incoming.forAgent({ chatId: CU }, { text: 'ok', before: Date.now() }) === 'ok');
+  conversation.clear(CU);
+  require('../src/core/chatState').slot('agentSeen').delete(CU);
+
 }
 
 // ------------------------------------------------------------ the agent
@@ -274,6 +374,27 @@ const CASES = [
     say: 'aap log sunday ko khule hote ho?',
     check: (reply) => reply.length <= 260 && reply.split('\n').filter((l) => l.trim()).length <= 3,
     why: 'a one-line question got a paragraph',
+  },
+  // WHATSAPP FEATURES: the notes agent/incoming puts in front of a message,
+  // exactly as the bot builds them.
+  {
+    name: 'a swipe-reply is answered against the message it quotes',
+    say: '[Swipe-reply to OUR earlier message: "CTWBSI26P-16 Inch — MRP ₹599, stock hai. Kitne chahiye?"]\n2',
+    check: (reply, tools) =>
+      (tools.includes('add_to_order') || /CTWBSI26P-16/i.test(reply)) && !/which part|kaun sa part|konsa part/i.test(reply),
+    why: 'read "2" as a message on its own instead of the quantity for the quoted part',
+  },
+  {
+    name: 'a 👍 on a price is not an order',
+    say: '[Reacted 👍 to OUR message "13780M68P01 — MRP ₹310, stock hai. Kitne chahiye?"]',
+    check: (_reply, tools) => !tools.includes('confirm_order') && !tools.includes('add_to_order'),
+    why: 'treated a reaction as an order',
+  },
+  {
+    name: 'a deleted message is not acted on',
+    say: '[DELETED their earlier message "16510M65L10 10 pcs" — they took it back]',
+    check: (_reply, tools) => !tools.includes('add_to_order') && !tools.includes('check_stock_and_price') && !tools.includes('confirm_order'),
+    why: 'acted on a message the customer deleted',
   },
   {
     name: 'asked straight out, it says it is an assistant — never that it is a person',

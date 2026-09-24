@@ -21,6 +21,7 @@ const knowledge = require('../core/knowledge');
 const inquiries = require('../core/inquiries');
 const customers = require('../core/customers');
 const agent = require('../agent');
+const incoming = require('../agent/incoming');
 const customerCreate = require('../core/customerCreate');
 const portal = require('../integrations/dealerPortal');
 const escalation = require('../core/escalation');
@@ -418,7 +419,12 @@ class CustomerBot {
 
     // Both sides of the thread are remembered, so "pakka?" and "This also"
     // mean something on the next message instead of arriving out of nowhere.
-    conversation.record(m.chatId, 'customer', m.body || `(${m.mediaType || 'media'})`);
+    // Said as what it was — "(photo) 3pise", "(reacted 👍)", "(edited a message)
+    // 25 pcs" — not as bare words, so a caption is never mistaken for a typed
+    // message later on. `receivedAt` marks where this message sits in that
+    // record, so the agent's catch-up can leave it out (it is being answered).
+    m.receivedAt = Date.now();
+    conversation.record(m.chatId, 'customer', incoming.forLog(m));
     rememberMsg(m.chatId, m.id, 'customer', m.body || '');
 
     // They carried on talking, so the "send me a part number" nudge is no
@@ -471,6 +477,16 @@ class CustomerBot {
     // so every reader below (DM, group, sales desk) sees the same order line.
     if (m.body) m.body = ai.normalizeOrderText(m.body);
     const text = (m.body || '').trim();
+
+    // A REACTION, AN EDIT, A DELETION — no text, and still the customer saying
+    // something. The template path cannot read them and passes, as it always
+    // has. The agent can: a 👍 on "Yahi chahiye, 20 pcs?", "20" edited to
+    // "25", an order line taken back. Checked before the empty-text exit, which
+    // is where every one of these used to fall silent.
+    if (!text && incoming.isEvent(m) && agent.enabled() && agent.allowed(m.from)) {
+      const done = await this.askAgent(m, '', reply, t);
+      if (done !== null) return done;
+    }
     if (!text) return false;
 
     // AN APPROVER SAYING YES. "OK WA-ABC123" from a Sales Head is the only
@@ -565,30 +581,8 @@ class CustomerBot {
       vahan.isOnlyPlate(text);
 
     if (!notForTheAgent && agent.enabled() && agent.allowed(m.from)) {
-      const who = await customers.resolve(m.from).catch(() => null);
-      const res = await agent.handle({
-        bot: this,
-        chatId: m.chatId,
-        phone: m.from,
-        customer: who && who.found ? who : null,
-        text,
-      });
-      // THE AGENT IS WAITING FOR THE SPECIALIST.
-      //
-      // The conversation is parked mid-turn and checkpointed. The customer is
-      // told once, here, in their own language — not by the model, because the
-      // model is not running: it stopped inside the tool. When the specialist
-      // answers, core/escalation resumes that thread and the reply goes out
-      // then.
-      if (res.paused) {
-        return reply(
-          t(
-            'Let me get this checked by our specialist — I will confirm shortly.',
-            'Ye main apne specialist se check karwa leta hoon — thodi der mein confirm karta hoon.',
-          ),
-        );
-      }
-      if (res.handled) return res.reply ? reply(res.reply) : true;
+      const done = await this.askAgent(m, text, reply, t);
+      if (done !== null) return done;
       store.log(this.key, 'agent could not answer ' + m.from + ' — falling back to the usual path');
     }
 
@@ -2782,6 +2776,53 @@ class CustomerBot {
   // portal is touched (founder, 22 Sep). A part-wise rule is set by the
   // lowest price the part may be sold at: the portal's MRP is shown, the
   // price is asked, and the percentage is worked out from the two.
+  // ONE MESSAGE TO THE AGENT, and whatever it says back.
+  //
+  // -> the reply's result when the agent answered (the caller returns it), or
+  //    null when it could not run, and the caller carries on the usual path.
+  async askAgent(m, text, reply, t) {
+    const who = await customers.resolve(m.from).catch(() => null);
+    const res = await agent.handle({
+      bot: this,
+      chatId: m.chatId,
+      phone: m.from,
+      customer: who && who.found ? who : null,
+      // The words WITH what WhatsApp said about them — a swipe-reply and what
+      // it quoted, a caption, a reaction, an edit — and anything said in the
+      // chat since the agent last spoke (agent/incoming).
+      text: incoming.forAgent(m, { text, quoted: (id) => quotedMsg(m.chatId, id), before: m.receivedAt }),
+    });
+    if (!res.handled) return null;
+
+    let out = true;
+    // THE AGENT IS WAITING FOR THE SPECIALIST. The conversation is parked
+    // mid-turn and checkpointed; the customer is told once, here, because the
+    // model is not running — it stopped inside the tool. The answer goes out
+    // when he replies (agent.resume).
+    if (res.paused) {
+      out = await reply(
+        t(
+          'Let me get this checked by our specialist — I will confirm shortly.',
+          'Ye main apne specialist se check karwa leta hoon — thodi der mein confirm karta hoon.',
+        ),
+      );
+    } else if (res.reply) {
+      out = await reply(res.reply);
+    }
+    // Everything up to and including this reply is in the agent's own memory
+    // now; the next catch-up starts after it.
+    incoming.markSeen(m.chatId);
+    return out;
+  }
+
+  // A message sent outside a customer's turn — the agent's answer once the
+  // specialist has replied — recorded like every other reply, so it is in the
+  // chat's history and a swipe-reply onto it can be read.
+  recordOutgoing(chatId, id, text) {
+    conversation.record(chatId, 'us', text);
+    rememberMsg(chatId, id, 'us', text);
+  }
+
   // Every question in this flow already asks itself in words — "Brand wise ya
   // Part wise?", "Ye rule approval ke liye bhejun?" — and every step reads a
   // typed answer. So the question goes out as it is: no buttons, and no menu
