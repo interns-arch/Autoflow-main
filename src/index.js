@@ -109,6 +109,12 @@ async function main() {
       require('./core/parts').aliases.embedPending().catch(() => {});
     };
     setInterval(catchUp, 60 * 60 * 1000).unref();
+    // What a person has ALREADY taught, brought across once: those phrases were
+    // answered at somebody's desk and are the last ones that should have to be
+    // asked again.
+    require('./core/parts')
+      .aliases.seedFromLearnedAliases()
+      .catch(() => {});
   }
 
   // THE AGENT'S CHECKPOINTER, set up before the first customer message rather

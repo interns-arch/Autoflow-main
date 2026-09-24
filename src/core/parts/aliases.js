@@ -134,6 +134,71 @@ async function rememberNow({ phrase, partNo, partName, source, taughtBy } = {}) 
   }
 }
 
+// DOES THE NEW QUESTION STILL SAY WHAT THE REMEMBERED ONE SAID?
+//
+// availability.matchTrustworthy asks this of a customer's words against a
+// CATALOGUE row, and the rule is the right one: every word that names something
+// has to be there, or the nearest match is answering a question nobody asked.
+//
+// Here both sides are somebody's own sentence, typed in a hurry, and that needs
+// one more allowance than a catalogue line does. Live, 23 Sep: "Cartend ka
+// Horan" was answered as CTHNKAM889WP and remembered as "cartend horn" — the
+// understand model spells it one way one minute and the other the next. The
+// four-letter-prefix rule reads "hora" against "horn" and calls them different
+// parts, so the same customer, in the same words, went back to the specialist.
+//
+// So a word also matches one edit away — an inserted vowel, a dropped letter —
+// held down exactly as core/knowledge holds its own fuzzy match: the first
+// letter must agree, a word carrying a digit is never matched loosely ("10w30"
+// and "10w40" are one edit apart and are different oils), and the longer of the
+// two has to be a real word rather than an abbreviation.
+function within1(a, b) {
+  const [short, long] = a.length <= b.length ? [a, b] : [b, a];
+  if (long.length - short.length > 1) return false;
+  let i = 0;
+  let j = 0;
+  let diff = 0;
+  while (i < short.length && j < long.length) {
+    if (short[i] === long[j]) {
+      i++;
+      j++;
+      continue;
+    }
+    if (++diff > 1) return false;
+    if (short.length === long.length) i++;
+    j++;
+  }
+  return true;
+}
+
+function sameWord(a, b) {
+  if (a === b) return true;
+  // "cartend" against "cartrends", "bottel" against "bottle": dealers spell by
+  // ear, and the first four letters carry it. The rule matchTrustworthy uses.
+  if (a.length >= 4 && b.length >= 4 && a.slice(0, 4) === b.slice(0, 4)) return true;
+  if (/[0-9]/.test(a) || /[0-9]/.test(b)) return false;
+  if (a[0] !== b[0]) return false;
+  if (Math.max(a.length, b.length) < 5) return false;
+  return within1(a, b);
+}
+
+function saysTheSameThing(asked, remembered) {
+  const availability = require('../availability');
+  const have = new Set(
+    String(remembered || '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, ' ')
+      .trim()
+      .split(' ')
+      .filter(Boolean),
+  );
+  for (const word of availability.distinctiveWords(asked)) {
+    const forms = availability.synonymsOf(word);
+    if (![...have].some((h) => forms.some((f) => sameWord(h, f)))) return false;
+  }
+  return true;
+}
+
 // RECALL ONE.
 //
 // -> { partNo, name, phrase, similarity, exact } when we are sure
@@ -232,11 +297,7 @@ async function recall(asked, opts = {}) {
     // new question has to appear in the phrase we remembered, the part's name
     // or its number — the rule the catalogue index and the portal search
     // already apply, borrowed whole.
-    const availability = require('../availability');
-    const trusted = availability.matchTrustworthy(words, {
-      partNo: best.part_no,
-      name: [best.part_name, best.phrase].filter(Boolean).join(' '),
-    });
+    const trusted = saysTheSameThing(words, [best.part_name, best.phrase, best.part_no].filter(Boolean).join(' '));
     if (!trusted) {
       store.log('parts', `"${key.slice(0, 40)}" is near "${String(best.phrase).slice(0, 40)}" but contradicts it — asking a person`);
       return { partNo: null, similarity: sim, candidates: cand(), contradicts: true, why: 'the closest thing we were taught does not match what they said' };
@@ -311,6 +372,35 @@ async function forget(phrase) {
   return n;
 }
 
+// EVERYTHING ALREADY LEARNED, BROUGHT ACROSS ONCE.
+//
+// The string-key map in data/state.json is the record of every question a person
+// has already answered — "cartend horn -> CTHNKAM889WP" was sitting in it while
+// the same customer, in the same words, was sent back to the specialist. There
+// is no reason to make him teach those again, so they are seeded here at boot.
+//
+// Idempotent: remember() skips a phrase that is already stored, embedded and
+// pointing at the same part, so this costs one query per phrase on later boots
+// and nothing else. Part-number shortcuts are left where they are — they belong
+// to the exact map.
+//
+// -> how many were newly remembered.
+async function seedFromLearnedAliases() {
+  if (!enabled()) return 0;
+  let n = 0;
+  try {
+    const knowledge = require('../knowledge');
+    for (const [phrase, entry] of Object.entries((knowledge.all() || {}).aliases || {})) {
+      if (!entry || !entry.partNo) continue;
+      if (await remember({ phrase, partNo: entry.partNo, source: entry.source || 'helper' })) n++;
+    }
+    if (n) store.log('parts', 'seeded the phrase memory with ' + n + ' thing(s) a person had already taught');
+  } catch (e) {
+    store.log('parts', 'could not seed the phrase memory: ' + String((e && e.message) || e).slice(0, 80));
+  }
+  return n;
+}
+
 async function stats() {
   const r = await db.query(
     `SELECT count(*)::int AS total,
@@ -333,4 +423,4 @@ async function list(limit = 100) {
   return (r && r.rows) || [];
 }
 
-module.exports = { enabled, remember, recall, forget, embedPending, stats, list, normPhrase, worthRemembering };
+module.exports = { enabled, remember, recall, forget, seedFromLearnedAliases, embedPending, stats, list, normPhrase, worthRemembering, saysTheSameThing };

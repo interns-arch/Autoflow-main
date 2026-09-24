@@ -57,12 +57,18 @@ stub('../src/integrations/dealerPortal', {
   analyze: async (p) => p,
   commercialAnalyze: async () => null,
 });
-const realMatchTrustworthy = require('../src/core/availability').matchTrustworthy;
+// The REAL word rules, captured before the stub goes in: which words name
+// something and which are filler, and which words mean the same thing. Every
+// refusal in this suite turns on them, so a double that always said yes would
+// be testing nothing.
+const real = require('../src/core/availability');
 stub('../src/core/availability', {
   resolve: async (l) => l.map((x) => ({ item: x.item, partNo: x.item, qty: 1, source: 'available' })),
   describe: (l) => l.item + ' - available',
   displayName: (l) => l.item,
-  matchTrustworthy: realMatchTrustworthy,
+  matchTrustworthy: real.matchTrustworthy,
+  distinctiveWords: real.distinctiveWords,
+  synonymsOf: real.synonymsOf,
 });
 stub('../src/core/orders', {
   getOrCreateDraft: () => ({ id: 'SO', lines: [] }),
@@ -83,6 +89,7 @@ const embeddings = require('../src/core/kb/embeddings');
 const NAMES = [
   'clutch', 'plate', 'swift', 'dzire', 'wiper', 'blade', 'cartrends', 'cartrend', 'fortuner',
   'air', 'filter', 'brezza', 'shocker', 'rear', 'front', 'bumper', 'alto', 'baleno', 'inch',
+  'horn',
 ];
 const FILLER = ['chahiye', 'ka', 'ki', 'ke', 'hai', 'for', 'please', 'pcs', 'number', 'no', 'kitna', 'bhejo'];
 const LEX = [...NAMES, ...FILLER];
@@ -91,8 +98,18 @@ function unit(v) {
   const n = Math.sqrt(v.reduce((s, x) => s + x * x, 0));
   return n ? v.map((x) => x / n) : v;
 }
+// Spelled by ear. "cartend" and "cartrends", "horan" and "horn" are ONE word to
+// a real embedding — that is most of what an embedding is for — and two words to
+// a bag of words. The double is told so explicitly, because a suite whose
+// embedding cannot connect them would pass cases the live system fails, and
+// would fail this one, which is taken from the log.
+//
+// It only makes the double's SIMILARITY realistic. What is then allowed through
+// is decided by the real guards in core/parts/aliases.
+const EAR = { cartend: 'cartrends', cartrend: 'cartrends', horan: 'horn', horran: 'horn' };
+
 function fakeEmbed(text) {
-  const words = String(text).toLowerCase().match(/[a-z0-9]+/g) || [];
+  const words = (String(text).toLowerCase().match(/[a-z0-9]+/g) || []).map((w) => EAR[w] || w);
   const v = LEX.map((w) => {
     if (!words.includes(w)) return 0;
     return NAMES.includes(w) ? 1 : 0.15;
@@ -279,6 +296,22 @@ const check = (n, c, d) => {
     reworded ? 'got ' + JSON.stringify(reworded).slice(0, 120) : 'got nothing — he would be asked again',
   );
 
+  // THE ONE FROM THE LOG, 23 Sep, exactly as it happened. The customer wrote
+  // "Cartend ka Horan 5 set" twice. The understand model called it "Cartend
+  // Horn" the first time, the specialist answered CTHNKAM889WP, and THAT is the
+  // wording that went into the alias map — so when the model called the same
+  // message "Cartend ka Horan" the second time, nothing matched and he was asked
+  // again. Two words apart, and one of them spelled by ear.
+  await aliases.remember({ phrase: 'Cartend Horn', partNo: 'CTHNKAM889WP', partName: 'Horn | | Cartrends', source: 'helper' });
+  const horn = await aliases.recall('Cartend ka Horan');
+  check(
+    'THE HORN: "cartend ka horan" finds what "cartend horn" was taught',
+    horn && horn.partNo === 'CTHNKAM889WP',
+    horn ? 'got ' + JSON.stringify(horn).slice(0, 130) : 'got nothing',
+  );
+  const hornQty = await aliases.recall('Cartend ka Horan 5 set');
+  check('...and the quantity they wrote does not change the answer', hornQty && hornQty.partNo === 'CTHNKAM889WP');
+
   console.log('\nWHAT IT REFUSES TO ANSWER');
   const otherPart = await aliases.recall('rear shocker alto');
   check(
@@ -293,6 +326,13 @@ const check = (n, c, d) => {
     'a different SIZE is not answered from the one we know',
     !wrongSize || !wrongSize.partNo,
     wrongSize && wrongSize.partNo ? 'answered ' + wrongSize.partNo + ' for a 22 inch blade' : '',
+  );
+
+  const someoneElsesHorn = await aliases.recall('fortuner ka horn');
+  check(
+    'another brand of the SAME part is not answered from it',
+    !someoneElsesHorn || !someoneElsesHorn.partNo,
+    someoneElsesHorn && someoneElsesHorn.partNo ? 'answered ' + someoneElsesHorn.partNo : '',
   );
 
   const wrongBrand = await aliases.recall('fortuner wiper blade 16 inch');

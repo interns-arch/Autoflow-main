@@ -322,8 +322,12 @@ function displayName(line) {
 // must not be read as a contradiction. "clutch plate chahiye swift KE LIYE"
 // against "swift ka clutch plate chahiye" was refused on the word "liye" — the
 // same part, the same car, sent back to a person over a postposition.
+//
+// How many, and in what packaging — "5 set", "1 pair", "2 box" — name nothing
+// either. "Cartend ka Horan 5 SET" against a remembered "cartend horn" was
+// refused on the word "set", which is a unit of counting, not a part.
 const MATCH_FILLER =
-  /^(number|no|nos|pcs|pc|piece|pieces|qty|quantity|ka|ki|ke|ko|hai|liye|lie|mujhe|hume|humein|bhai|chahiye|chaiye|chahiyega|wala|wali|lena|leni|jaldi|urgent|batao|bata|new|old|latest|model|type|size|sizes|inch|inches|for|the|and|with|please|plz|sir|kitne|kitna|kitni|kya|kaun|kaunsi|milega|milegi|price|rate|mrp|cost|stock|available|avl|dena|bhejo|bhej|bhejna|bhejiye)$/i;
+  /^(number|no|nos|pcs|pc|piece|pieces|qty|quantity|set|sets|pair|pairs|pack|packet|box|dozen|ka|ki|ke|ko|hai|liye|lie|mujhe|hume|humein|bhai|chahiye|chaiye|chahiyega|wala|wali|lena|leni|jaldi|urgent|batao|bata|new|old|latest|model|type|size|sizes|inch|inches|for|the|and|with|please|plz|sir|kitne|kitna|kitni|kya|kaun|kaunsi|milega|milegi|price|rate|mrp|cost|stock|available|avl|dena|bhejo|bhej|bhejna|bhejiye)$/i;
 
 // Words that name the SAME thing. A customer writes "Maruti Suzuki"; the
 // catalogue writes "MARUTI". Treating the missing half as a contradiction
@@ -335,6 +339,18 @@ function synonymsOf(word) {
   return [word];
 }
 
+// The words in a message that actually name something. Exported because the
+// phrase memory (core/parts/aliases) compares one customer's sentence against
+// another's and needs the same idea of which words carry meaning.
+function distinctiveWords(text) {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .split(' ')
+    .filter((w) => w && w.length >= 3 && !MATCH_FILLER.test(w) && !/^\d+$/.test(w));
+}
+
 function matchTrustworthy(asked, row) {
   const words = (s) =>
     String(s || '')
@@ -344,7 +360,7 @@ function matchTrustworthy(asked, row) {
       .split(' ')
       .filter(Boolean);
 
-  const theirs = words(asked).filter((w) => w.length >= 3 && !MATCH_FILLER.test(w) && !/^\d+$/.test(w));
+  const theirs = distinctiveWords(asked);
   if (!theirs.length) return true; // nothing distinctive was said; the size matched
 
   const have = new Set(words(String(row.name || '') + ' ' + String(row.partNo || '')));
@@ -410,6 +426,8 @@ module.exports = {
   groupedPart,
   priceOf,
   matchTrustworthy,
+  distinctiveWords,
+  synonymsOf,
   resolve,
   resolveOne,
   describe,
