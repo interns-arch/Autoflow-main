@@ -9,6 +9,7 @@
 // change what the bot tells customers, so they do not inherit that assumption.
 const config = require('../config');
 const kb = require('../core/kb');
+const partAliases = require('../core/parts/aliases');
 
 // Constant-time-ish compare, so a wrong token cannot be found a character at a
 // time by timing the response.
@@ -50,6 +51,9 @@ function wrap(fn) {
 function mount(app) {
   app.use('/api/kb', requireToken);
   app.use('/api/escalations', requireToken);
+  // Behind the same token, and for the same reason: a phrase learned here
+  // decides which part a customer is quoted.
+  app.use('/api/parts', requireToken);
 
   app.get(
     '/api/kb/health',
@@ -181,6 +185,49 @@ function mount(app) {
         autoApprove: Boolean(req.body && req.body.approve),
       });
       res.json({ learned: out });
+    }),
+  );
+
+  // ------------------------------------------------- learned part phrases
+  //
+  // What a person's answer taught the bot, remembered by meaning
+  // (core/parts/aliases). Worth looking at for two reasons: it is the record of
+  // what Prateek sir no longer has to answer twice, and one wrong row here
+  // answers every question that MEANS the same thing — so there is a way to
+  // read them and a way to delete one.
+  app.get(
+    '/api/parts/aliases',
+    wrap(async (req, res) =>
+      res.json({
+        stats: await partAliases.stats(),
+        aliases: await partAliases.list(Math.min(parseInt(req.query.limit, 10) || 100, 500)),
+      }),
+    ),
+  );
+
+  // The tuning tool, as /api/kb/search is for the knowledge base: what WOULD be
+  // recalled for these words, and how sure, without messaging anybody. A reply
+  // with partNo null and a `why` is the interesting case — it says which guard
+  // refused and whether the threshold is in the right place.
+  app.post(
+    '/api/parts/aliases/search',
+    wrap(async (req, res) => {
+      const phrase = req.body && req.body.phrase;
+      if (!phrase) return res.status(400).json({ error: 'phrase required' });
+      res.json({ recall: await partAliases.recall(phrase, { threshold: req.body.threshold }) });
+    }),
+  );
+
+  app.delete(
+    '/api/parts/aliases',
+    wrap(async (req, res) => {
+      const phrase = (req.body && req.body.phrase) || req.query.phrase;
+      if (!phrase) return res.status(400).json({ error: 'phrase required' });
+      const removed = await partAliases.forget(phrase);
+      // The string-key alias in data/state.json is a separate store and is NOT
+      // touched here; say so rather than implying the bot has forgotten
+      // everything about these words.
+      res.json({ removed, note: removed ? 'the exact-wording alias in state.json is separate and still stands' : 'nothing matched' });
     }),
   );
 }

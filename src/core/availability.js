@@ -315,8 +315,15 @@ function displayName(line) {
 // every distinctive word the customer used has to appear somewhere in the
 // part's name or number. Words that describe nothing on their own are
 // ignored, and so are the sizes, which the search already matched on.
+//
+// The Hindi half of that list earns its keep twice over now that a remembered
+// PHRASE is matched against a new question (core/parts/aliases): both sides are
+// somebody's own sentence, so the words they wrap a part in decide nothing and
+// must not be read as a contradiction. "clutch plate chahiye swift KE LIYE"
+// against "swift ka clutch plate chahiye" was refused on the word "liye" — the
+// same part, the same car, sent back to a person over a postposition.
 const MATCH_FILLER =
-  /^(number|no|nos|pcs|pc|piece|pieces|qty|ka|ki|ke|ko|hai|chahiye|chaiye|wala|wali|new|old|latest|model|type|size|sizes|inch|inches|for|the|and|with|please|plz|sir|kitne|kitna|kitni|kya|kaun|kaunsi|milega|milegi|price|rate|mrp|cost|stock|available|avl|dena|bhejo|bhej)$/i;
+  /^(number|no|nos|pcs|pc|piece|pieces|qty|quantity|ka|ki|ke|ko|hai|liye|lie|mujhe|hume|humein|bhai|chahiye|chaiye|chahiyega|wala|wali|lena|leni|jaldi|urgent|batao|bata|new|old|latest|model|type|size|sizes|inch|inches|for|the|and|with|please|plz|sir|kitne|kitna|kitni|kya|kaun|kaunsi|milega|milegi|price|rate|mrp|cost|stock|available|avl|dena|bhejo|bhej|bhejna|bhejiye)$/i;
 
 // Words that name the SAME thing. A customer writes "Maruti Suzuki"; the
 // catalogue writes "MARUTI". Treating the missing half as a contradiction

@@ -457,10 +457,16 @@ sequenceDiagram
   participant K as knowledge.js
   participant H as Helper (ESCALATION_NUMBER)
 
+  participant V as parts/aliases (pgvector)
+
   C->>B: "wiper bottel pipe" / unreadable photo / voice note / "8502 outstanding"
-  B->>K: lookupAlias(phrase)
+  B->>K: lookupAlias(phrase) — the exact words
   alt already learned
     K-->>B: part number
+    B->>C: answer straight away (no human)
+  else the same question in DIFFERENT words
+    B->>V: recall(phrase) — by meaning
+    V-->>B: part number + the phrase it was taught as
     B->>C: answer straight away (no human)
   else new
     B->>H: Question #7 — who is waiting, what is stuck,<br/>WHY, and exactly what reply ends it<br/>(photo or audio attached)
@@ -468,6 +474,7 @@ sequenceDiagram
     alt helper answers in time
       H->>B: "E7 55810M75J30" · "7 2" · "correct" · "no" · swipe-reply
       B->>K: learnAlias(phrase → part)  ← never asked again
+      B->>V: remember(phrase → part), embedded  ← nor in other words
       B->>C: availability / the helper's own words
       B->>H: "✅ #7 done — sent to +91 …" + what is still pending
     else timeout
@@ -482,6 +489,15 @@ Design details worth knowing before you touch it:
 * **Six different question shapes**, because they are different jobs:
   `NOT_IN_CATALOGUE`, `NO_PART_NUMBER`, `UNREADABLE`, `DOCUMENT`, `VOICE`, `NOT_A_PART`,
   `RATE` (`composeAsk`, `:143-243`).
+* **Learned twice, on purpose.** The string key in `state.json` answers the wording it
+  was taught; `core/parts/aliases` embeds the same phrase so the next customer only has
+  to *mean* the same thing. Without the second one, "swift ka clutch plate chahiye" was
+  answered and "clutch plate for swift dzire, 2 pcs" went back to the helper a week
+  later. It refuses where it cannot be sure — below threshold, a near-tie between two
+  remembered parts, a different size, or a brand the customer named that the remembered
+  phrase does not carry — and every refusal is the old behaviour: ask a person.
+  Inspect and prune with `GET`/`DELETE /api/parts/aliases`; tune with
+  `POST /api/parts/aliases/search`.
 * **Only part questions are teachable.** Teaching the bot that "voice note" means
   55810M75J30 would poison every future voice note (`:271`).
 * `VOICE / DOCUMENT / RATE / NOT_A_PART` answers are **relayed as written** — the helper
@@ -632,6 +648,7 @@ the current API. Nothing else in the parked bots depends on removed code.
 |---|---|---|---|
 | Carts, placed orders, SO reviews, open questions, active customer, chat memory, seen-message ids, escalation queue | `/data/state.json` (atomic temp+rename) | ✅ | `src/store.js` |
 | Learned phrase → part, "valid but not stocked", human notes | `knowledge` inside `state.json` | ✅ forever | `core/knowledge.js` |
+| The same phrase → part, **embedded**, so a rewording is recalled instead of re-asked | `bot_part_aliases` (Postgres + pgvector, migration 004) | ✅ forever | `core/parts/aliases.js` |
 | Every message in and out (+ media) | `/shared/chats.jsonl` (rotates) | ✅ | `core/chatLog.js` |
 | Model-vs-gate decisions | `/shared/shadow.jsonl` (rotates, 20 MB) | ✅ | `pipeline/shadow.js` |
 | Open "naam ye rakhun?" questions | `/shared/part-approvals/*.json` | ✅ | both containers |

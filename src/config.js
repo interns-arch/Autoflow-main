@@ -401,6 +401,13 @@ const config = {
     // whisker apart is the wiper case - right size, wrong brand, sitting
     // next to each other - and a near-tie is shown rather than chosen.
     margin: parseFloat(process.env.PARTS_MATCH_MARGIN || '0.03'),
+    // Recalling a PHRASE a person already answered (core/parts/aliases), not a
+    // catalogue row. Both sides are a customer's own words here — "swift ka
+    // clutch plate chahiye" against "clutch plate for swift dzire" — and two
+    // sentences about the same part score higher than a sentence against a
+    // catalogue line, so this is held above the catalogue threshold. The brand
+    // check still has the last word on anything it lets through.
+    aliasThreshold: parseFloat(process.env.PARTS_ALIAS_THRESHOLD || '0.72'),
   },
 
   // ---------------------------------------------------------------- knowledge

@@ -100,8 +100,15 @@ async function main() {
       })
       .catch(() => {});
     // Entries approved while the embedding service was unreachable would stay
-    // unsearchable forever otherwise.
-    setInterval(() => kb.backfillEmbeddings().catch(() => {}), 60 * 60 * 1000).unref();
+    // unsearchable forever otherwise. The phrases a person answered (core/
+    // parts/aliases) ride along: one taught while the embedding service was
+    // down is remembered but unrecallable, which looks exactly like the bug
+    // that table exists to fix — the same question going back to him twice.
+    const catchUp = () => {
+      kb.backfillEmbeddings().catch(() => {});
+      require('./core/parts').aliases.embedPending().catch(() => {});
+    };
+    setInterval(catchUp, 60 * 60 * 1000).unref();
   }
 
   // THE AGENT'S CHECKPOINTER, set up before the first customer message rather

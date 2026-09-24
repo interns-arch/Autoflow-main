@@ -310,9 +310,30 @@ function lookupAlias(phrase) {
 }
 
 // Teach a phrase -> part number. `source` records who taught it.
-function learnAlias(phrase, partNo, source) {
+//
+// TWICE, ON PURPOSE. The string key below is exact and free, and it answers the
+// shortcut somebody types the same way every day ("CTWB 18"). It cannot answer
+// a SENTENCE: nobody types the same sentence twice, so a phrase Prateek sir
+// answered was walked straight past by the next customer's wording and he was
+// asked the same thing again. So the phrase also goes to core/parts/aliases,
+// which embeds it — and there the next question only has to MEAN the same
+// thing.
+//
+// Fire-and-forget: the customer whose question taught us this has already been
+// answered, and a database that is down must cost nothing but the recall.
+function learnAlias(phrase, partNo, source, opts = {}) {
   const k = key(phrase);
   if (!k || !partNo) return null;
+  if (!isPartShaped(k)) {
+    try {
+      require('./parts')
+        .rememberPhrase({ phrase, partNo, partName: opts.partName || null, source, taughtBy: opts.taughtBy || null })
+        .catch(() => {});
+    } catch (_) {
+      // no database configured, or the module could not load: the string key
+      // below still works, exactly as before this existed.
+    }
+  }
   const aliases = bank().aliases;
   const existing = aliases[k];
   aliases[k] = {

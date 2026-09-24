@@ -159,6 +159,22 @@ async function portalCanAnswer(item, reason) {
   }
 }
 
+// WHAT A PERSON ALREADY TOLD US, FOUND BY MEANING.
+//
+// Never throws: a database that cannot be reached costs this question its
+// recall and nothing else — it goes to a person, which is what used to happen
+// every time.
+async function recallLearnedPhrase(item) {
+  try {
+    const parts = require('./parts');
+    if (!parts.enabled()) return null;
+    return await parts.recall(item);
+  } catch (err) {
+    store.log('escalate', 'could not recall a learned phrase: ' + String((err && err.message) || err).slice(0, 80));
+    return null;
+  }
+}
+
 // Which person this question goes to. Only voice notes were split out —
 // somebody has to put headphones on, and that is a different job from
 // answering a part number. Everything else is untouched.
@@ -542,6 +558,46 @@ async function create(
         (already.waiters.length ? ` (${already.waiters.length} also waiting)` : ''),
     );
     return { alreadyOpen: already.id };
+  }
+
+  // ASKED BEFORE IN OTHER WORDS.
+  //
+  // The alias map above is a string key, and it only answers the wording it was
+  // taught. Two customers never write the same sentence, so a part Prateek sir
+  // had already named came back to him under a new phrasing — the one thing the
+  // knowledge shift was supposed to make impossible:
+  //
+  //   "swift ka clutch plate chahiye"       he answered this
+  //   "clutch plate for swift dzire 2 pcs"  and was asked it again
+  //
+  // core/parts/aliases holds the same lesson embedded, so the question only has
+  // to MEAN the same thing. It refuses on its own terms — a near-tie between
+  // two remembered parts, or a phrase that contradicts what was actually said,
+  // comes back without a part number and a person is asked, as before.
+  const recalled = teachable ? await recallLearnedPhrase(item) : null;
+  if (recalled && recalled.partNo) {
+    store.log(
+      'escalate',
+      `"${item}" means ${recalled.partNo} — learned from "${String(recalled.phrase || '').slice(0, 40)}"` +
+        (recalled.exact ? '' : ` (${Number(recalled.similarity).toFixed(2)})`) +
+        '; no human needed',
+    );
+    // Taught under this wording too, so the next one is the free string-key
+    // hit above rather than another embedding call.
+    knowledge.learnAlias(item, recalled.partNo, 'memory', { partName: recalled.name });
+    if (forAgent) return { knownAlready: true, partNo: recalled.partNo };
+    try {
+      await resolveWithAnswer(
+        { customerBot, chatId, customerPhone, item, qty: qty || 1, kind: kind || 'order' },
+        recalled.partNo,
+        'memory',
+      );
+      return null;
+    } catch (err) {
+      // Answering failed for some other reason — fall through and ask, rather
+      // than leave the customer with nothing.
+      store.log('escalate', 'recalled answer could not be delivered: ' + String((err && err.message) || err).slice(0, 80));
+    }
   }
 
   // The portal, one last time, by NAME. If it holds this part there is no
@@ -1085,6 +1141,24 @@ async function resolveWithAnswer(e, chosen, source) {
       ),
     );
   }
+  // WHAT THE PORTAL CALLS IT, kept against both the part and the phrase. The
+  // part number was worked out the expensive way — a person was asked — and the
+  // catalogue index is how the NEXT customer finds it without a search, while
+  // the name on the phrase row is what the brand check reads when it decides
+  // whether a near-enough question may be answered from it.
+  //
+  // Price and stock are not stored. Only which part it is.
+  if (teachable && line.partNo) {
+    // The portal's own spelling when it gave one; never the customer's words,
+    // which are already the phrase and would teach the brand check nothing.
+    const portalName = line.name || line.partName || null;
+    const parts = require('./parts');
+    parts.remember({ partNo: line.partNo, name: portalName || line.partNo }).catch(() => {});
+    parts
+      .rememberPhrase({ phrase: e.item, partNo: line.partNo, partName: portalName, source: source || 'helper' })
+      .catch(() => {});
+  }
+
   // The sales team: the answer and nothing else. Not answerInquiry either —
   // that ends "Send items with quantities to place an order", an order
   // prompt to someone who never orders.

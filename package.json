@@ -19,7 +19,8 @@
     "import:parts": "node scripts/import-parts.js",
     "try:agent": "node scripts/try-agent.js",
     "test:agent": "node scripts/test-agent.js",
-    "test:loop": "node scripts/test-loop.js"
+    "test:loop": "node scripts/test-loop.js",
+    "test:aliases": "node scripts/test-part-aliases.js"
   },
   "dependencies": {
     "@langchain/core": "^1.2.12",

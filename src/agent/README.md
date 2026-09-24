@@ -27,7 +27,10 @@ customer message
 ```
 customer asks
   |
-  1. lookup_known_part        what we were already taught      (free, exact)
+  1. lookup_known_part        what we were already taught
+                              (the exact words, a learned range, or — by
+                               meaning — a question he answered before in
+                               different words)
   2. search_catalogue_index   by meaning, their wording
   3. search_portal_catalogue  the live catalogue
   4. search_the_web           3 phrasings, part NUMBERS only, never a price
@@ -51,7 +54,10 @@ customer asks
      core/kb decides whether what was learned is general or belongs to
      this customer alone, and stores it with its embedding
         |
-     the next customer to ask never gets past step 1
+     the next customer to ask never gets past step 1 — IN WHATEVER WORDS.
+     The phrase he answered is embedded too (core/parts/aliases), because
+     the string key only ever answered the sentence it was taught and
+     nobody types the same sentence twice.
 ```
 
 Three rules hold this together, and each of them was a bug first:

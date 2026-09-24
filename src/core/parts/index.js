@@ -313,4 +313,23 @@ async function stats() {
   return (r && r.rows[0]) || { total: 0, embedded: 0, used: 0 };
 }
 
-module.exports = { enabled, importFile, embedPending, find, remember, stats, searchableText: parse.searchableText };
+// The phrases customers use for a part, remembered by meaning (./aliases).
+// Re-exported here so callers have one door into "which part is this?":
+//
+//   find(text)          the catalogue, by meaning
+//   recall(text)        a phrase a person already answered, by meaning
+//   rememberPhrase(...)  keep one, so nobody is asked it twice
+const aliases = require('./aliases');
+
+module.exports = {
+  enabled,
+  importFile,
+  embedPending,
+  find,
+  remember,
+  stats,
+  searchableText: parse.searchableText,
+  recall: aliases.recall,
+  rememberPhrase: aliases.remember,
+  aliases,
+};

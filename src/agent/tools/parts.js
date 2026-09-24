@@ -55,13 +55,30 @@ const lookupKnownPart = tool(
     const refused = knowledge.notCarried(asked);
     if (refused) return JSON.stringify({ result: 'not_carried', since: refused.at, why: 'we were told we do not carry this' });
 
+    // 4. THE SAME QUESTION, IN DIFFERENT WORDS.
+    //
+    //    Everything above is a string key, and a string key only answers the
+    //    wording it was taught. A sentence is never typed twice the same way,
+    //    so a part the specialist had already named came back to him under a
+    //    new phrasing. The phrases he answered are embedded (core/parts/
+    //    aliases), and this finds them by meaning. It will not pick between
+    //    two remembered parts, and will not answer across a brand the
+    //    customer named.
+    const recalled = await partsIndex.recall(asked).catch(() => null);
+    if (recalled && recalled.partNo) {
+      // Taught under this wording too, so the next one is the free exact hit
+      // at step 1 rather than another embedding call.
+      knowledge.learnAlias(asked, recalled.partNo, 'memory', { partName: recalled.name });
+      return found(recalled.partNo, recalled.name, 'answered before as "' + String(recalled.phrase || '').slice(0, 40) + '"');
+    }
+
     return none('not taught yet');
   },
   {
     name: 'lookup_known_part',
     description:
-      'Resolve a part the bot has ALREADY been taught: an exact part number, a learned shortcut such as "CTWB 18", or one size out of a learned range such as "Cartend wiper blade 16 number". ' +
-      'Costs nothing and is exact. ALWAYS TRY THIS FIRST for any message that names a part. ' +
+      'Resolve a part the bot has ALREADY been taught: an exact part number, a learned shortcut such as "CTWB 18", one size out of a learned range such as "Cartend wiper blade 16 number", or a question the specialist answered before in different words. ' +
+      'Nearly free, and it is the only tool that knows what a person has already told us. ALWAYS TRY THIS FIRST for any message that names a part. ' +
       'Returns result "found" with a part number, "options" when the wording matches a range but not one size, "not_carried" when we were told we do not stock it, or "none" if it has not been taught.',
     schema: z.object({ phrase: z.string().describe('the customer\'s own words for the part, exactly as they wrote them') }),
   },
@@ -114,8 +131,13 @@ const searchPortalCatalogue = tool(
     // and matched a Fortuner blade. A single hit that contradicts the question
     // is shown, not returned as the answer.
     if (rows.length === 1 && availability.matchTrustworthy(asked, rows[0])) {
-      // Worth keeping: the next customer asking this way skips the search.
+      // Worth keeping: the next customer asking this way skips the search, and
+      // the next one asking ANOTHER way skips it too — the words go to the
+      // phrase memory, the part to the catalogue index.
       partsIndex.remember({ partNo: rows[0].partNo, name: rows[0].name }).catch(() => {});
+      partsIndex
+        .rememberPhrase({ phrase: asked, partNo: rows[0].partNo, partName: rows[0].name, source: 'portal' })
+        .catch(() => {});
       return found(rows[0].partNo, rows[0].name, 'portal catalogue, single confident match');
     }
     return options(rows, rows.length === 1 ? 'the only match is not the brand they asked for' : rows.length + ' parts carry that name');
