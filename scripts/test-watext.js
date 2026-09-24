@@ -80,5 +80,34 @@ for (const text of ['Okay', 'Ok', '*Ok*', 'yes', 'OK WA-MUF9D6Q6 please create',
 // happens to be open.
 ok('a decision still needs the request id', cc.readDecision('OK') === null);
 
+console.log('\nTHE SECOND NUDGE IS PLAIN\n');
+
+// Asking nicely in bold is what caused the loop. Once it has failed once, the
+// command is shown as plain text, so whatever comes back is exactly what was
+// shown.
+{
+  const cs = require('../src/core/chatState');
+  const awaiting = cs.slot('customerCreate.awaiting');
+  awaiting.set('WA-NUDGE1', { answers: { name: 'TEST MOTORS', phone: '919999000001' } });
+
+  ok('the first nudge is counted', cc.noteNudge('WA-NUDGE1') === 1);
+  ok('the second is counted', cc.noteNudge('WA-NUDGE1') === 2);
+  ok('the count is written through, so a restart does not forget it', awaiting.get('WA-NUDGE1').nudges === 2);
+  ok('a request that is no longer pending counts nothing', cc.noteNudge('WA-GONE') === 0);
+
+  // The plain wording itself: whatever the bot shows on the second try must
+  // carry no marker WhatsApp would render, or the copy comes back wrong again.
+  const plain = [
+    'WA-NUDGE1 (TEST MOTORS) is still waiting.',
+    '',
+    'Copy one of these exactly:',
+    '',
+    'OK WA-NUDGE1',
+    'NO WA-NUDGE1',
+  ].join('\n');
+  ok('the plain nudge carries nothing WhatsApp will render', !/[*_~`]/.test(plain));
+  ok('...and the command in it parses as an approval', (cc.readDecision('OK WA-NUDGE1') || {}).requestId === 'WA-NUDGE1');
+}
+
 console.log('\n' + pass + ' passed, ' + fail + ' failed\n');
 process.exit(fail ? 1 : 0);

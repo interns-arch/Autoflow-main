@@ -2621,10 +2621,39 @@ class CustomerBot {
     }
 
     store.log(this.key, `${who} wrote on ${requestId} without a decision: "${text.slice(0, 80)}"`);
+
+    // THE SECOND NUDGE DROPS THE BOLD.
+    //
+    // 24 Sep: the first nudge asked for "*OK WA-MUF9D6Q6*". He copied what he
+    // was shown — which is what anybody does — and copying bold text brings
+    // the asterisks with it. The reply was refused, so the same bolded nudge
+    // went again, and he copied it again. Three rounds, nine minutes, a
+    // customer's account unopened, over punctuation the bot had added itself.
+    //
+    // The parser now strips the markup (core/waText), so that loop cannot
+    // recur. This is the other half: once asking nicely has failed once, show
+    // the command as PLAIN TEXT, with nothing in it that can be copied wrong.
+    //
+    // The count lives on the parked request and is written through, so it
+    // survives a restart — otherwise the third message after a deploy would
+    // be the bolded one again.
+    const nudges = customerCreate.noteNudge(requestId);
+
+    if (nudges <= 1) {
+      return reply(
+        t(
+          `${requestId} (${firm}) is still waiting. Reply *OK ${requestId}* to create, *NO ${requestId}* to reject, or "already hai" if they have an account.`,
+          `${requestId} (${firm}) abhi pending hai. Banane ke liye *OK ${requestId}*, reject ke liye *NO ${requestId}*, ya account pehle se hai to "already hai" likhiye.`,
+        ),
+      );
+    }
+
+    // Plain. No asterisks, no underscores, nothing WhatsApp will render —
+    // so whatever comes back is exactly what was shown.
     return reply(
       t(
-        `${requestId} (${firm}) is still waiting. Reply *OK ${requestId}* to create, *NO ${requestId}* to reject, or "already hai" if they have an account.`,
-        `${requestId} (${firm}) abhi pending hai. Banane ke liye *OK ${requestId}*, reject ke liye *NO ${requestId}*, ya account pehle se hai to "already hai" likhiye.`,
+        `${requestId} (${firm}) is still waiting.\n\nCopy one of these exactly:\n\nOK ${requestId}\nNO ${requestId}\n\nOr say "already hai" if they already have an account.`,
+        `${requestId} (${firm}) abhi pending hai.\n\nInme se ek exactly copy kar dijiye:\n\nOK ${requestId}\nNO ${requestId}\n\nYa "already hai" likhiye agar account pehle se hai.`,
       ),
     );
   }

@@ -1005,6 +1005,24 @@ function park(form) {
 function parked(requestId) {
   return awaiting.get(String(requestId || '').toUpperCase()) || null;
 }
+// HOW MANY TIMES THIS REQUEST HAS BEEN NUDGED.
+//
+// Counted here rather than mutated by the caller, because the parked request
+// lives in chatState and a bare mutation is only in memory until something
+// writes it — a restart would reset the count and the approver would be sent
+// the same bolded message a third time.
+//
+// Per REQUEST, not per person: two firms waiting on the same approver do not
+// share a grudge.
+function noteNudge(requestId) {
+  const id = String(requestId || '').toUpperCase();
+  const req = awaiting.get(id);
+  if (!req) return 0;
+  req.nudges = (req.nudges || 0) + 1;
+  awaiting.set(id, req); // write it through, so a restart does not forget
+  return req.nudges;
+}
+
 function unpark(requestId) {
   awaiting.delete(String(requestId || '').toUpperCase());
 }
@@ -1061,6 +1079,7 @@ module.exports = {
   approverName,
   park,
   parked,
+  noteNudge,
   unpark,
   addDiscount,
   noteSummary,
