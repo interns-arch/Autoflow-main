@@ -40,6 +40,7 @@ const knowledge = require('./tools/knowledge');
 const fulfilment = require('./tools/fulfilment');
 const escalation = require('./tools/escalation');
 const web = require('./tools/web');
+const workflows = require('./tools/workflows');
 
 const TOOLS = [
   parts.lookupKnownPart,
@@ -62,6 +63,10 @@ const TOOLS = [
   fulfilment.reportShortShipment,
   fulfilment.partStatus,
   escalation.askAPerson,
+  workflows.resolveOrderList,
+  workflows.accountForm,
+  workflows.lookupVehicle,
+  workflows.myAccount,
 ];
 
 let agent = null;
@@ -80,27 +85,11 @@ function enabled() {
   return Boolean(config.agent.enabled && config.gemini && config.gemini.apiKey);
 }
 
-// Only these numbers reach the agent while it is being trialled, whatever
-// AGENT_ENABLED says. An empty list means nobody — the deliberate default, so
-// that turning the flag on by accident cannot put a model in front of a
-// paying customer.
-function allowed(phone) {
-  const list = config.agent.allowFrom;
-  if (!list.length) return false; // the default: nobody, even when enabled
-
-  // EVERYONE. AGENT_ALLOW_FROM=* means every customer's message is written by
-  // the model rather than by a template.
-  //
-  // It is spelled as a deliberate, ugly wildcard rather than "empty means all"
-  // because the two mistakes are not equally bad: an empty list that meant
-  // everyone would put a model in front of every paying customer the first
-  // time somebody set AGENT_ENABLED while experimenting. An empty list means
-  // nobody, and turning it on for the whole shop has to be typed out.
-  if (list.includes('*')) return true;
-
-  const p = store.normPhone(phone || '');
-  return Boolean(p && list.includes(p));
-}
+// NO ALLOW-LIST. There used to be one (AGENT_ALLOW_FROM) while the agent was
+// trialled beside the template path. The template path is gone for customers
+// — the agent writes every reply — so a list would only decide who gets no
+// answer at all. Every customer reaches the agent; staff keep their commands
+// (bots/customerBot, isOperator).
 
 // Called once at boot, so the Postgres checkpointer is ready before the first
 // customer message rather than being set up inside someone's turn.
@@ -143,9 +132,12 @@ function build() {
   return agent;
 }
 
-function configFor({ chatId, phone, customer, bot }) {
+function configFor({ chatId, phone, customer, bot, message }) {
   return {
     configurable: {
+      // The message being answered, for the tools that need more than its
+      // words — a shop photo or a dropped pin for the account form.
+      message: message || null,
       // The memory key AND the identity, in one object. Nothing here is ever
       // shown to the model: the tools read it, the prompt does not.
       thread_id: chatId,
@@ -171,8 +163,9 @@ function pausedAt(out) {
 // -> { handled, reply, paused }
 //
 //   handled false  the agent could not run at all (the model was down, the
-//                  turn threw). The caller falls back to the deterministic
-//                  path, which is still the whole bot and still works.
+//                  turn threw), or wrote a price no tool gave it. There is
+//                  no template path behind it any more: the caller says one
+//                  plain line and hands the message to a person.
 //
 //   paused true    the agent asked the specialist and is now waiting. The
 //                  caller tells the customer someone is reviewing it, and
@@ -186,10 +179,10 @@ function pausedAt(out) {
 //
 // Collapsing those into a bare null is how a customer ends up answered twice,
 // so they are kept apart.
-async function handle({ bot, chatId, phone, customer, text }) {
-  const message = String(text || '').trim();
-  if (!message) return { handled: false, reply: null };
-  return await run({ bot, chatId, phone, customer }, { messages: [{ role: 'user', content: message }] }, 'turn');
+async function handle({ bot, chatId, phone, customer, text, message }) {
+  const said = String(text || '').trim();
+  if (!said) return { handled: false, reply: null };
+  return await run({ bot, chatId, phone, customer, message }, { messages: [{ role: 'user', content: said }] }, 'turn');
 }
 
 // THE SPECIALIST HAS ANSWERED.
@@ -201,10 +194,13 @@ async function handle({ bot, chatId, phone, customer, text }) {
 // -> true when the customer was answered, false when this thread could not be
 // resumed — in which case escalation answers the old way and the customer is
 // not left with nothing.
-async function resume({ bot, chatId, phone, answer }) {
+async function resume({ bot, chatId, phone, answer, timedOut }) {
   if (!enabled() || !chatId) return false;
   const said = String(answer || '').trim();
-  if (!said) return false;
+  // No words is only a resume when the wait itself has run out: the tool
+  // then tells the model nothing came back, and the model writes what the
+  // customer hears — instead of the old fixed "could not confirm" line.
+  if (!said && !timedOut) return false;
 
   const res = await run({ bot, chatId, phone, customer: null }, new Command({ resume: { answer: said } }), 'resume');
   if (!res.handled) return false;
@@ -241,6 +237,27 @@ async function resume({ bot, chatId, phone, answer }) {
   // closed, so the log reads as one story.
   store.log('agent', `${chatId} answered from the specialist's reply`);
   return true;
+}
+
+// A TURN THE CUSTOMER DID NOT START — the specialist answering after the
+// conversation had already stopped waiting for him (the wait ran out, or a
+// restart lost the pause). The news goes in as a note, the model writes the
+// customer's reply, and it is delivered and recorded like any other.
+//
+// -> true when the customer was answered.
+async function followUp({ bot, chatId, phone, note }) {
+  if (!enabled() || !chatId || !note) return false;
+  const res = await run({ bot, chatId, phone, customer: null }, { messages: [{ role: 'user', content: String(note) }] }, 'follow-up');
+  if (!res.handled || !res.reply) return false;
+  try {
+    const id = await bot.transport.sendToChat(chatId, res.reply);
+    if (typeof bot.recordOutgoing === 'function') bot.recordOutgoing(chatId, id, res.reply);
+    require('./incoming').markSeen(chatId);
+    return true;
+  } catch (e) {
+    store.log('agent', 'could not deliver the follow-up: ' + String((e && e.message) || e).slice(0, 80));
+    return false;
+  }
 }
 
 async function run(who, input, what) {
@@ -338,4 +355,4 @@ function textOf(msg) {
   return '';
 }
 
-module.exports = { handle, resume, warmUp, enabled, allowed, TOOLS, _build: build, _inventedMoney: inventedMoney };
+module.exports = { handle, resume, followUp, warmUp, enabled, TOOLS, _build: build, _inventedMoney: inventedMoney };

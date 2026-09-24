@@ -50,7 +50,7 @@ const punchRefused = require('../core/punchRefused');
 const partish = require('../core/partish');
 const { createTransport } = require('../wa/transport');
 const route = require('../pipeline/route');
-const { handleMedia, NOT_MEDIA } = require('../pipeline/media');
+const { handleMedia, readForAgent, NOT_MEDIA } = require('../pipeline/media');
 
 // How this trade says hello. Kept here rather than in the chat layer because
 // it is the single most common opening message and must never depend on a
@@ -445,6 +445,30 @@ class CustomerBot {
       return true;
     };
 
+    // CUSTOMERS TALK TO THE AGENT — AND ONLY TO THE AGENT.
+    //
+    // Every word a customer reads is written by the model, from what its tools
+    // return. There is no template path for them any more: a photo, a voice
+    // note, an order list, a number plate, an account form, a greeting — all
+    // of it reaches the agent as facts, and the agent writes the reply. The
+    // agent's words go out as it wrote them, without the style post-processing
+    // (profiles.polish) the templates were run through.
+    //
+    // EVERYTHING BELOW THIS LINE IS STAFF TOOLING: admins, the helper, the
+    // Sales Heads approving accounts, salesmen punching orders for a customer,
+    // the sales team asking on a customer's behalf. Those are commands with
+    // powers — ledgers, approvals, any customer's orders — that the customer's
+    // agent must never have, and they stay exactly as they were.
+    if (!this.isOperator(m)) {
+      const asWritten = async (text) => {
+        const sentId = await this.transport.sendToChat(m.chatId, text);
+        conversation.record(m.chatId, 'us', text);
+        rememberMsg(m.chatId, sentId, 'us', text);
+        return true;
+      };
+      return this.answerCustomer(m, asWritten, t);
+    }
+
     // A CUSTOMER FORM IN PROGRESS owns every message until it is finished,
     // and that has to be decided BEFORE anything else reads them. Two of its
     // answers are not text at all: the shop photograph would otherwise be
@@ -478,15 +502,6 @@ class CustomerBot {
     if (m.body) m.body = ai.normalizeOrderText(m.body);
     const text = (m.body || '').trim();
 
-    // A REACTION, AN EDIT, A DELETION — no text, and still the customer saying
-    // something. The template path cannot read them and passes, as it always
-    // has. The agent can: a 👍 on "Yahi chahiye, 20 pcs?", "20" edited to
-    // "25", an order line taken back. Checked before the empty-text exit, which
-    // is where every one of these used to fall silent.
-    if (!text && incoming.isEvent(m) && agent.enabled() && agent.allowed(m.from)) {
-      const done = await this.askAgent(m, '', reply, t);
-      if (done !== null) return done;
-    }
     if (!text) return false;
 
     // AN APPROVER SAYING YES. "OK WA-ABC123" from a Sales Head is the only
@@ -512,50 +527,6 @@ class CustomerBot {
       }
     }
 
-    // THE AGENT.
-    //
-    // One agent holding every tool, deciding for itself which to reach for.
-    // It sits HERE and not at the top of the handler on purpose: everything
-    // above this line is cheap, deterministic and has been right in
-    // production for months — the echo guard, voice and photo, a half-filled
-    // customer form, an approver saying yes. Handing any of that to a model
-    // would be paying tokens to get worse.
-    //
-    // Two gates, and both default to shut. AGENT_ENABLED is off, and
-    // AGENT_ALLOW_FROM is empty, so turning the flag on by accident still
-    // reaches nobody. While it is being tried out it answers exactly the
-    // numbers named in that list and no others.
-    //
-    // If the agent cannot run, this falls through to everything below and
-    // the bot behaves as it always has. If the agent RAN but has nothing to
-    // add — because a tool has already messaged the customer — nothing more
-    // is sent, because the alternative is answering the same person twice.
-    // THREE THINGS ARE NOT A CONVERSATION, and stay deterministic however
-    // wide the agent is switched on:
-    //
-    //   opening an account   a twelve-question form that collects a shop
-    //                        photograph and a dropped pin. The model has no
-    //                        tool for it and would answer with sympathy.
-    //   changing a discount  goes to a Sales Head for approval before the
-    //                        portal is touched. Not the model's to grant.
-    //   a number plate       "DL7CW1692" is a car. It goes to VAHAN, and the
-    //                        answer is remembered so the next message can say
-    //                        "is gaadi ka bumper".
-    //
-    // Each is a handler a few lines below this one, and each would be
-    // silently lost the moment AGENT_ALLOW_FROM was widened. Naming them here
-    // is the difference between "every sales message is written by the model"
-    // and "three features quietly stopped working".
-    //
-    // AND a question the OLD path already asked, which this message is the
-    // answer to. The day the agent is switched on for everybody, some
-    // conversations are mid-sentence: "kitne chahiye?" is on screen, or a
-    // numbered list is waiting to be picked from. The agent knows nothing
-    // about those — they were never in its thread — so it would read "2" as
-    // a brand new message and the customer would have to start again.
-    //
-    // Whoever asked the question answers it. Once those close, the chat is
-    // the agent's like any other.
     // The "someone else's account?" question, if it is the one open.
     const askedCreate = createAsk.get(m.chatId);
     let createAnswer = null;
@@ -568,23 +539,6 @@ class CustomerBot {
       else createAsk.delete(m.chatId);
     }
 
-    const oldQuestionOpen = Boolean(
-      askQty.get(m.chatId) || clarify.get(m.chatId) || voiceOrder.get(m.chatId) || createAnswer,
-    );
-
-    const notForTheAgent =
-      oldQuestionOpen ||
-      (m.buttonId && customerCreate.declinedCreate(text)) ||
-      customerCreate.wantsToStart(text) ||
-      customerCreate.wantsSomeoneElse(text) ||
-      (discountSetup.wantsSetup(text) && !discountSetup.pending(m.chatId)) ||
-      vahan.isOnlyPlate(text);
-
-    if (!notForTheAgent && agent.enabled() && agent.allowed(m.from)) {
-      const done = await this.askAgent(m, text, reply, t);
-      if (done !== null) return done;
-      store.log(this.key, 'agent could not answer ' + m.from + ' — falling back to the usual path');
-    }
 
     // "CREATE CUSTOMER". Asked for in words, rather than waiting for an
     // unregistered order to trigger it. 21 Sep, live: "Create coustomer"
@@ -2776,11 +2730,72 @@ class CustomerBot {
   // portal is touched (founder, 22 Sep). A part-wise rule is set by the
   // lowest price the part may be sold at: the portal's MRP is shown, the
   // price is asked, and the percentage is worked out from the two.
+  // STAFF, NOT CUSTOMERS. Admins, the helper and the voice helper, the
+  // Sales Heads who approve accounts, the account-opening team, salesmen, the
+  // sales team who ask on a customer's behalf. Their messages are commands to
+  // the staff tooling; everyone else is a customer, and talks to the agent.
+  isOperator(m) {
+    const p = store.normPhone(m.from);
+    if (!p) return false;
+    return Boolean(
+      route.isStaff(p) ||
+        (config.salesTeamNumbers || []).includes(p) ||
+        (config.inquiryOnlyNumbers || []).includes(p) ||
+        salesOrder.isSalesPerson(p) ||
+        customerCreate.isApprover(p) ||
+        customerCreate.agentName(p),
+    );
+  }
+
+  // A CUSTOMER'S MESSAGE, start to finish. Read whatever came with it —
+  // photo, document, voice note — into facts (pipeline/media.readForAgent,
+  // which answers nothing), and give the whole thing to the agent.
+  async answerCustomer(m, reply, t) {
+    const read = await readForAgent(this, m);
+    let text = String(read.text || '').trim();
+    // "26300_02752 40 pcs", "16510m68k10.48 pcs" — straightened out the same
+    // way it always was, so the part-number tools read the same thing.
+    if (text) text = ai.normalizeOrderText(text);
+    if (!text && !read.attachment && !incoming.isEvent(m)) return false;
+
+    if (agent.enabled()) {
+      const done = await this.askAgent(m, text, reply, t, read.attachment);
+      if (done !== null) return done;
+    }
+    return this.agentUnavailable(m, text, reply, t, read.attachment);
+  }
+
+  // THE ONE FIXED LINE A CUSTOMER CAN STILL GET. The model could not run at
+  // all — no key, Gemini down — or wrote a price no tool gave it. There is no
+  // template path behind the agent any more, so a person is asked, with the
+  // message (and its photo), and the customer is told so in one line. When he
+  // answers, escalation gives his words to the customer.
+  async agentUnavailable(m, text, reply, t, attachment) {
+    const what = text || (attachment ? incoming.describeAttachment(attachment) : incoming.forLog(m));
+    store.log(this.key, `agent could not answer ${m.from} — handed to a person: "${String(what).slice(0, 60)}"`);
+    try {
+      await escalation.create(this, {
+        chatId: m.chatId,
+        customerPhone: m.from,
+        customerName: m.profileName || null,
+        customerMessageId: m.id || null,
+        item: String(what).slice(0, 300),
+        qty: 1,
+        kind: 'inquiry',
+        reason: 'NOT_A_PART',
+        photo: incoming.heldPhoto(m.chatId) || undefined,
+      });
+    } catch (e) {
+      store.log(this.key, 'could not hand the message to a person: ' + String((e && e.message) || e).slice(0, 80));
+    }
+    return reply(t('One moment — let me get someone to check this for you.', 'Ek minute — main kisi se check karwa ke batata hoon.'));
+  }
+
   // ONE MESSAGE TO THE AGENT, and whatever it says back.
   //
   // -> the reply's result when the agent answered (the caller returns it), or
-  //    null when it could not run, and the caller carries on the usual path.
-  async askAgent(m, text, reply, t) {
+  //    null when it could not run.
+  async askAgent(m, text, reply, t, attachment) {
     const who = await customers.resolve(m.from).catch(() => null);
     const res = await agent.handle({
       bot: this,
@@ -2788,9 +2803,13 @@ class CustomerBot {
       phone: m.from,
       customer: who && who.found ? who : null,
       // The words WITH what WhatsApp said about them — a swipe-reply and what
-      // it quoted, a caption, a reaction, an edit — and anything said in the
-      // chat since the agent last spoke (agent/incoming).
-      text: incoming.forAgent(m, { text, quoted: (id) => quotedMsg(m.chatId, id), before: m.receivedAt }),
+      // it quoted, a caption, a reaction, an edit — what an attachment
+      // contained, and anything said in the chat since the agent last spoke
+      // (agent/incoming).
+      text: incoming.forAgent(m, { text, quoted: (id) => quotedMsg(m.chatId, id), before: m.receivedAt, attachment }),
+      // The message itself, for the tools that need more than its words: the
+      // account form takes a shop photo or a dropped pin straight from it.
+      message: m,
     });
     if (!res.handled) return null;
 

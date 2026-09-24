@@ -352,16 +352,15 @@ const config = {
     // and nowhere else, so changing it here changes it everywhere.
     name: process.env.AGENT_NAME || 'Prateek',
     model: process.env.AGENT_MODEL || 'gemini-3.5-flash-lite',
-    // OFF by default. Nothing reaches a customer through the agent until
-    // this is set, so the existing deterministic path stays in charge while
-    // the agent is being driven by hand from a test number.
-    enabled: String(process.env.AGENT_ENABLED || '').toLowerCase() === 'true',
-    // Numbers allowed to talk to the agent while it is being trialled. Empty
-    // means nobody, even when enabled is true.
-    allowFrom: String(process.env.AGENT_ALLOW_FROM || '')
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean),
+    // ON unless switched off. The agent is the ONLY way a customer is
+    // answered now — there is no template path behind it — so "off" means
+    // every customer message goes straight to a person with one fixed line
+    // (bots/customerBot.agentUnavailable). AGENT_ENABLED=false does that on
+    // purpose; a missing Gemini key does it too (agent/index.enabled).
+    //
+    // AGENT_ALLOW_FROM is gone: with no template path, a list could only
+    // decide who gets no answer at all.
+    enabled: String(process.env.AGENT_ENABLED || 'true').toLowerCase() !== 'false',
     // A runaway loop costs money and makes a customer wait. Measured: a
     // normal part-and-price turn is 2 to 4 tool calls.
     maxToolCalls: parseInt(process.env.AGENT_MAX_TOOL_CALLS || '10', 10),

@@ -140,9 +140,15 @@ const askAPerson = tool(
         reason:
           reason === 'business_question'
             ? 'NOT_A_PART'
-            : reason === 'no_part_number'
-              ? 'NO_PART_NUMBER'
-              : 'NOT_IN_CATALOGUE',
+            : reason === 'voice_note'
+              ? 'VOICE'
+              : reason === 'no_part_number'
+                ? 'NO_PART_NUMBER'
+                : 'NOT_IN_CATALOGUE',
+        // THE PHOTO BEING TALKED ABOUT goes with the question (agent/incoming
+        // holds it). A recording goes too: core/escalation picks the held clip
+        // up itself (core/voiceNote).
+        photo: require('../incoming').heldPhoto(ctx.chatId) || undefined,
         context,
         // Marks this as the agent's question, so that when the answer lands
         // core/escalation hands it back to THIS paused conversation instead
@@ -211,7 +217,7 @@ const askAPerson = tool(
       item: z.string().describe('what the customer asked for, in their own words — this is what the specialist will read'),
       qty: z.number().int().optional().describe('how many they want, if they said'),
       reason: z
-        .enum(['not_in_catalogue', 'no_part_number', 'business_question'])
+        .enum(['not_in_catalogue', 'no_part_number', 'business_question', 'voice_note'])
         .describe(
           '"not_in_catalogue" when nothing matched anywhere; "no_part_number" when you know the part but not its number; ' +
             '"business_question" when it is not about a part at all — delivery, payment, timings, returns, GST',

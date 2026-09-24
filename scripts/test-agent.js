@@ -101,27 +101,22 @@ async function toolChecks() {
   const memory = require('../src/agent/memory');
   ok('the cart note for an empty cart says so', memory.cartNote('nobody@c.us').includes('empty'));
 
-  // WHO REACHES THE MODEL.
+  // WHO REACHES THE MODEL: every customer — and no member of staff.
   //
-  // The default has to be nobody, because the failure is silent and expensive:
-  // a flag set while experimenting would otherwise put a model in front of
-  // every paying customer. "Everyone" has to be typed out.
-  const agentMod = require('../src/agent');
+  // The template path is gone for customers, so there is nothing else to
+  // answer them. Staff keep their command tooling (approvals, SO punching,
+  // ledgers) — powers the customer's agent must never be handed.
   const cfg2 = require('../src/config');
-  const saved = cfg2.agent.allowFrom;
-  try {
-    cfg2.agent.allowFrom = [];
-    ok('an empty allow-list means nobody, not everybody', !agentMod.allowed('919999492550'));
-
-    cfg2.agent.allowFrom = ['919999492550'];
-    ok('a listed number is allowed', agentMod.allowed('919999492550'));
-    ok('an unlisted number is not', !agentMod.allowed('917355374975'));
-
-    cfg2.agent.allowFrom = ['*'];
-    ok('"*" means every customer', agentMod.allowed('917355374975') && agentMod.allowed('919999492550'));
-  } finally {
-    cfg2.agent.allowFrom = saved;
-  }
+  const { prototype: botProto } = require('../src/bots/customerBot');
+  const isOp = (from) => botProto.isOperator.call({}, { from });
+  ok('the agent is on unless switched off', cfg2.agent.enabled === (String(process.env.AGENT_ENABLED || 'true').toLowerCase() !== 'false'));
+  ok('there is no allow-list any more', !('allowFrom' in cfg2.agent) && typeof require('../src/agent').allowed === 'undefined');
+  ok('a customer is not staff — the agent answers them', !isOp('917355374975'));
+  if (cfg2.escalationNumber) ok('the helper is staff — his messages never reach the customer agent', isOp(cfg2.escalationNumber));
+  const admin = (cfg2.adminNumbers || [])[0];
+  if (admin) ok('an admin is staff', isOp(admin));
+  const salesman = (cfg2.salesTeamNumbers || [])[0];
+  if (salesman) ok('the sales team is staff', isOp(salesman));
 
   // ---------------------------------------- tools hand over FACTS, not words
   //
@@ -176,6 +171,68 @@ async function toolChecks() {
   ok('part status says yes or no for their quantity', ps && ps.needed === 20 && ps.available === false && ps.etaDays > 0, JSON.stringify(ps));
   ok('...and never how many we have (5 on the shelf appears nowhere)', !/"available":\s*5|\b5\b/.test(JSON.stringify(ps)) && !/stock|purchase|sales/i.test(JSON.stringify(ps)), JSON.stringify(ps));
   ok('the stock check answers for their quantity too, without a count', st20 && st20.parts[0].status === 'part_in_stock_rest_on_order' && !/\b5\b/.test(JSON.stringify(st20)), JSON.stringify(st20));
+
+  // ------------------------------------------- the work the templates did
+  console.log('\nTHE TEMPLATES\' WORK, AS TOOLS (offline)\n');
+  const workflows = require('../src/agent/tools/workflows');
+  // An order list: matched, on order, and a close match for a number the
+  // portal does not know — the "(1/6) did not match exactly" of old.
+  av.resolve = async (lines) =>
+    lines.map((l) =>
+      l.item === 'GONEX'
+        ? { item: l.item, source: 'unidentified' }
+        : { item: l.item, partNo: l.item, source: l.item === 'ONORD' ? 'unavailable' : 'available', mrp: 47, pricedForCustomer: false },
+    );
+  const fakeBot = { closestMatches: async (names) => new Map(names.map((n) => [n, { partNo: n + '5PK', name: 'Instrument Panel Garnish' }])) };
+  let ol;
+  try {
+    ol = JSON.parse(await workflows.resolveOrderList.invoke({ items: [{ part: 'X1', qty: 20 }, { part: 'ONORD', qty: 5 }, { part: 'GONEX', qty: 20 }] }, { configurable: { chatId: 'facts@c.us', bot: fakeBot } }));
+  } finally {
+    av.resolve = resolveWas;
+  }
+  const [o1, o2, o3] = (ol && ol.lines) || [];
+  ok('an order list is checked in one call, each line with its quantity', o1 && o1.status === 'in_stock' && o1.qty === 20 && o2.status === 'on_order' && o2.etaDays > 0, JSON.stringify(ol));
+  ok('...and a number the portal does not know comes back with its close match', o3 && o3.status === 'close_match_only' && o3.closeMatch.partNo === 'GONEX5PK' && o3.closeMatch.packOf === 5, JSON.stringify(o3));
+  ok('...as facts: no sentence, no stock count', !/found and added|did not match|\bavailable\b/i.test(JSON.stringify(ol)));
+
+  // The account form, driven by the agent: a registered customer is asked
+  // whether it is for someone else; then the form's questions come back as
+  // facts for the agent to ask in its own words.
+  const cust = require('../src/core/customers');
+  const cc = require('../src/core/customerCreate');
+  const resolveCustWas = cust.resolve;
+  cust.resolve = async () => ({ found: true, name: 'Miya Ji Motors' });
+  const formCfg = { configurable: { chatId: 'form-test@c.us', phone: '919000000990', bot: { finishNewCustomer: async () => true, reviewNewCustomer: async () => true } } };
+  cc.cancel('form-test@c.us');
+  let f1;
+  let f2;
+  let f3;
+  try {
+    f1 = JSON.parse(await workflows.accountForm.invoke({ action: 'start' }, formCfg));
+    f2 = JSON.parse(await workflows.accountForm.invoke({ action: 'start', forSomeoneElse: true }, formCfg));
+    f3 = JSON.parse(await workflows.accountForm.invoke({ action: 'answer', answer: '9812345678' }, formCfg));
+  } finally {
+    cust.resolve = resolveCustWas;
+    cc.cancel('form-test@c.us');
+  }
+  ok('a registered customer asking for an account is found to have one already', f1 && f1.alreadyRegistered === true && f1.name === 'Miya Ji Motors', JSON.stringify(f1));
+  ok('...and "for someone else" opens the form, with its first question as a fact', f2 && f2.started === true && /number|WhatsApp/i.test(f2.nextQuestion), JSON.stringify(f2));
+  ok('...and an answer moves the form on', f3 && f3.inProgress === true && typeof f3.formSays === 'string', JSON.stringify(f3));
+
+  // A number plate, looked up.
+  const vahan = require('../src/integrations/vahan');
+  const vEnabledWas = vahan.enabled;
+  const vLookupWas = vahan.lookup;
+  vahan.enabled = () => true;
+  vahan.lookup = async () => ({ maker: 'MARUTI SUZUKI', model: 'SWIFT DZIRE', variant: 'VXI', fuel: 'PETROL', year: '2019' });
+  let car;
+  try {
+    car = JSON.parse(await workflows.lookupVehicle.invoke({ plate: 'DL7CW1692' }, { configurable: {} }));
+  } finally {
+    vahan.enabled = vEnabledWas;
+    vahan.lookup = vLookupWas;
+  }
+  ok('a number plate becomes a car the agent can use', car && car.found && car.model === 'SWIFT DZIRE' && car.year === '2019', JSON.stringify(car));
 
   // THE GUARD THAT MAKES THAT SAFE: a figure no tool gave is never sent.
   const guard = require('../src/agent')._inventedMoney;
@@ -445,6 +502,26 @@ const CASES = [
     check: (reply, tools) =>
       tools.includes('check_stock_and_price') && !/ - (hai|available) — /i.test(reply) && reply.length > 0,
     why: 'forwarded a template line instead of writing the reply',
+  },
+  // THE TEMPLATES' WORK, NOW THE AGENT'S: a photo of an order list, an
+  // account, a number plate — each reached through its tool.
+  {
+    name: 'an order list read off a photo is checked with resolve_order_list',
+    say: '[Sent a PHOTO. It reads as 3 order line(s):\n1. 13780M68P01 x 5\n2. 16510M65L10 x 10\n3. 72371M56R00 x 20]',
+    check: (reply, tools) => tools.includes('resolve_order_list') && !/found and added|did not match exactly/i.test(reply),
+    why: 'did not check the list with resolve_order_list, or wrote the old template',
+  },
+  {
+    name: 'opening an account goes through account_form',
+    say: 'mujhe naya account khulwana hai',
+    check: (_reply, tools) => tools.includes('account_form'),
+    why: 'did not use account_form',
+  },
+  {
+    name: 'a number plate is looked up, not guessed at',
+    say: 'DL7CW1692 ka front bumper chahiye',
+    check: (_reply, tools) => tools.includes('lookup_vehicle'),
+    why: 'did not look the plate up',
   },
   // WHATSAPP FEATURES: the notes agent/incoming puts in front of a message,
   // exactly as the bot builds them.

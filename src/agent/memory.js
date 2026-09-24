@@ -306,8 +306,16 @@ function contextMiddleware({ createMiddleware, z }) {
       const configurable = (request.runtime && (request.runtime.configurable || (request.runtime.config && request.runtime.config.configurable))) || {};
       const chatId = configurable.chatId || configurable.thread_id || null;
       const registered = configurable.customer && configurable.customer.name;
+      // AN ACCOUNT FORM PART-WAY THROUGH. Without this "07AABCU9603R1ZM" is a
+      // part number to look up, not the GST number the form asked for.
+      const form = chatId ? require('../core/customerCreate').pending(chatId) : null;
       const extra = [
         cartNote(chatId),
+        form
+          ? 'ACCOUNT FORM OPEN: this customer is part-way through opening an account' +
+            (form.forSomeoneElse ? ' for someone else' : '') +
+            '. Unless they are plainly asking about something else, their message — or the photo or location they sent — answers the form\'s last question: call account_form with action "answer".'
+          : '',
         st.notes || registered
           ? 'WHAT WE KNOW ABOUT THIS CUSTOMER (background; the tools and the live cart win if they disagree):\n' +
             [registered ? 'Registered with us as ' + registered + '.' : '', st.notes || ''].filter(Boolean).join('\n')

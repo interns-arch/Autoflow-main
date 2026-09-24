@@ -126,6 +126,19 @@ async function main() {
   });
 
   const customer = new CustomerBot();
+  // THE FLOWS BELOW ARE STAFF TOOLING NOW.
+  //
+  // A customer's message goes to the agent and nothing else — every reply is
+  // written by the model from what its tools return (bots/customerBot,
+  // answerCustomer). The command flows this suite drives — orders punched from a
+  // list, close matches offered one by one, quantity asks, the account form,
+  // approvals, rates — are what STAFF use: the sales team asking for a
+  // customer, salesmen punching an SO, the Sales Head approving. So the sim
+  // numbers here are treated as staff, and every check below keeps testing
+  // that tooling exactly as it was. Section [70] at the end restores the real
+  // split and tests the customer path itself: the agent, and only the agent.
+  const realIsOperator = customer.isOperator.bind(customer);
+  customer.isOperator = () => true;
   const bots = { customer };
   require('../src/core/admin').attach(bots);
   const escalation = require('../src/core/escalation');
@@ -5721,6 +5734,84 @@ async function main() {
     ai66.readShopPhoto = shopWas66;
     cfg66.team = teamWas66;
     portal66._setMockDuplicates([]);
+  }
+
+  // ---- [70] THE CUSTOMER PATH: the agent, and only the agent ----
+  //
+  // Everything above drove the staff tooling. Here the real split is back: a
+  // customer's message — typed, a photo, a greeting, a reaction — goes to the
+  // agent, and what the customer receives is the agent's own words and
+  // nothing else. The agent is a stand-in: this suite has no model key, and
+  // what is being tested is the routing, not the model's judgement.
+  console.log('\n[70] customers: the agent writes every reply — no template path');
+  {
+    customer.isOperator = realIsOperator;
+    const agent70 = require('../src/agent');
+    const ai70 = require('../src/core/ai');
+    const handleWas70 = agent70.handle;
+    const enabledWas70 = agent70.enabled;
+    const readWas70 = ai70.parseOrderImage;
+    const got70 = [];
+    agent70.enabled = () => true;
+    agent70.handle = async (a) => {
+      got70.push(a);
+      return { handled: true, reply: 'AGENT WROTE THIS #' + got70.length };
+    };
+    const C70 = '919000000701';
+    // The bot listens only to whitelisted DMs in this suite.
+    const dmsWas70 = config.customerDms.slice();
+    config.customerDms.push(C70, ...(config.adminNumbers || []).slice(0, 1));
+    const say70 = async (msg) => {
+      customer.transport.outbox.length = 0;
+      await customer.transport.injectIncoming({ from: C70, chatId: 'sim-' + C70, isGroup: false, mediaType: 'chat', ...msg });
+      return customer.transport.outbox.map((o) => o.text || '');
+    };
+    try {
+      check('a customer is not staff', !customer.isOperator({ from: C70 }));
+
+      const hi = await say70({ body: 'hi' });
+      check('a greeting goes to the agent — not the mirrored template', got70.length === 1 && /hi/.test(got70[0].text));
+      check('...and the customer receives exactly what the agent wrote', hi.length === 1 && hi[0] === 'AGENT WROTE THIS #1', JSON.stringify(hi));
+
+      const typed = await say70({ body: '13780M68P01 10 pcs' });
+      check('an order typed by a customer goes to the agent, not the order parser', got70.length === 2 && /13780M68P01/.test(got70[1].text));
+      check('...with nothing else sent alongside it', typed.length === 1 && /^AGENT WROTE THIS/.test(typed[0]), JSON.stringify(typed));
+
+      ai70.parseOrderImage = async () => [{ item: '72371M56R00', qty: 20 }, { item: '13780M68P01', qty: 5 }];
+      const photo = await say70({ body: '', hasMedia: true, mediaType: 'image', mediaBase64: 'iVBORw0KGgo=', mediaMime: 'image/png' });
+      const seen = got70[got70.length - 1];
+      check('a photo is READ, and what it says goes to the agent as facts', /Sent a PHOTO\. It reads as 2 order line/.test(seen.text) && /72371M56R00 x 20/.test(seen.text), seen.text);
+      check('...and no "part(s) found and added" template reaches the customer', photo.length === 1 && !/found and added|did not match exactly/i.test(photo.join('\n')), JSON.stringify(photo));
+      check('the message itself goes with it, for the tools that need a photo or a pin', seen.message && seen.message.mediaBase64 === 'iVBORw0KGgo=');
+
+      const react = await say70({ body: '', mediaType: 'reaction', reaction: { messageId: 'wamid.X', emoji: '👍' } });
+      check('a reaction reaches the agent too', /Reacted 👍/.test(got70[got70.length - 1].text) && react.length === 1);
+
+      // THE ONE FIXED LINE: the model could not run. A person is asked.
+      agent70.handle = async () => ({ handled: false, reply: null });
+      const down = await say70({ body: 'clutch plate swift chahiye' });
+      const toHelper70 = down.length;
+      check('with the agent down, the customer gets one plain line — not the old template path', down.filter((x) => x).length >= 1 && /check|Ek minute/i.test(down.join('\n')) && !/available|MRP|Rs\./i.test(down.join('\n')), JSON.stringify(down));
+      check('...and the message is handed to a person', toHelper70 >= 2 || customer.transport.outbox.some((o) => o.to === require('../src/store').normPhone(config.escalationNumber)), JSON.stringify(customer.transport.outbox.map((o) => o.to)));
+
+      // STAFF NEVER REACH THE CUSTOMER AGENT.
+      const before70 = got70.length;
+      agent70.handle = async (a) => {
+        got70.push(a);
+        return { handled: true, reply: 'AGENT' };
+      };
+      if (config.adminNumbers && config.adminNumbers[0]) {
+        customer.transport.outbox.length = 0;
+        await customer.transport.injectIncoming({ from: config.adminNumbers[0], chatId: 'sim-' + config.adminNumbers[0], isGroup: false, body: 'pending', mediaType: 'chat' });
+        check('an admin\'s message goes to the staff tooling, not the customer agent', got70.length === before70);
+      }
+    } finally {
+      agent70.handle = handleWas70;
+      agent70.enabled = enabledWas70;
+      ai70.parseOrderImage = readWas70;
+      customer.isOperator = () => true;
+      config.customerDms = dmsWas70;
+    }
   }
 
 

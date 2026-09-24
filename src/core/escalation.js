@@ -835,6 +835,11 @@ async function onTimeout(id) {
   if (!e || e.timedOut) return;
   e.timedOut = true;
   persist();
+  // The agent's own question: the agent tells the customer, in its words.
+  if (await timeoutToAgent(e)) {
+    store.log('escalate', `E${id} timed out — the agent told the customer; still waiting on the helper`);
+    return;
+  }
   store.log('escalate', `E${id} timed out — customer told; still waiting on the helper`);
   await fallbackReply(e);
 }
@@ -1085,10 +1090,43 @@ async function handBackToAgent(e, specialistSaid) {
       store.log('escalate', `#${e.id} answer handed back to the agent for ${e.agentThread}`);
       return true;
     }
+    // NOT WAITING ANY MORE — the wait ran out and the agent already told the
+    // customer, or a restart lost the pause. His answer is still the agent's
+    // to give, not a template's: it goes in as a fresh turn, and the agent
+    // writes the reply from it.
+    const followed = await agent.followUp({
+      bot: e.customerBot,
+      chatId: e.agentThread,
+      phone: e.customerPhone,
+      note:
+        `[Note from the shop, not from the customer: our specialist has now answered the question you asked him about "${e.item}". ` +
+        `He said: "${String(specialistSaid || '').trim().slice(0, 600)}". Tell the customer — in their language, and if he named a part number, check it with check_stock_and_price before quoting anything.]`,
+    });
+    if (followed) {
+      store.log('escalate', `#${e.id} answer given to the agent as a follow-up for ${e.agentThread}`);
+      return true;
+    }
   } catch (err) {
     store.log('escalate', `#${e.id} agent could not take the answer: ` + String((err && err.message) || err).slice(0, 90));
   }
   return false;
+}
+
+// THE WAIT RAN OUT on a question the AGENT asked. The customer hears it from
+// the agent — which knows what they asked and in what language — instead of
+// the fixed "could not confirm, send the exact part number" line. The question
+// stays open: when he does answer, handBackToAgent gives it to the agent as a
+// follow-up.
+async function timeoutToAgent(e) {
+  if (!e || !e.agentThread) return false;
+  try {
+    const agent = require('../agent');
+    if (!agent.enabled || !agent.enabled()) return false;
+    return await agent.resume({ bot: e.customerBot, chatId: e.agentThread, phone: e.customerPhone, answer: '', timedOut: true });
+  } catch (err) {
+    store.log('escalate', `#${e.id} timeout could not be handed to the agent: ` + String((err && err.message) || err).slice(0, 90));
+    return false;
+  }
 }
 
 async function resolveWithAnswer(e, chosen, source) {
