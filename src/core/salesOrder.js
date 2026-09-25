@@ -700,10 +700,59 @@ function inr(v) {
   return Number.isFinite(n) ? n.toLocaleString('en-IN', { maximumFractionDigits: 2 }) : '-';
 }
 
+// THE CUSTOMER'S LEDGER AS A PDF (founder, 25 Sep): every posted entry on
+// their account in Odoo for the last 90 days, the opening and closing
+// balance, sent as a document into the agent's chat. -> true when it went.
+async function sendLedgerPdf(bot, m, row, t) {
+  const portal = require('../integrations/dealerPortal');
+  const odoo = require('../integrations/odoo');
+  let full = row;
+  if (!full.odoo_partner_id && full.name) {
+    const rows = await portal.searchAccounts(full.name).catch(() => []);
+    full = { ...full, ...(rows.find((r) => Number(r.id) === Number(full.id)) || {}) };
+  }
+  if (!odoo.enabled() || !full.odoo_partner_id) {
+    store.log('sales', 'no ledger PDF for ' + full.name + ': ' + (odoo.enabled() ? 'no Odoo partner' : 'Odoo not configured'));
+    return false;
+  }
+  try {
+    const st = await odoo.statement(full.odoo_partner_id);
+    const buf = await require('./pdf').ledgerPdf(st, {
+      name: full.name,
+      phone: full.phone || full.mobile || null,
+      gst: full.gst_no || null,
+      address: [full.address, full.state_name].filter(Boolean).join(', ') || null,
+      portalId: full.id,
+      creditLimit: full.credit_limit != null ? Number(full.credit_limit) : null,
+      creditDays: full.credit_days != null ? full.credit_days : null,
+    });
+    const safe = String(full.name || 'customer').replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
+    const due = st.closing >= 1 ? 'due ' + require('./pdf').rs(st.closing) : 'nothing due';
+    await bot.transport.sendDocument(
+      m.chatId,
+      buf,
+      'Ledger-' + safe + '-' + st.to + '.pdf',
+      'application/pdf',
+      t(full.name + ' — ledger ' + st.from + ' to ' + st.to + ' (' + due + ')', full.name + ' — ledger ' + st.from + ' se ' + st.to + ' (' + due + ')'),
+    );
+    store.log('sales', m.from + ' was sent the ledger PDF of ' + full.name + ' (' + st.lines.length + ' entries, ' + due + ')');
+    return true;
+  } catch (e) {
+    store.log('sales', 'ledger PDF for ' + full.name + ' failed: ' + String((e && e.message) || e).slice(0, 140));
+    return false;
+  }
+}
+const LEDGER_RE = /\b(ledger|khata|statement|hisab|hisaab|account\s*statement)\b/i;
+
 async function answerAbout(bot, m, row, about, reply, t) {
   const portal = require('../integrations/dealerPortal');
   store.log('sales', m.from + ' asked about ' + row.name + ' (' + about.intent + (about.part ? ' ' + about.part : '') + ')');
-  if (about.intent === 'ledger' || about.intent === 'credit' || about.intent === 'status') {
+  if (about.intent === 'ledger') {
+    await reply(await lookup.answer(row, about.intent, t));
+    await sendLedgerPdf(bot, m, row, t);
+    return true;
+  }
+  if (about.intent === 'credit' || about.intent === 'status') {
     return reply(await lookup.answer(row, about.intent, t));
   }
   const ctx = await enrich(ctxFor(row), row);
@@ -1277,6 +1326,33 @@ async function handle(bot, m, text, reply, t) {
   // 1b. The customer's name for parts sent in a file, sent on its own.
   if (await fileAnalysisName(bot, m, text, reply, t)) return true;
 
+  // 1b2. A LEDGER by phone / GST number, or for the customer just shown:
+  //      "9654078241 ka ledger", "ledger bhejo", "is customer ka khata".
+  if (LEDGER_RE.test(text) && (findKeyIn(text) || !lookup.parse(text))) {
+    const k = findKeyIn(text);
+    let rows = k ? await findByKey(k).catch(() => []) : [];
+    if (!k) {
+      const shown = s && s.stage === 'choose' && s.candidates && s.candidates.length === 1 ? s.candidates[0] : null;
+      const active = !shown && activeCustomer(m.chatId);
+      if (shown) rows = [shown];
+      else if (active) rows = [{ ...(active.raw || {}), id: active.buyerId, name: active.name }];
+    }
+    if (rows.length === 1) {
+      await reply(t('Sending the ledger of ' + rows[0].name + '…', rows[0].name + ' ka ledger bhej raha hoon…'));
+      if (!(await sendLedgerPdf(bot, m, rows[0], t))) {
+        return reply(await lookup.answer(rows[0], 'ledger', t).catch(() => t('The ledger could not be made right now.', 'Ledger abhi nahi ban paya.')));
+      }
+      return true;
+    }
+    if (rows.length > 1) {
+      start(m.chatId, rows.slice(0, MAX_CANDIDATES), null, 'ledger');
+      return reply(t('Which one?' + String.fromCharCode(10), 'Kaunsa wala?' + String.fromCharCode(10)) + rows.slice(0, MAX_CANDIDATES).map((r, i) => i + 1 + '. ' + label(r)).join(String.fromCharCode(10)));
+    }
+    if (k) return reply(t('No customer on the portal with that number.', 'Is number pe portal mein koi customer nahi mila.'));
+    sessions.set(m.chatId, { stage: 'askCustomer', intent: 'ledger', items: null, at: Date.now() });
+    return reply(t("Whose ledger? Send the customer's phone number or GST number (or name).", 'Kiska ledger? Customer ka phone number ya GST number bhejiye (ya naam).'));
+  }
+
   // 1c0. ASKING ABOUT A CUSTOMER — "customer ki detail", "check customer
   // 9654078241", "mere number pe koi account hai". The phone or GSTIN in it is
   // looked up below; without one, whose is asked.
@@ -1296,6 +1372,20 @@ async function handle(bot, m, text, reply, t) {
 
   // 1c1. The customer's NAME, after "kis customer ke liye?".
   if (s && s.stage === 'askCustomer' && !readCustomerKey(text) && !findKeyIn(text) && looksLikeName(text)) {
+    if (s.intent === 'ledger') {
+      const found = await findCustomers(text).catch(() => ({ top: [] }));
+      if (found.top.length === 1) {
+        clear(m.chatId);
+        await reply(t('Sending the ledger of ' + found.top[0].name + '…', found.top[0].name + ' ka ledger bhej raha hoon…'));
+        if (!(await sendLedgerPdf(bot, m, found.top[0], t))) return reply(await lookup.answer(found.top[0], 'ledger', t));
+        return true;
+      }
+      if (found.top.length > 1) {
+        start(m.chatId, found.top, null, 'ledger');
+        return reply(t('Which one?\n', 'Kaunsa wala?\n') + found.top.map((r, i) => i + 1 + '. ' + label(r)).join('\n'));
+      }
+      return reply(t('No customer called "' + text + '". Send the phone number or GST number.', '"' + text + '" naam ka customer nahi mila. Phone number ya GST number bhejiye.'));
+    }
     return searchByName(m, text, s.items || takeItems(m.chatId), reply, t);
   }
 
@@ -1318,6 +1408,16 @@ async function handle(bot, m, text, reply, t) {
           what + ' pe portal mein koi customer nahi mila. Naya account kholna hai to "customer bana do" likhiye.',
         ),
       );
+    }
+    if (s && s.stage === 'askCustomer' && s.intent === 'ledger') {
+      if (rows.length === 1) {
+        clear(m.chatId);
+        await reply(t('Sending the ledger of ' + rows[0].name + '…', rows[0].name + ' ka ledger bhej raha hoon…'));
+        if (!(await sendLedgerPdf(bot, m, rows[0], t))) return reply(await lookup.answer(rows[0], 'ledger', t));
+        return true;
+      }
+      start(m.chatId, rows.slice(0, MAX_CANDIDATES), null, 'ledger');
+      return reply(t('Which one?' + String.fromCharCode(10), 'Kaunsa wala?' + String.fromCharCode(10)) + rows.slice(0, MAX_CANDIDATES).map((r, i) => i + 1 + '. ' + label(r)).join(String.fromCharCode(10)));
     }
     const items = takeItems(m.chatId);
     start(m.chatId, rows.slice(0, MAX_CANDIDATES), items);
@@ -1349,7 +1449,9 @@ async function handle(bot, m, text, reply, t) {
         clear(m.chatId);
         if (about) return about.many ? answerAboutMany(bot, m, row, about, reply, t) : answerAbout(bot, m, row, about, reply, t);
         store.log('sales', m.from + ' asked about ' + row.name + ' (' + s.intent + ')');
-        return reply(await lookup.answer(row, s.intent, t));
+        await reply(await lookup.answer(row, s.intent, t));
+        if (s.intent === 'ledger') await sendLedgerPdf(bot, m, row, t);
+        return true;
       }
       const chosen = await choose(m.chatId, pick);
       const c = chosen.customer;

@@ -126,13 +126,14 @@ function build(now = new Date()) {
     `Orders placed: ${sales.length} — Rs ${total.toLocaleString('en-IN')}`,
     `Discounts approved: ${count('discount', 'approved')}` + (count('discount', 'rejected') ? `, rejected ${count('discount', 'rejected')}` : ''),
     `Orders approved: ${count('order', 'approved')}` + (count('order', 'rejected') ? `, rejected ${count('order', 'rejected')}` : '') + (count('order', 'failed') ? `, refused by the portal ${count('order', 'failed')}` : ''),
+    count('payment', 'settled') || pending.some((e) => e.kind === 'payment') ? `Payments settled: ${count('payment', 'settled')}` + (pending.filter((e) => e.kind === 'payment').length ? `, waiting ${pending.filter((e) => e.kind === 'payment').length}` : '') : null,
     pending.length ? `Still waiting: ${pending.length}` : null,
   ]
     .filter(Boolean)
     .join('\n');
 
   // With a byte-order mark, so Excel opens the ₹ and the names correctly.
-  return { ymd, csv: '﻿' + lines.join('\r\n') + '\r\n', summary, created, sales, events, pending };
+  return { ymd, csv: '﻿' + lines.join('\r\n') + '\r\n', summary, created, sales, events, pending, askedBy: Object.fromEntries(asked) };
 }
 
 // To every Sales Head. The report goes as a document; if a phone cannot be
@@ -141,14 +142,22 @@ async function send(bot, now = new Date()) {
   const escalation = require('./escalation');
   const r = build(now);
   const filename = `Cartrends-daily-report-${r.ymd}.csv`;
+  let pdf = null;
+  try {
+    pdf = await require('./pdf').reportPdf(r);
+  } catch (e) {
+    store.log('report', 'daily report PDF failed, sending the CSV only: ' + String((e && e.message) || e).slice(0, 120));
+  }
   let sent = 0;
   for (const phone of Object.keys(config.creation.approvers || {})) {
     try {
       // Outside the 24h window a message is silently dropped.
       await escalation.ensureWindow(bot.transport, phone, 'Daily report — file follows');
       if (bot.transport.sendDocument) {
-        // WhatsApp takes a CSV as text/plain; the .csv name opens it in Excel.
-        await bot.transport.sendDocument(phone, Buffer.from(r.csv, 'utf8'), filename, 'text/plain', r.summary);
+        // The PDF to read on the phone (founder, 25 Sep), and the CSV to open
+        // in Excel — WhatsApp takes a CSV as text/plain; the .csv name opens it.
+        if (pdf) await bot.transport.sendDocument(phone, pdf, filename.replace(/\.csv$/, '.pdf'), 'application/pdf', r.summary);
+        await bot.transport.sendDocument(phone, Buffer.from(r.csv, 'utf8'), filename, 'text/plain', pdf ? 'Same report as a spreadsheet (CSV)' : r.summary);
       } else {
         await bot.transport.sendText(phone, r.summary);
       }

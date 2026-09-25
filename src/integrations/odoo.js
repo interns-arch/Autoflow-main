@@ -108,6 +108,52 @@ async function ledger(partnerId, { limit = 6 } = {}) {
   };
 }
 
+// THE LEDGER — every posted entry on the customer's receivable account:
+// invoices and the opening balance as debits, payments and credit notes as
+// credits, with the running balance. `from` (YYYY-MM-DD) starts it, with the
+// balance before it as the opening; default the last 90 days.
+// -> { name, from, to, opening, lines: [{ date, voucher, particulars, debit,
+//      credit, balance }], closing, debit, credit }
+async function statement(partnerId, { from, to } = {}) {
+  const id = Number(partnerId);
+  if (!id) return null;
+  const today = new Date().toISOString().slice(0, 10);
+  to = to || today;
+  from = from || new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const base = [['partner_id', '=', id], ['parent_state', '=', 'posted'], ['account_id.account_type', '=', 'asset_receivable']];
+  const [partner] = await call('res.partner', 'read', [[id]], { fields: ['name'] });
+  const before = await call('account.move.line', 'read_group', [[...base, ['date', '<', from]], ['balance:sum'], []], { lazy: false });
+  const opening = num(before && before[0] && before[0].balance);
+  const rows = await call('account.move.line', 'search_read', [[...base, ['date', '>=', from], ['date', '<=', to]]], {
+    fields: ['date', 'move_name', 'ref', 'name', 'debit', 'credit', 'journal_id', 'move_type'],
+    order: 'date asc, id asc',
+    limit: 1000,
+  });
+  const what = (l) => {
+    const journal = (l.journal_id && l.journal_id[1]) || '';
+    if (l.move_type === 'out_invoice') return 'Sales invoice' + (l.ref ? ' (' + l.ref + ')' : '');
+    if (l.move_type === 'out_refund') return 'Credit note';
+    if (/opening/i.test(journal) || /^OB\//.test(l.move_name || '')) return 'Opening balance';
+    if (Number(l.credit) > 0) return 'Payment received' + (journal ? ' — ' + journal.replace(/\s*\(.*\)\s*$/, '') : '');
+    return String(l.name || journal || 'Entry').slice(0, 60);
+  };
+  let run = opening;
+  const lines = rows.map((l) => {
+    run = num(run + num(l.debit) - num(l.credit));
+    return { date: l.date, voucher: l.move_name, particulars: what(l), debit: num(l.debit), credit: num(l.credit), balance: run };
+  });
+  return {
+    name: partner && partner.name,
+    from,
+    to,
+    opening,
+    lines,
+    closing: run,
+    debit: num(lines.reduce((s, l) => s + l.debit, 0)),
+    credit: num(lines.reduce((s, l) => s + l.credit, 0)),
+  };
+}
+
 // Posted credit notes only: a draft one is not money the customer has.
 async function creditNotes(partnerId, { limit = 6 } = {}) {
   const id = Number(partnerId);
@@ -176,4 +222,4 @@ async function ensurePartner({ name, phone, gstNo, email, address, city, state, 
   return { id, created: true, matchedBy: null };
 }
 
-module.exports = { enabled, ledger, creditNotes, ensurePartner, _call: call, _login: login };
+module.exports = { enabled, ledger, statement, creditNotes, ensurePartner, _call: call, _login: login };
