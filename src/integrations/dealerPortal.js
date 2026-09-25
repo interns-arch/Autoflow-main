@@ -1254,6 +1254,15 @@ module.exports = {
     return Array.isArray(data) ? data : (data && (data.items || data.data || data.results)) || [];
   },
 
+  // A customer's details changed on the portal: only the fields sent (name,
+  // phone, email, gst_no, address, credit_days, credit_limit, dealer_category).
+  async updateCustomer(accountId, fields) {
+    if (isMock()) return { ok: true, mock: true };
+    const data = await api('PUT', '/users/customer/' + encodeURIComponent(accountId) + '/update', fields, true, 'admin');
+    store.log('portal', `customer ${accountId} updated: ${JSON.stringify(fields).slice(0, 120)}`);
+    return data;
+  },
+
   // The same search, by the customer's MOBILE: a salesman ordering for a
   // customer names them by their phone as often as by their name.
   async searchAccountsByMobile(mobile) {
