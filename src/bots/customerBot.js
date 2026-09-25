@@ -2590,7 +2590,22 @@ class CustomerBot {
       // account; SHREE SHYAM ENTERPRISES: 51818). An account with no partner
       // can take orders that never become an Odoo SO, so it is checked here
       // and the Sales Head is told plainly if it is missing.
-      const odoo = await this.odooLinkOf(req.answers.phone);
+      let odoo = await this.odooLinkOf(req.answers.phone);
+      // The portal did not make it: the bot makes it — or finds the one that
+      // is already there by GSTIN or phone — and asks the portal again, which
+      // links a partner it can match on its own.
+      if (!odoo.partnerId) {
+        try {
+          const made = await require('../integrations/odoo').ensurePartner(account);
+          store.log(this.key, `${decision.requestId}: Odoo partner ${made.id} ${made.created ? 'created by the bot' : 'found by ' + made.matchedBy}`);
+          const again = await this.odooLinkOf(req.answers.phone, { tries: 3 });
+          odoo = again.partnerId
+            ? again
+            : { partnerId: null, made: made.id, why: `created on Odoo as partner ${made.id}, but the portal has not linked it to the account yet` };
+        } catch (e) {
+          odoo.why = 'Odoo: ' + String((e && e.message) || e).slice(0, 80);
+        }
+      }
       const odooNote = odoo.partnerId
         ? t(` On Odoo as partner ${odoo.partnerId}.`, ` Odoo pe bhi hai (partner ${odoo.partnerId}).`)
         : t(
