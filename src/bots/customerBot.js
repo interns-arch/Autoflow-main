@@ -466,6 +466,21 @@ class CustomerBot {
         rememberMsg(m.chatId, sentId, 'us', text);
         return true;
       };
+      // A CUSTOMER SETTING UP THEIR OWN DISCOUNT. Anyone may ask for one, not
+      // only an agent; the rule goes to the Sales Head ("OK DSC-…") before the
+      // portal is touched, whoever asked. Its answers — "12", "3 mahine" — are
+      // the setup's, so an open one is checked before the agent sees them. A
+      // question asked in the middle (answerDiscount -> null) goes on to it.
+      const said = String(m.body || '').trim();
+      if (said && !['image', 'video', 'document', 'audio', 'ptt', 'sticker'].includes(m.mediaType)) {
+        if (discountSetup.pending(m.chatId)) {
+          const done = await this.answerDiscount(m, said, asWritten, t);
+          if (done) return done;
+        } else if (discountSetup.wantsSetup(said)) {
+          store.log(this.key, `${m.from} asked to set up a discount: "${said.slice(0, 60)}"`);
+          return this.startDiscountChange(m, said, asWritten, t);
+        }
+      }
       return this.answerCustomer(m, asWritten, t);
     }
 
@@ -2405,11 +2420,10 @@ class CustomerBot {
         `Shukriya — approval ke liye bhej diya (${form.answers.requestId}). Account khulte hi bata dunga.`,
       ),
     );
-    // An AGENT opened it: their customer's discount is theirs to set up, now,
-    // while the approval runs. A customer registering themselves is not asked
-    // to name their own discount.
-    if (form.byName) return this.startDiscountSetup(m, form, t);
-    return true;
+    // The discount is set up now, while the approval runs — by whoever filled
+    // the form, an agent or the customer registering themselves. Every rule
+    // still goes to the Sales Head before the portal is touched.
+    return this.startDiscountSetup(m, form, reply, t);
   }
 
 
@@ -2878,27 +2892,27 @@ class CustomerBot {
     return sent;
   }
 
-  // A NEW ACCOUNT, just sent for approval: its agent sets the discount now.
-  async startDiscountSetup(m, form, t) {
+  // A NEW ACCOUNT, just sent for approval: whoever filled the form sets the
+  // discount now. Asked through `reply`, so on the agent's path the question
+  // comes back to the agent as a fact and it asks it in its own words.
+  async startDiscountSetup(m, form, reply, t) {
+    const by = form.byName || `customer (${m.from})`;
     discountSetup.save(m.chatId, {
       mode: 'new',
       accountRequestId: form.answers.requestId,
       phone: form.answers.phone,
       customer: form.answers.name || form.answers.phone,
-      setBy: form.byName,
+      setBy: by,
       step: 'type',
       draft: {},
       count: 0,
     });
-    store.log(this.key, `${form.answers.requestId}: asking ${form.byName} for the discount rule`);
-    return this.askDiscount(
-      m,
+    store.log(this.key, `${form.answers.requestId}: asking ${by} for the discount rule`);
+    return reply(
       t(
         `Now the discount for ${form.answers.name || 'this customer'}. Brand-wise or part-wise? It is sent for approval, and starts the day it is approved.`,
         `Ab ${form.answers.name || 'is customer'} ka discount rule set kar lete hain. Brand wise ya Part wise? Approval ke baad lagu hoga.`,
       ),
-      this.discountTypeButtons(t),
-      t,
     );
   }
 
