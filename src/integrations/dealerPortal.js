@@ -435,6 +435,9 @@ function remarksWith(fields) {
   if (fields.contactPhone && String(fields.contactPhone) !== String(fields.phone)) {
     bits.push('Contact phone: ' + fields.contactPhone);
   }
+  // No portal field for these: they travel here (core/customerCreate).
+  if (fields.dob) bits.push('Owner DOB: ' + fields.dob);
+  if (fields.bankDetails) bits.push('Bank: ' + fields.bankDetails);
   if (fields.gstVerified === false) bits.push('GST NOT verified' + (fields.gstWaiver ? ' (waived on ' + fields.gstWaiver + ')' : ''));
   return bits.join(' | ') || null;
 }

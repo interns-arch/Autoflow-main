@@ -5302,18 +5302,19 @@ async function main() {
       && cc64.pending(CH64).answers.email === 'rakesh@sharma.com');
 
     // THE PHOTO IS ASKED BEFORE THE PIN, because it may answer it.
-    // No photo to be had (a shop in Madurai, opened from Delhi — 25 Sep): the
-    // approver is told there is none, and the pin is asked next.
-    const noPhoto64 = await say64('koi photo nahi hai');
-    check('"no photo" is recorded for the approver, and the pin is asked next',
-      /location/i.test(noPhoto64.reply) && /^NO SHOP PHOTO/.test(cc64.pending(CH64).answers.photoNote || ''));
-    check('...and a photo with no location in it does not answer the pin',
-      /location/i.test((await say64('', { mediaBase64: 'QUJD', mediaMime: 'image/jpeg' })).reply));
+    // THE PHOTO AND THE PIN ARE REQUIRED (founder, 25 Sep): "no photo" is
+    // answered with why, and the form waits for one.
+    check('a photo is required, words will not do', /zaroori/i.test((await say64('koi photo nahi hai')).reply) && cc64.pending(CH64).answers.shopPhoto === undefined);
+    check('...and a plain photo still leaves the pin to ask for',
+      /location bhej/i.test((await say64('', { mediaBase64: 'QUJD', mediaMime: 'image/jpeg' })).reply));
+    check('the pin is required too', /zaroori/i.test((await say64('location nahi hai')).reply));
     // Typed coordinates are how a shop ends up in the sea.
     check('typed coordinates are refused, the pin is asked for', /Location attach/i.test((await say64('28.6139, 77.2090')).reply));
 
     const done64 = await say64('', { location: { lat: 28.61, lng: 77.2 } });
-    const final64 = done64.done ? done64 : await say64('skip');
+    // Then the optional ones: owner DOB, bank details, remarks — each skippable.
+    let final64 = done64;
+    for (let i = 0; i < 4 && !final64.done; i++) final64 = await say64('skip');
     check('the form completes', final64.done === true);
     // Six fields the customer never typed: firm, address, city, state, PIN
     // and PAN were all answered by the GSTIN.

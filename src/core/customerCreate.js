@@ -44,6 +44,40 @@ const PIN_RE = /^[1-9][0-9]{5}$/;
 
 const SKIP = /^(skip|nahi|nhi|no|na|-|n\/a|none|baad mein|later)$/i;
 
+// "15/08/1985", "15-8-85", "15.08.1985" -> "15/08/1985"; null when it is not
+// a real date for a living adult.
+function readDob(v) {
+  const m = String(v || '').trim().match(/^(\d{1,2})[\/\-. ](\d{1,2})[\/\-. ](\d{2}|\d{4})$/);
+  if (!m) return null;
+  const d = Number(m[1]);
+  const mo = Number(m[2]);
+  let y = Number(m[3]);
+  if (y < 100) y += y > (new Date().getFullYear() % 100) ? 1900 : 2000;
+  const dt = new Date(Date.UTC(y, mo - 1, d));
+  if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== mo - 1 || dt.getUTCDate() !== d) return null;
+  const age = new Date().getFullYear() - y;
+  if (age < 16 || age > 100) return null;
+  return `${String(d).padStart(2, '0')}/${String(mo).padStart(2, '0')}/${y}`;
+}
+
+// "A/C 50100123456789 HDFC0001234 HDFC Bank" -> "A/C 50100123456789 · IFSC
+// HDFC0001234 · HDFC Bank". Needs an account number or an IFSC at least; the
+// rest of what they wrote is kept as the bank's name.
+function readBank(v) {
+  const s = String(v || '').replace(/\s+/g, ' ').trim();
+  const ifsc = (s.toUpperCase().match(/\b[A-Z]{4}0[A-Z0-9]{6}\b/) || [])[0] || null;
+  const acct = (s.replace(/\b[A-Za-z]{4}0[A-Za-z0-9]{6}\b/, '').match(/\b\d{9,18}\b/) || [])[0] || null;
+  if (!ifsc && !acct) return null;
+  const name = s
+    .replace(/\b[A-Za-z]{4}0[A-Za-z0-9]{6}\b/, '')
+    .replace(/\b\d{9,18}\b/, '')
+    .replace(/\b(a\/?c|account|acct|no\.?|number|ifsc|code|bank\s*name)\b[:\-]?/gi, '')
+    .replace(/[,;:|]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return [acct ? 'A/C ' + acct : null, ifsc ? 'IFSC ' + ifsc : null, name || null].filter(Boolean).join(' · ');
+}
+
 // THE PHOTO OR THE PIN IS NOT TO BE HAD. Somebody opening an account for a
 // shop in Madurai from Delhi cannot photograph it or stand in it (25 Sep,
 // live: "Photo not available request come from jain sir" — the form waited
@@ -199,8 +233,8 @@ const FIELDS = [
     req: true,
     type: 'photo',
     ask: [
-      'Shop ke saamne ki photo bhejiye — board/banner dikhna chahiye.',
-      'Shop ke saamne ki photo bhejiye — shop ka board ya banner dikhna chahiye.',
+      'Shop ke saamne ki photo bhejiye — board/banner dikhna chahiye. (GPS camera wali photo ho to location alag se nahi poochenge.)',
+      'Shop ke saamne ki photo bhejiye — shop ka board ya banner dikhna chahiye. (GPS camera wali photo ho to location alag se nahi poochenge.)',
     ],
   },
   {
@@ -217,6 +251,26 @@ const FIELDS = [
       'Shop ki location bhej dijiye — attach (📎) → Location → Send your current location.',
       'Shop ki location bhej dijiye — attach (📎) → Location → Send your current location.',
     ],
+  },
+  // OPTIONAL: the owner's date of birth, and the bank account. The portal has
+  // no box for either, so both travel in remarks (dealerPortal.remarksWith)
+  // and are on the approver's summary.
+  {
+    key: 'dob',
+    req: false,
+    ask: ['Owner date of birth? (DD/MM/YYYY — optional, "skip" chalega)', 'Owner ki date of birth? (DD/MM/YYYY — optional, "skip" chalega)'],
+    check: (v) => (readDob(v) ? null : 'Date DD/MM/YYYY mein bhejiye, jaise 15/08/1985. Ya "skip".'),
+    clean: (v) => readDob(v),
+  },
+  {
+    key: 'bankDetails',
+    req: false,
+    ask: [
+      'Bank details? Account number, IFSC aur bank ka naam (optional, "skip" chalega)',
+      'Bank details? Account number, IFSC aur bank ka naam (optional, "skip" chalega)',
+    ],
+    check: (v) => (readBank(v) ? null : 'Account number ya IFSC nahi mila. Account number, IFSC aur bank ka naam bhejiye — ya "skip".'),
+    clean: (v) => readBank(v),
   },
   { key: 'remarks', req: false, ask: ['Aur kuch batana hai? (optional)', 'Aur kuch batana hai? (optional)'] },
 ];
@@ -373,15 +427,28 @@ async function answer(chatId, m, text, t) {
     };
   }
 
-  // No photo / no pin to be had: recorded for the approver, and the form goes
-  // on. Checked BEFORE notAnAnswer, which passes typed text at these steps on
-  // to the agent — that is how the form sat waiting for a photo while the
-  // agent told the customer it had gone for approval (25 Sep, live).
+  // THE PHOTO AND THE PIN ARE REQUIRED (founder, 25 Sep). "Photo not
+  // available", "skip", "location nahi hai" is answered here — the form says
+  // it cannot go without them, and waits. Checked BEFORE notAnAnswer, which
+  // passes typed text at these steps on to the agent: that is how the form sat
+  // waiting for a photo while the agent told the customer it had gone for
+  // approval (25 Sep, live). A photo with a GPS fix answers the pin as well.
   if ((field.type === 'photo' || field.type === 'location') && said && !(m && (m.mediaBase64 || m.location)) && (NOT_AVAILABLE.test(said) || SKIP.test(said))) {
-    if (field.type === 'photo') form.answers.photoNote = 'NO SHOP PHOTO — ' + said.slice(0, 120);
-    else form.answers.locationNote = 'not given — ' + said.slice(0, 120);
-    store.log('create', `${chatId}: no ${field.type === 'photo' ? 'shop photo' : 'location'} — "${said.slice(0, 60)}"`);
-    return advance(form, t);
+    store.log('create', `${chatId}: no ${field.type === 'photo' ? 'shop photo' : 'location'} offered ("${said.slice(0, 60)}") — it is required, asked again`);
+    return {
+      reply:
+        field.type === 'photo'
+          ? t(
+              'The shop photo is required — the account cannot be approved without it. Please send a photo of the shop front with the signboard visible. (Taken with a GPS camera app, it also gives us the location, so we will not ask for it separately.)',
+              'Shop ki photo zaroori hai — iske bina account approve nahi hota. Shop ke saamne ki photo bhejiye, board dikhna chahiye. (GPS camera wali photo ho to location alag se nahi maangenge.)',
+            )
+          : t(
+              'The shop location is required. From the shop: attach (📎) → Location → Send your current location.',
+              'Shop ki location zaroori hai. Shop pe hi: attach (📎) → Location → Send your current location bhejiye.',
+            ),
+      done: false,
+      form,
+    };
   }
 
   if (notAnAnswer(field, m, said)) {
@@ -964,6 +1031,8 @@ function summary(form, t) {
     line('Constitution', a.constitution),
     line('PAN', a.panNo),
     line('Email', a.email),
+    line('Owner DOB', a.dob),
+    line('Bank', a.bankDetails),
     '',
     line('Address', a.address),
     line('City', a.city),
