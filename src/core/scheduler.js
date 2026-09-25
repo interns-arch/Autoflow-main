@@ -32,6 +32,11 @@ function start({ bots, admin }) {
     schedule(config.dailyReportTime, () => admin.sendDailyReport(bots), 'daily admin report');
   }
 
+  // 6 pm: the CSV of the day to the Sales Heads (core/dailyApprovalReport).
+  if (bots && bots.customer && Object.keys(config.creation.approvers || {}).length && /^\d{1,2}:\d{2}$/.test(config.approvalReportTime)) {
+    schedule(config.approvalReportTime, () => require('./dailyApprovalReport').send(bots.customer), 'Sales Head CSV report');
+  }
+
   if (!config.enableExtraBots) return;
 
   // ---- parked roles ----

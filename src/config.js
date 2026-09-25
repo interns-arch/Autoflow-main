@@ -193,6 +193,8 @@ const config = {
     pdf: (process.env.PDF_READING || 'on').toLowerCase() !== 'off',
   },
   dailyReportTime: (process.env.DAILY_REPORT_TIME || '20:00').trim(),
+  // The CSV report to the Sales Heads: customers created, sales, approvals.
+  approvalReportTime: (process.env.APPROVAL_REPORT_TIME || '18:00').trim(),
 
   // human-confirm escalation: confusion par is number ko DM, itni der jawab
   // ka intezar, phir customer ko fallback reply. Helper ka jawab PERMANENTLY

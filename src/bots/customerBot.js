@@ -110,6 +110,7 @@ const quotable = require('../core/chatState').slot('quotable');
 // it. chatId -> { base, parts: [{ partNo, name }], at }
 const rateOptions = require('../core/chatState').slot('rateOptions');
 const discountSetup = require('../core/discountSetup');
+const approvalLog = require('../core/approvalLog');
 // The car a customer last NAMED in words, for the half hour after. "Swift
 // Dzire bumper price", then "mera gaadi 2018 model hai, kaun sa rear bumper"
 // - the second never says the car again, and searching "rear bumper" alone
@@ -2431,6 +2432,7 @@ class CustomerBot {
       }
     }
     store.log(this.key, `${form.answers.requestId} sent to ${approvers.length} approver(s)`);
+    approvalLog.record({ kind: 'account', id: form.answers.requestId, event: 'requested', by: form.byName || form.answers.createdByName || 'customer (' + m.from + ')', ...approvalLog.accountFacts(form.answers) });
     await reply(
       t(
         `Thank you — sent for approval (${form.answers.requestId}). You will hear as soon as it is open.`,
@@ -2506,6 +2508,7 @@ class CustomerBot {
       customerCreate.unpark(decision.requestId);
       if (!decision.yes) {
         store.log(this.key, decision.requestId + ' (GST review) rejected by ' + who);
+        approvalLog.record({ kind: 'account', id: decision.requestId, event: 'rejected', by: who, note: 'GST review', ...approvalLog.accountFacts(req.answers) });
         await this.transport.sendText(
           req.answers.phone,
           t(
@@ -2528,6 +2531,7 @@ class CustomerBot {
       customerCreate.unpark(decision.requestId);
       for (const r of discountSetup.forAccount(decision.requestId)) discountSetup.drop(r.id);
       store.log(this.key, `${decision.requestId} rejected by ${who}`);
+      approvalLog.record({ kind: 'account', id: decision.requestId, event: 'rejected', by: who, ...approvalLog.accountFacts(req.answers) });
       await this.transport.sendText(
         req.answers.phone,
         t(
@@ -2613,6 +2617,7 @@ class CustomerBot {
             `\n⚠️ Odoo pe abhi nahi hai — portal ne Odoo customer link nahi kiya${odoo.why ? ` (${odoo.why})` : ''}. Link hone tak order Odoo tak nahi jayenge.`,
           );
       store.log(this.key, `${decision.requestId}: Odoo ${odoo.partnerId ? 'partner ' + odoo.partnerId : 'NOT linked' + (odoo.why ? ' — ' + odoo.why : '')}`);
+      approvalLog.record({ kind: 'account', id: decision.requestId, event: 'approved', by: who, username: account.username, odooPartner: odoo.partnerId || null, ...approvalLog.accountFacts(req.answers) });
       return reply(t(`Done — ${req.answers.name} is open (${account.username}).`, `Ho gaya — ${req.answers.name} ka account khul gaya (${account.username}).`) + odooNote);
     } catch (e) {
       // The request STAYS parked: a failed create is worth another try, and
@@ -3128,6 +3133,7 @@ class CustomerBot {
       });
       await this.toApprovers(discountSetup.approvalText(req));
       store.log(this.key, `${req.id}: discount ${type} for ${st.customer} sent for approval (${d.target || ''} ${d.value}%)`);
+      approvalLog.record({ kind: 'discount', id: req.id, event: 'requested', by: st.setBy || null, customer: st.customer, detail: `${type === 'change' ? 'change ' + (extra && extra.oldValue) + '% → ' : ''}${d.kind || ''} ${d.target || ''} ${d.value}%`.trim() });
       return req;
     };
 
@@ -3400,6 +3406,7 @@ class CustomerBot {
     if (!decision.yes) {
       discountSetup.drop(req.id);
       store.log(this.key, `${req.id} (discount) rejected by ${who}`);
+      approvalLog.record({ kind: 'discount', id: req.id, event: 'rejected', by: who, customer: req.customer, detail: what });
       await tell(t(`Discount request ${req.id} (${what}) was not approved.`, `Discount request ${req.id} (${what}) approve nahi hua.`));
       return reply(t(`Rejected ${req.id}. ${req.by || 'They'} was told.`, `${req.id} reject kar diya. ${req.by || 'Unko'} bata diya.`));
     }
@@ -3432,6 +3439,7 @@ class CustomerBot {
       }
       discountSetup.drop(req.id);
       store.log(this.key, `${req.id} approved by ${who} — rule ${req.ruleId} now ${req.rule.value}%`);
+      approvalLog.record({ kind: 'discount', id: req.id, event: 'approved', by: who, customer: req.customer, detail: `${what} (rule #${req.ruleId} updated)` });
       await tell(t(`✅ Approved: ${what}. Updated on the portal.`, `✅ Approve ho gaya: ${what}. Portal pe update kar diya.`));
       return reply(t(`Done — ${what}.`, `Ho gaya — ${what}.`));
     }
@@ -3442,6 +3450,7 @@ class CustomerBot {
       req.status = 'approved';
       discountSetup.requests.set(req.id, req);
       store.log(this.key, `${req.id} approved by ${who} — waits for account ${req.accountRequestId}`);
+      approvalLog.record({ kind: 'discount', id: req.id, event: 'approved', by: who, customer: req.customer, detail: `${what} (created when ${req.accountRequestId} opens)` });
       return reply(t(`Approved. It is created as soon as ${req.accountRequestId} is approved.`, `Approve ho gaya. ${req.accountRequestId} approve hote hi portal pe ban jayega.`));
     }
     const made = await this.createDiscountFor(req);
@@ -3451,6 +3460,7 @@ class CustomerBot {
     }
     discountSetup.drop(req.id);
     store.log(this.key, `${req.id} approved by ${who} — created ${made.name}`);
+    approvalLog.record({ kind: 'discount', id: req.id, event: 'approved', by: who, customer: req.customer, detail: `${made.name} (created on the portal)` });
     await tell(t(`✅ Discount rule approved and created: ${made.name}`, `✅ Discount rule approve ho gaya, portal pe ban gaya: ${made.name}`));
     return reply(t(`Done — ${made.name}.`, `Ho gaya — ${made.name}.`));
   }
@@ -3498,6 +3508,7 @@ class CustomerBot {
       store.save();
     }
     store.log(this.key, `${order.id} sent to ${sent} approver(s) for approval`);
+    if (sent) approvalLog.record({ kind: 'order', id: order.id, event: 'requested', by: 'customer (' + phone + ')', customer: pc.name || order.customer || phone, phone, detail: `${order.lines.length} line(s)`, amount: Math.round(total) });
     return sent;
   }
 
@@ -3523,6 +3534,7 @@ class CustomerBot {
       order.rejectedBy = who;
       store.save();
       store.log(this.key, `${order.id} rejected by ${who}`);
+      approvalLog.record({ kind: 'order', id: order.id, event: 'rejected', by: who, customer: (order.portalCustomer && order.portalCustomer.name) || null });
       await tell(ct(`Your order ${order.id} was not approved. Please call us if you want to talk about it.`, `Aapka order ${order.id} approve nahi hua. Baat karni ho to humein call kijiye.`));
       return reply(t(`Rejected ${order.id}. The customer was told.`, `${order.id} reject kar diya. Customer ko bata diya.`));
     }
@@ -3533,6 +3545,7 @@ class CustomerBot {
     } catch (e) {
       const full = String((e && e.message) || e);
       store.log(this.key, `${order.id} approved by ${who} but the portal refused it: ${full.slice(0, 600)}`);
+      approvalLog.record({ kind: 'order', id: order.id, event: 'failed', by: who, customer: (order.portalCustomer && order.portalCustomer.name) || null, detail: /credit control/i.test(full) ? 'portal: customer on credit control' : 'portal refused: ' + full.slice(0, 120) });
       // 25 Sep: MIYA JI MOTORS's order came back 409 "Customer credit control
       // blocked order confirmation" — a credit limit or overdue bills. That
       // is for the Sales Head to clear on the portal, so it is named as such.
@@ -3562,6 +3575,7 @@ class CustomerBot {
     const punched = (res.punchedLines || []).map((l) => `${l.partNo} × ${l.qty}`).join('\n');
     const later = [...(res.skipped || []).map((l) => l.partNo || l.item), ...(res.short || []).map((l) => `${l.partNo} (${l.asked - l.punched} more)`)];
     store.log(this.key, `${order.id} approved by ${who} — placed on the portal as ${so}`);
+    approvalLog.record({ kind: 'order', id: order.id, event: 'approved', by: who, customer: (order.portalCustomer && order.portalCustomer.name) || null, detail: `portal order ${so}` });
     await tell(
       ct(
         `✅ Your order is placed — order no. ${so}.\n${punched}${later.length ? `\n\nOn order, not in this one yet: ${later.join(', ')}` : ''}`,
