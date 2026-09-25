@@ -25,7 +25,7 @@ What it replaced: a person reading every WhatsApp message, searching the portal 
 | Customer DM and bot-created groups | Live |
 | Order punching (`ORDER_CONFIRM_ENABLED=true`) | Live since 14 Sep 08:28 UTC |
 | Draft SO → confirm SO flow | Live |
-| Photo / handwriting / PDF / sheet reading (Claude vision) | Live |
+| Photo / handwriting / PDF / sheet reading (Gemini vision) | Live |
 | Voice notes (Gemini speech-to-text) | Live |
 | Sales desk: customer SO, analysis and lookups | Live |
 | Understand model (Phase 4 hybrid: gates first, model decides the rest) | Live |
@@ -73,7 +73,7 @@ flowchart LR
 
   P[Dealer Portal<br/>vagmine.vagminetech.com]
   O[Odoo<br/>SO / bill PDFs]
-  AI1[Claude API<br/>understand, vision, desk AI]
+  AI1[Gemini API<br/>understand, vision, desk AI]
   AI2[Gemini<br/>voice notes]
   G[Gmail IT mailbox]
 
@@ -124,7 +124,7 @@ flowchart LR
 | | `src/core/partish.js` | Is this token a part number, a name, a vehicle or a question |
 | | `src/core/rates.js` | MRP − customer discount = rate |
 | | `src/core/knowledge.js` | Part answers learned from the helper, kept forever |
-| AI | `src/core/ai.js` | Claude calls: vision (`VISION_PROMPT`), line parsing, `normalizeOrderText`, `bareQty` |
+| AI | `src/core/ai.js` | Gemini calls: vision (`VISION_PROMPT`), line parsing, `normalizeOrderText`, `bareQty` |
 | | `src/integrations/speech.js` | Gemini voice-note transcription |
 | | `src/core/smallTalk.js` | Human-sounding replies to chat, with a fence against promises |
 | Humans | `src/core/escalation.js` | Ask the helper, time out, learn the answer |
@@ -151,7 +151,7 @@ sequenceDiagram
   participant P as relayPoller (EC2)
   participant B as customerBot
   participant DP as Dealer Portal
-  participant AI as Claude
+  participant AI as Gemini
 
   U->>M: WhatsApp message
   M->>R: webhook POST
@@ -253,7 +253,7 @@ flowchart TD
   S2 -- "shortage list / Kalra ki shortage" --> S11[out-of-stock]
   S2 -- "16510M65L10 ka status" --> S12[part-status]
   S2 -- "aane wala maal" --> S13[incoming-shipments]
-  S2 -- "unclear but has a desk word" --> S14[classifyDesk: Claude sorts it<br/>order no. / part must be in the text]
+  S2 -- "unclear but has a desk word" --> S14[classifyDesk: Gemini sorts it<br/>order no. / part must be in the text]
   S2 -- "admin, no customer named, haan" --> S15[Punch on the account of the admin's own number]
 ```
 
@@ -263,8 +263,8 @@ Desk rules: a desk user's unknown part gets "nahi mila" plus the closest parts, 
 
 | Input | How it is read | Then |
 |---|---|---|
-| Photo (printed list, label, handwritten) | Claude vision with `VISION_PROMPT`: joins a printed and a handwritten part number (`33400 M` + `68P10`), ignores handwritten MRP; a Maruti fragment gets a second look | Same line parser as typed text |
-| PDF | Text extraction, Claude when unreadable | Same parser |
+| Photo (printed list, label, handwritten) | Gemini vision with `VISION_PROMPT`: joins a printed and a handwritten part number (`33400 M` + `68P10`), ignores handwritten MRP; a Maruti fragment gets a second look | Same line parser as typed text |
+| PDF | Text extraction, Gemini vision when unreadable | Same parser |
 | Excel / CSV | `core/sheet.js` column reading | Same parser |
 | Voice note | Gemini transcription (`speech.js`) → `heardOrder` | Read back before adding |
 | GST invoice photo | Refused, so "Invoice No 2939" never becomes qty 2939 | — |
@@ -330,7 +330,7 @@ API docs: `vagmine.vagminetech.com/docs`.
 | Service | Used for |
 |---|---|
 | Meta Graph API `/{phone_number_id}/messages` | Send text and PDFs; download media |
-| Claude API | Understand model, vision, desk classifier, line parsing, small talk |
+| Gemini API | Understand model, vision, desk classifier, line parsing, small talk |
 | Gemini | Voice-note transcription |
 | Odoo | SO and bill PDFs, customer origin lookups |
 | Gmail | IT mailbox for the data-entry watcher |
@@ -346,7 +346,7 @@ API docs: `vagmine.vagminetech.com/docs`.
 | Portal | `DEALER_PORTAL_BASE_URL`, `DEALER_PORTAL_USERNAME/PASSWORD`, `DEALER_PORTAL_ADMIN_USERNAME/PASSWORD`, `DEALER_PORTAL_*_PATH` |
 | People | `ADMIN_NUMBERS`, `SALES_TEAM_NUMBERS`, `CUSTOMER_DMS`, `INQUIRY_ONLY_NUMBERS`, `ESCALATION_NUMBER`, `VOICE_ESCALATION_NUMBER`, `DATA_ENTRY_ALERT_NUMBERS`, `GROUP_DEFAULT_MEMBERS` |
 | Switches | `ORDER_CONFIRM_ENABLED=true`, `AI_SHADOW=true`, `ENABLE_EXTRA_BOTS=false` |
-| AI | `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, `GEMINI_API_KEY` |
+| AI | `GEMINI_API_KEY` (every model call: photos, text, naming, knowledge base, voice) |
 | Odoo / Gmail | `ODOO_URL`, `ODOO_DB`, `ODOO_USERNAME`, `ODOO_API_KEY`, `GMAIL_*` |
 
 Secrets are never printed, never copied from a laptop `.env` to EC2. Changes are made key by key after backing up the EC2 `.env`.

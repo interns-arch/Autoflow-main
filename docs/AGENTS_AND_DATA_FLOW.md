@@ -79,7 +79,7 @@ flowchart LR
 
   DP["Dealer Portal<br/>vagmine.vagminetech.com"]
   OD["Odoo (PDFs, ledger)"]
-  CL["Claude API"]
+  CL["Gemini API"]
   GM["Gemini (voice)"]
   MB["Gmail IT mailbox"]
 
@@ -186,7 +186,7 @@ sequenceDiagram
   participant T as cloudTransport
   participant B as CustomerBot
   participant DP as Dealer Portal
-  participant AI as Claude / Gemini
+  participant AI as Gemini
 
   U->>M: WhatsApp message
   M->>R: POST /webhook/wa (signed)
@@ -335,7 +335,7 @@ flowchart TD
   S1 -- "'shortage list'" --> D4["/out-of-stock/"]
   S1 -- "'16510M65L10 ka status'" --> D5["part-status"]
   S1 -- "'aane wala maal'" --> D6["incoming-shipments"]
-  S1 -- "sounds like a desk question but no pattern matched" --> D7["classifyDesk — Claude sorts it,<br/>but the order/part number must really be in the text"]
+  S1 -- "sounds like a desk question but no pattern matched" --> D7["classifyDesk — Gemini sorts it,<br/>but the order/part number must really be in the text"]
   S1 -- "'punch this order'" --> P1["the active cart, or the part just analysed"]
 ```
 
@@ -433,8 +433,8 @@ itself (order placed, human asked, or a reply).
 
 | Input | Reader | Then |
 |---|---|---|
-| **Voice note** | Gemini (`integrations/speech.js`); Claude takes no audio | 1) if it swipe-replies one of our numbered lists and sounds like an edit → apply it. 2) else `heardOrder`: every part must be in the catalogue, then **read back** → "sahi hai?". 3) else the recording + transcript go to the **voice helper** |
-| **Photo** | Vision — Gemini, then Claude (`ai.parseOrderImage`) | Caption part number beats the box's number; caption qty fills missing qty. Desk + "analyse for X" → analysis. Unreadable → helper, **with the photo attached** |
+| **Voice note** | Gemini (`integrations/speech.js`) | 1) if it swipe-replies one of our numbered lists and sounds like an edit → apply it. 2) else `heardOrder`: every part must be in the catalogue, then **read back** → "sahi hai?". 3) else the recording + transcript go to the **voice helper** |
+| **Photo** | Vision — Gemini (`ai.parseOrderImage`) | Caption part number beats the box's number; caption qty fills missing qty. Desk + "analyse for X" → analysis. Unreadable → helper, **with the photo attached** |
 | **PDF** | pdfplumber text, else render pages → vision | same line parser as typed text |
 | **Excel / CSV** | `core/sheet.js` grid reader | large orders get an **xlsx reply back**, not a 70-line bubble |
 | **GST invoice photo** | vision says `docType` | refused as an order — "Invoice No 2939" can never become qty 2939 |
@@ -679,7 +679,7 @@ orders are punched:
 | Credit control (on 409) | `GET /accounts/{id}/credit-control` |
 | Create customer / vendor / part | `/users/customer/create`, `/users/vendor/create`, `/parts/create-part` — **admin user only** |
 
-**Others:** Meta Graph API (send/receive, media download), Claude (understand, vision,
+**Others:** Meta Graph API (send/receive, media download), Gemini (understand, vision,
 line parsing, desk classifier, small talk, part naming), Gemini (voice), Odoo (SO/bill
 PDFs, ledger, credit notes), Gmail (data-entry mailbox), Twilio/mock IVR (parked).
 

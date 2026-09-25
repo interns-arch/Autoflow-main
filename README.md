@@ -44,7 +44,7 @@ simulator and data admin.
 
 ### Phase 1 — Purchase Bot, Line 414  ✅ built  (spec Phase A)
 - Stock broadcast to all registered vendors (2× daily, `STOCK_BROADCAST_TIMES`)
-- Stock list ingestion from vendor replies (line parser + optional Claude for messy/Hinglish lists)
+- Stock list ingestion from vendor replies (line parser + optional Gemini for messy/Hinglish lists)
 - IVR voice follow-up 2× daily **only to vendors who haven't submitted since
   the last broadcast** — dynamic suppression, exactly as specified
 
@@ -76,7 +76,7 @@ simulator and data admin.
 - **Photo orders**: customer sends the order as a photograph → vision reads
   it into order lines and the normal draft/confirm flow continues.
 
-  **The reader: Gemini vision first, Claude vision behind it.** There is no
+  **The reader: Gemini vision.** There is no
   local OCR — the old Windows-only chain (`pytesseract` / `easyocr` / WinRT)
   never ran in production, where the image ships no OCR binary, and has been
   taken out. A photo with no vision key available goes to a person, with the
@@ -96,8 +96,8 @@ simulator and data admin.
     spammed.
 
   **Known limit:** the built-in engine reads print well but genuine
-  handwriting poorly — handwritten photos generally need the optional
-  `ANTHROPIC_API_KEY` (Claude vision) to work.
+  handwriting poorly — handwritten photos need `GEMINI_API_KEY` (Gemini
+  vision) to work.
 
 ### No UI needed — admin runs on WhatsApp too
 The web console is a **dev/testing tool only**; production runs headless.
@@ -144,7 +144,7 @@ the standalone WhatsApp stock-collection flow is used.
 6. Dealer Portal creds from Aneeq → `DEALER_PORTAL_BASE_URL` + `DEALER_PORTAL_API_KEY`
    (until then the mock portal issues SO-/PO- numbers so nothing blocks)
 7. Voice calls: keep `IVR_PROVIDER=mock`, or set `twilio` + credentials
-8. Optional: `ANTHROPIC_API_KEY` for AI parsing of free-form/Hinglish messages
+8. `GEMINI_API_KEY` for AI parsing of free-form/Hinglish messages and photos
 
 ## Architecture
 
@@ -233,7 +233,7 @@ database that is down or a schema that is missing is reported at boot and each
 question simply goes to a person.
 
 Embeddings come from Gemini using the `GEMINI_API_KEY` already configured for
-photos and voice notes (Anthropic has no embeddings API). `EMBEDDING_DIM` must
+photos and voice notes — one provider for everything. `EMBEDDING_DIM` must
 match the `vector(768)` column in `migrations/001`.
 
 ### Tuning

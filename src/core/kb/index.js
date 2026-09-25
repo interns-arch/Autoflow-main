@@ -43,7 +43,7 @@ async function phrase(entry, question, chatId) {
 
   let out = null;
   try {
-    const j = await ai._claude(
+    const j = await ai._model(
       system,
       'Customer question:\n' + String(question).slice(0, 500) + '\n\nApproved answer:\n' + stored,
     );

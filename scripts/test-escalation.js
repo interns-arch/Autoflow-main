@@ -24,7 +24,7 @@ require('fs').mkdirSync(process.env.SCRATCH, { recursive: true });
 require('fs').writeFileSync(path.join(process.env.SCRATCH, 'state.json'), '{}');
 process.env.DATA_DIR = process.env.SCRATCH;
 process.env.ESCALATION_NUMBER = '919999492550';
-process.env.ANTHROPIC_API_KEY = '';
+process.env.GEMINI_API_KEY = '';
 process.env.GEMINI_API_KEY = '';
 process.env.DATABASE_URL = '';
 

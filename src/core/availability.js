@@ -388,11 +388,12 @@ function priceOf(line) {
   const mrp = Number(line.mrp);
   if (line.pricedForCustomer && Number.isFinite(rate) && rate > 0) {
     // Their approved discount, shown as what it is: MRP, the % off, and the
-    // price after it — GST included, as MRP includes it.
+    // price after it. (That GST is inside MRP is said by the agent from the
+    // tool's discount.gstIncluded; "incl. 18% GST" in this line is the staff
+    // analysis's own wording, and an availability answer must not read as one.)
     const pct = Number(line.discountPercent);
-    const gst = Number(line.taxPercent) > 0 ? `, incl. ${Number(line.taxPercent)}% GST` : '';
     if (Number.isFinite(mrp) && mrp > rate) {
-      return pct > 0 ? ` — ${money(rate)} (MRP ${money(mrp)} - ${pct}% discount${gst})` : ` — ${money(rate)} (MRP ${money(mrp)})`;
+      return pct > 0 ? ` — ${money(rate)} (MRP ${money(mrp)} - ${pct}% discount)` : ` — ${money(rate)} (MRP ${money(mrp)})`;
     }
     return ` — ${money(rate)}`;
   }

@@ -40,7 +40,7 @@ async function validate(question, entry) {
 
   let j = null;
   try {
-    j = await ai._claude(SYSTEM, user);
+    j = await ai._model(SYSTEM, user);
   } catch (e) {
     kblog.event('knowledge_validation', { knowledge_id: entry.id, reason: 'model error' });
     return { can_answer: false, confidence: 0, reason: 'relevance check failed' };

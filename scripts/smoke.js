@@ -28,7 +28,7 @@ process.env.GST_API_KEY = '';
 // Odoo and assert the fallback, and a real value in .env would quietly send
 // them down the portal path instead.
 process.env.DEALER_PORTAL_ACCOUNT_ID = '';
-process.env.ANTHROPIC_API_KEY = ''; // deterministic parsers only
+process.env.GEMINI_API_KEY = ''; // deterministic parsers only
 process.env.ODOO_URL = ''; // no live ERP either - MRP and ledgers are stubbed below
 process.env.ODOO_DB = '';
 process.env.ODOO_USERNAME = '';
@@ -2442,7 +2442,7 @@ async function main() {
       };
       cc20.park(form20);
       customer.transport.outbox.length = 0;
-      await customer.startDiscountSetup({ chatId: agentChat20, from: AGENT20 }, form20, tt20);
+      await customer.startDiscountSetup({ chatId: agentChat20, from: AGENT20 }, form20, (text) => customer.askDiscount({ chatId: agentChat20, from: AGENT20 }, text), tt20);
       check('the agent is asked for the discount: brand or part', /Brand wise ya Part wise/.test(text20(customer.transport.outbox)));
       await say20(AGENT20, 'Brand wise', 'DSC_BRAND');
       check('the brand is written as the portal writes it', /CARTRENDS — kitna discount/.test(text20(await say20(AGENT20, 'cartrend'))));
@@ -2470,7 +2470,7 @@ async function main() {
       portal.setMockStock([{ part_no: '16510M65L10', name: 'Oil Filter', quantity: 50, price: 90, mrp: 200, vendor: 'K' }]);
       const form21 = { chatId: agentChat20, byName: 'Shubham', answers: { ...form20.answers, requestId: 'WA-DSC21', phone: '919000000303' } };
       cc20.park(form21);
-      await customer.startDiscountSetup({ chatId: agentChat20, from: AGENT20 }, form21, tt20);
+      await customer.startDiscountSetup({ chatId: agentChat20, from: AGENT20 }, form21, (text) => customer.askDiscount({ chatId: agentChat20, from: AGENT20 }, text), tt20);
       await say20(AGENT20, 'Part wise', 'DSC_PART');
       const mrp21 = text20(await say20(AGENT20, '16510M65L10'));
       check('part-wise: the portal MRP is shown and the lowest price asked', /MRP ₹200/.test(mrp21) && /Minimum kitne mein bechna/.test(mrp21));
@@ -2495,8 +2495,10 @@ async function main() {
       const list22 = text20(await say20(CUST22, 'mera discount change karna hai'));
       check('an existing customer is shown their own rules only', /1\. Mock Customer CARTRENDS 12% — 12%/.test(list22) && !/BOSCH/.test(list22));
       check('...and asked the new %', /Abhi 12% hai\. Naya discount %/.test(text20(await say20(CUST22, '1'))));
-      check('...shown the change before it is sent', /12% → 15%/.test(text20(await say20(CUST22, '15'))));
-      const sent22 = await say20(CUST22, 'Haan', 'DSC_YES');
+      // The new % sends it: there is no "Send for approval?" any more (25 Sep,
+      // live — the next message was read as a no and the change was lost).
+      const sent22 = await say20(CUST22, '15');
+      check('...shown the change as it is sent', /12% → 15%/.test(text20(sent22)));
       const id22 = dscIn20(sent22);
       check('the change goes to the Sales Head, not the portal', /\*Discount change\*/.test(sent22.filter((o) => o.to === APPR20).map((o) => o.text).join('\n')) && (await portal.listDiscountRules())[0].discount_value === 12);
       const ok22 = await say20(APPR20, 'OK ' + id22);
@@ -2506,8 +2508,7 @@ async function main() {
       // a NO leaves it as it was
       await say20(CUST22, 'discount change karna hai');
       await say20(CUST22, '1');
-      await say20(CUST22, '20');
-      const id23 = dscIn20(await say20(CUST22, 'Haan', 'DSC_YES'));
+      const id23 = dscIn20(await say20(CUST22, '20'));
       await say20(APPR20, 'NO ' + id23);
       check('"NO DSC-…" changes nothing', (await portal.listDiscountRules())[0].discount_value === 15);
 
@@ -2522,7 +2523,7 @@ async function main() {
       };
       cc20.park(form24);
       customer.transport.outbox.length = 0;
-      await customer.startDiscountSetup({ chatId: form24.chatId, from: AGENT24 }, form24, tt20);
+      await customer.startDiscountSetup({ chatId: form24.chatId, from: AGENT24 }, form24, (text) => customer.askDiscount({ chatId: form24.chatId, from: AGENT24 }, text), tt20);
       const ask24 = text20(customer.transport.outbox);
       check('typed only: the question is a question, with no menu of bullets under it', /Brand wise ya Part wise/.test(ask24) && !/•/.test(ask24));
       await say20(AGENT24, 'Brand wise');
@@ -3490,11 +3491,11 @@ async function main() {
   };
   const discuss37 = (items, chatId = C37) => chatState37.slot('focus').set(chatId, { at: Date.now(), items });
 
-  // The live model, as it behaved: every call goes through ai._claude.
-  const keyWas37 = config.ai.apiKey;
-  config.ai.apiKey = 'test-key';
+  // The live model, as it behaved: every call goes through ai._model.
+  const keyWas37 = config.gemini.apiKey;
+  config.gemini.apiKey = 'test-key';
   const live37 = { parse: null, chat: null, understand: null };
-  ai37._setClaude(async (system, user) => {
+  ai37._setModel(async (system, user) => {
     if (/^You parse WhatsApp messages/.test(system)) return live37.parse ? live37.parse(user) : { intent: 'other' };
     if (/^You answer WhatsApp messages for CARTRENDS/.test(system)) return live37.chat ? live37.chat(user) : { action: 'silent' };
     if (/^You are the counter person/.test(system)) return live37.understand ? live37.understand(user) : { intent: 'chat' };
@@ -3598,8 +3599,8 @@ async function main() {
   check('in a group "5 p" orders the part just discussed too', qtyOf37(P37, G37) === groupQtyBefore37 + 5);
   chatState37.slot('focus').delete(G37);
 
-  ai37._setClaude(null);
-  config.ai.apiKey = keyWas37;
+  ai37._setModel(null);
+  config.gemini.apiKey = keyWas37;
   reset37();
 
   // 13 Sep, live, after the fix: "Thik hai.. mt kro" was taken as a yes, "Ok
@@ -3633,14 +3634,14 @@ async function main() {
     check(`"${msg}" reads as ${want}`, r.intent === want);
   }
   // ...and the model cannot turn them back into a yes.
-  config.ai.apiKey = 'test-key';
-  ai37._setClaude(async () => ({ intent: 'confirm' }));
+  config.gemini.apiKey = 'test-key';
+  ai37._setModel(async () => ({ intent: 'confirm' }));
   for (const [msg, want] of INTENTS38.filter(([, w]) => w !== 'confirm')) {
     const r = await ai37.parseCustomerMessage(msg, []);
     check(`with the model saying yes, "${msg}" still reads as ${want}`, r.intent === want);
   }
-  ai37._setClaude(null);
-  config.ai.apiKey = keyWas37;
+  ai37._setModel(null);
+  config.gemini.apiKey = keyWas37;
 
   reset37();
   await dm(customer, CUST, P37 + ' 2');
@@ -3715,12 +3716,12 @@ async function main() {
   check('group customer: a part number with no quantity gets an answer that asks for one', customer.transport.outbox.length === 1 && /quantit|kitni|how many/i.test(lastOut(customer)));
 
   resetG38();
-  config.ai.apiKey = 'test-key';
-  ai37._setClaude(async (system) => (/^You answer WhatsApp messages for CARTRENDS/.test(system) ? { action: 'reply', text: 'Rate 450 hai sir' } : { intent: 'other' }));
+  config.gemini.apiKey = 'test-key';
+  ai37._setModel(async (system) => (/^You answer WhatsApp messages for CARTRENDS/.test(system) ? { action: 'reply', text: 'Rate 450 hai sir' } : { intent: 'other' }));
   await group(customer, GC38, 'acha bhai sunno');
   check('group customer: a refused chat reply is not silence', customer.transport.outbox.length === 1 && !/450/.test(lastOut(customer)));
-  ai37._setClaude(null);
-  config.ai.apiKey = keyWas37;
+  ai37._setModel(null);
+  config.gemini.apiKey = keyWas37;
 
   // Unchanged until the founder decides: a Cartrends person in a group is a
   // person talking to the customer, not the customer.
@@ -4216,10 +4217,10 @@ async function main() {
     { part_no: '22400M74L00', name: 'Clutch Plate Swift', quantity: 12, price: 1850, mrp: 2400, vendor: 'Northend' },
     { part_no: 'BP-1001', name: 'Brake Pad', quantity: 40, price: 450, mrp: 600, vendor: 'Northend' },
   ]);
-  const keyWas46 = config.ai.apiKey;
-  config.ai.apiKey = 'test-key';
+  const keyWas46 = config.gemini.apiKey;
+  config.gemini.apiKey = 'test-key';
   const live46 = { parse: null, chat: null, understand: null, calls: 0 };
-  ai46._setClaude(async (system, user) => {
+  ai46._setModel(async (system, user) => {
     if (/^You parse WhatsApp messages/.test(system)) return live46.parse ? live46.parse(user) : { intent: 'other' };
     if (/^You answer WhatsApp messages for CARTRENDS/.test(system)) return live46.chat ? live46.chat(system, user) : { action: 'silent' };
     if (/^You are the counter person/.test(system)) {
@@ -4372,8 +4373,8 @@ async function main() {
   } catch {}
   config.sharedDir = sharedWas46;
 
-  ai46._setClaude(null);
-  config.ai.apiKey = keyWas46;
+  ai46._setModel(null);
+  config.gemini.apiKey = keyWas46;
   reset37();
   resetG38();
 
@@ -4415,14 +4416,14 @@ async function main() {
   const st47 = sent(customer);
   check('"order kahan hai" is answered from the portal', /701/.test(st47) && /dispatch/i.test(st47) && /702/.test(st47) && /allocate/i.test(st47));
 
-  const keyWas47 = config.ai.apiKey;
-  config.ai.apiKey = 'test-key';
+  const keyWas47 = config.gemini.apiKey;
+  config.gemini.apiKey = 'test-key';
   const ai47 = require('../src/core/ai');
   const live47 = {
     understand: () => ({ intent: 'orderStatus' }),
     chat: (system) => (/NOT going to a person/.test(system) ? { action: 'reply', text: 'Theek hai sir.' } : { action: 'human' }),
   };
-  ai47._setClaude(async (system, user) => {
+  ai47._setModel(async (system, user) => {
     if (/^You parse WhatsApp messages/.test(system)) return { intent: 'other' };
     if (/^You answer WhatsApp messages for CARTRENDS/.test(system)) return live47.chat(system, user);
     if (/^You are the counter person/.test(system)) return live47.understand(user);
@@ -4448,8 +4449,8 @@ async function main() {
   await dm(customer, CUST, 'Please collect cheque tomorrow');
   check('...a customer DM still reaches a person', team46());
 
-  ai47._setClaude(null);
-  config.ai.apiKey = keyWas47;
+  ai47._setModel(null);
+  config.gemini.apiKey = keyWas47;
   portal._setMockOrderHistory(null);
   reset37();
 
@@ -4652,13 +4653,13 @@ async function main() {
 
   // 13 Sep, founder, a coil box: printed "33400 M", "68P10" written after it by
   // hand. Vision read "33400M" twice and it went to a person. "ye handwritten
-  // photo kyon nhi pd rha..claude api lagaya hi isliye hai".
+  // photo kyon nhi pd rha..AI lagaya hi isliye hai".
   console.log('\n[51] a label finished by hand: "33400 M" + "68P10"');
   const ai51 = require('../src/core/ai');
-  const keyWas51 = config.ai.apiKey;
-  config.ai.apiKey = 'test-key';
+  const keyWas51 = config.gemini.apiKey;
+  config.gemini.apiKey = 'test-key';
   const calls51 = [];
-  ai51._setClaude(async (system, user) => {
+  ai51._setModel(async (system, user) => {
     if (!Array.isArray(user)) return { intent: 'other' };
     const text = (user.find((u) => u.type === 'text') || {}).text || '';
     calls51.push({ system, text });
@@ -4672,12 +4673,12 @@ async function main() {
     check('...and the whole number is used', (got51 || []).some((l) => /33400M68P10/.test(String(l.item || l.partNo || ''))));
 
     calls51.length = 0;
-    ai51._setClaude(async (system, user) => (Array.isArray(user) ? (calls51.push(1), { doc: 'order', lines: [{ item: '16510M65L10', qty: 5 }] }) : { intent: 'other' }));
+    ai51._setModel(async (system, user) => (Array.isArray(user) ? (calls51.push(1), { doc: 'order', lines: [{ item: '16510M65L10', qty: 5 }] }) : { intent: 'other' }));
     await ai51.parseOrderImage('iVBORw0KGgo=', 'image/jpeg');
     check('a whole number is not looked at twice', calls51.length === 1);
   } finally {
-    ai51._setClaude(null);
-    config.ai.apiKey = keyWas51;
+    ai51._setModel(null);
+    config.gemini.apiKey = keyWas51;
   }
 
   // 13 Sep, 22:26-22:30, live, the founder testing as admin:
@@ -5125,11 +5126,11 @@ async function main() {
 
     // Anything else that sounds like a desk question goes to the model - and a
     // number the model names must really be in the message.
-    const keyWas61 = config.ai.apiKey;
-    config.ai.apiKey = 'test-key';
+    const keyWas61 = config.gemini.apiKey;
+    config.gemini.apiKey = 'test-key';
     const ai61 = require('../src/core/ai');
     let answer61 = null;
-    ai61._setClaude(async (system) => (/^You sort one WhatsApp message from the Cartrends sales desk/.test(system) ? answer61 : { intent: 'other' }));
+    ai61._setModel(async (system) => (/^You sort one WhatsApp message from the Cartrends sales desk/.test(system) ? answer61 : { intent: 'other' }));
     try {
       answer61 = { kind: 'track', orderId: '639' };
       const byModel61 = await say61('order number 639 ka delivery ka kya scene hai');
@@ -5139,8 +5140,8 @@ async function main() {
       answer61 = { kind: 'track', orderId: '639' };
       check('...and a message with no desk word never reaches the model', (await lookup61.classifyDesk('16510M65L10 50 pcs')) === null);
     } finally {
-      ai61._setClaude(null);
-      config.ai.apiKey = keyWas61;
+      ai61._setModel(null);
+      config.gemini.apiKey = keyWas61;
     }
   } finally {
     customer.transport.sendDocument = sendDocWas61;
@@ -5301,9 +5302,13 @@ async function main() {
       && cc64.pending(CH64).answers.email === 'rakesh@sharma.com');
 
     // THE PHOTO IS ASKED BEFORE THE PIN, because it may answer it.
-    check('a photo is required, words will not do', /Photo bhejiye/i.test((await say64('koi photo nahi hai')).reply));
-    check('...and a plain photo still leaves the pin to ask for',
-      /location bhej/i.test((await say64('', { mediaBase64: 'QUJD', mediaMime: 'image/jpeg' })).reply));
+    // No photo to be had (a shop in Madurai, opened from Delhi — 25 Sep): the
+    // approver is told there is none, and the pin is asked next.
+    const noPhoto64 = await say64('koi photo nahi hai');
+    check('"no photo" is recorded for the approver, and the pin is asked next',
+      /location/i.test(noPhoto64.reply) && /^NO SHOP PHOTO/.test(cc64.pending(CH64).answers.photoNote || ''));
+    check('...and a photo with no location in it does not answer the pin',
+      /location/i.test((await say64('', { mediaBase64: 'QUJD', mediaMime: 'image/jpeg' })).reply));
     // Typed coordinates are how a shop ends up in the sea.
     check('typed coordinates are refused, the pin is asked for', /Location attach/i.test((await say64('28.6139, 77.2090')).reply));
 

@@ -5,8 +5,8 @@
 # the compose file caps what it can take. See docker-compose.yml.
 #
 # NOT installed on purpose:
-#   * any character recogniser — photos go to vision (Gemini first, Claude
-#     behind it), which costs a little money and no CPU. The local reader that
+#   * any character recogniser — photos go to Gemini vision,
+#     which costs a little money and no CPU. The local reader that
 #     used to sit in front of it was Windows-only, never ran here, and has been
 #     taken out of the code as well.
 #   * puppeteer / chromium — only the old QR-linked-device transport needed

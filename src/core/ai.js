@@ -1,7 +1,7 @@
 'use strict';
 // Message understanding.
-// Deterministic parsers work out of the box; if ANTHROPIC_API_KEY is set,
-// Claude is used first (handles Hinglish, free-form sentences, messy lists)
+// Deterministic parsers work out of the box; with GEMINI_API_KEY set the
+// model is used first (handles Hinglish, free-form sentences, messy lists)
 // and the deterministic parser remains the fallback.
 const config = require('../config');
 const store = require('../store');
@@ -489,29 +489,22 @@ function textGrounded(item, text) {
   return needle.split(' ').some((w) => w.length >= 3 && hay.includes(w));
 }
 
-// ---------------- Claude-backed parsing ----------------
+// ---------------- model-backed parsing ----------------
 
 // Tests put a stand-in here, so the suite can reproduce what the live model
 // actually did (13 Sep: "16510m65l10 -5" came back as an inquiry) without a
 // network call.
-let claudeStub = null;
+let modelStub = null;
 
-// Gemini, asked the same question and answering in the same shape, so every
-// caller of claude() below works unchanged when Anthropic is not there.
+// THE MODEL IS GEMINI. Every caller — smallTalk, the free-text parser, the
+// naming model, the knowledge base, photos — goes through model() below, so
+// there is one place that knows the provider.
 //
-// 21 Sep: the Anthropic key was revoked and this bot lost its voice — not
-// just photos. smallTalk, the free-text parser and the naming model all go
-// through claude(), so one dead credential turned every conversational reply
-// into "Samajh nahi paya sir". Routing the fallback HERE rather than at each
-// call site means there is one place that knows about providers.
-//
-// `user` is Claude's own shape: a plain string, or content blocks where an
-// image is { type:'image', source:{ media_type, data } }. Both are mapped.
-async function geminiJson(system, user) {
-  const g = config.gemini;
-  if (!g.apiKey) throw new Error('no Gemini key');
+// `user` is a plain string, or content blocks where an image is
+// { type:'image', source:{ media_type, data } }. Both are mapped.
+function partsOf(user) {
   const blocks = Array.isArray(user) ? user : [{ type: 'text', text: String(user == null ? '' : user) }];
-  const parts = blocks
+  return blocks
     .map((b) => {
       if (b && b.type === 'image' && b.source && b.source.data) {
         return { inline_data: { mime_type: b.source.media_type || 'image/jpeg', data: b.source.data } };
@@ -520,10 +513,14 @@ async function geminiJson(system, user) {
       return text ? { text: String(text) } : null;
     })
     .filter(Boolean);
+}
 
+async function geminiJson(system, user, { modelName, tools, timeoutMs } = {}) {
+  const g = config.gemini;
+  if (!g.apiKey) throw new Error('no Gemini key');
   const url =
     'https://generativelanguage.googleapis.com/v1beta/models/' +
-    encodeURIComponent(g.visionModel) +
+    encodeURIComponent(modelName || g.visionModel) +
     ':generateContent';
   // 500-class is the model being busy — worth one more ask. 429 is not: it is
   // either "slow down" or a spent quota, and neither is fixed by hammering.
@@ -536,13 +533,14 @@ async function geminiJson(system, user) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         systemInstruction: system ? { parts: [{ text: String(system) }] } : undefined,
-        contents: [{ parts }],
+        contents: [{ parts: partsOf(user) }],
+        ...(tools ? { tools } : {}),
       }),
-      signal: AbortSignal.timeout(g.timeoutMs),
+      signal: AbortSignal.timeout(timeoutMs || g.timeoutMs),
     });
     if (res.ok || !RETRY_ON.has(res.status)) break;
   }
-  if (!res.ok) throw new Error('Gemini API HTTP ' + res.status + ' ' + (await res.text()).slice(0, 120));
+  if (!res.ok) throw new Error('Gemini API HTTP ' + res.status + ' ' + (await res.text()).slice(0, 160));
   const data = await res.json();
   const text = (((data.candidates || [])[0] || {}).content?.parts || []).map((p) => p.text || '').join('');
   const json = text.match(/\{[\s\S]*\}/);
@@ -550,89 +548,27 @@ async function geminiJson(system, user) {
   return JSON.parse(json[0]);
 }
 
-// Is there any model at all behind this bot? Callers used to ask
-// `config.ai.apiKey`, which is now only half the answer.
+// Is there a model behind this bot at all?
 function modelAvailable() {
-  return Boolean(config.ai.apiKey || (config.gemini && config.gemini.apiKey));
+  return Boolean(config.gemini && config.gemini.apiKey);
 }
 
 // user may be a plain string or a content-block array (for images)
-async function claude(system, user) {
-  if (claudeStub) return claudeStub(system, user);
-  // No Anthropic key configured at all — Gemini is the model, not a fallback.
-  if (!config.ai.apiKey) return geminiJson(system, user);
-  try {
-    return await anthropic(system, user);
-  } catch (e) {
-    // A revoked key, a rate limit, an outage: whatever it is, the customer is
-    // still waiting. Try the other provider before giving up on them.
-    if (!config.gemini || !config.gemini.apiKey) throw e;
-    store.log('ai', 'Anthropic failed (' + String((e && e.message) || e).slice(0, 60) + ') — asking Gemini');
-    return geminiJson(system, user);
-  }
+async function model(system, user) {
+  if (modelStub) return modelStub(system, user);
+  return geminiJson(system, user);
 }
 
-async function anthropic(system, user) {
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'x-api-key': config.ai.apiKey,
-      'anthropic-version': '2023-06-01',
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: config.ai.model,
-      max_tokens: 1024,
-      system,
-      messages: [{ role: 'user', content: user }],
-    }),
+// The same call with Google Search behind it, for facts the model should look
+// up rather than remember: which car 3V5845049RNVB fits, its HSN. The same
+// grounding the agent's search_the_web uses (agent/tools/web.js).
+async function modelWeb(system, user) {
+  if (modelStub) return modelStub(system, user);
+  return geminiJson(system, user, {
+    modelName: (config.agent && config.agent.webSearchModel) || undefined,
+    tools: [{ google_search: {} }],
+    timeoutMs: 60000,
   });
-  if (!res.ok) throw new Error('Anthropic API HTTP ' + res.status);
-  const data = await res.json();
-  const text = (data.content || []).map((c) => c.text || '').join('');
-  const jsonMatch = text.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) throw new Error('no JSON in AI reply');
-  return JSON.parse(jsonMatch[0]);
-}
-
-// The same call with Anthropic's server-side web search, for facts the model
-// should look up rather than remember: which car 3V5845049RNVB fits, its HSN.
-// The searching happens on Anthropic's side inside this one request. A long
-// search can stop with `pause_turn`; sending the reply back continues it.
-async function claudeWeb(system, user, { maxSearches = 5 } = {}) {
-  const messages = [{ role: 'user', content: user }];
-  for (let round = 0; round < 3; round++) {
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'x-api-key': config.ai.apiKey,
-        'anthropic-version': '2023-06-01',
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: config.ai.model,
-        max_tokens: 8000,
-        system,
-        tools: [{ type: 'web_search_20260209', name: 'web_search', max_uses: maxSearches }],
-        messages,
-      }),
-      signal: AbortSignal.timeout(180000),
-    });
-    if (!res.ok) throw new Error('Anthropic API HTTP ' + res.status + ' ' + (await res.text()).slice(0, 160));
-    const data = await res.json();
-    if (data.stop_reason === 'pause_turn') {
-      messages.push({ role: 'assistant', content: data.content });
-      continue;
-    }
-    const text = (data.content || [])
-      .filter((c) => c.type === 'text')
-      .map((c) => c.text)
-      .join('');
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error('no JSON in AI reply');
-    return JSON.parse(jsonMatch[0]);
-  }
-  throw new Error('web research did not finish');
 }
 
 // A space before the quantity is required. Without it "43430-0K021" would
@@ -696,7 +632,7 @@ async function parseCustomerMessage(text, catalogNames) {
 
   if (modelAvailable()) {
     try {
-      const r = await claude(
+      const r = await model(
         'You parse WhatsApp messages from auto-parts customers (English/Hindi/Hinglish). ' +
           'Reply ONLY with JSON: {"intent":"order|inquiry|confirm|cancel|remove|set_qty|status|other",' +
           '"lines":[{"item":str,"qty":int}],"items":[str],"item":str,"qty":int}. ' +
@@ -705,13 +641,13 @@ async function parseCustomerMessage(text, catalogNames) {
         text
       );
       if (r && r.intent) {
-        // Claude answers "Bhejo 5pc" with {item:"", qty:5} — it correctly sees
+        // The model answers "Bhejo 5pc" with {item:"", qty:5} — it correctly sees
         // a quantity and honestly reports no item. That empty string must not
         // reach the portal, which rejects the whole batch with a 422, nor the
         // customer, who was shown a line reading " x5 - checking".
         if (Array.isArray(r.lines)) r.lines = r.lines.filter((l) => l && String(l.item || '').trim().length >= 2);
         if (Array.isArray(r.items)) r.items = r.items.filter((i) => String(i || '').trim().length >= 2);
-        // "Known catalog items" in the prompt is there so Claude can match a
+        // "Known catalog items" in the prompt is there so the model can match a
         // name the customer typed to its real spelling — never a menu to pick
         // from. A vague quantity with no named item ("I need one piece of each
         // item", 13 Sep live) made it invent lines from that list, and the cart
@@ -731,7 +667,7 @@ async function parseCustomerMessage(text, catalogNames) {
         return r;
       }
     } catch (e) {
-      store.log('ai', 'Claude parse failed, using basic parser: ' + e.message);
+      store.log('ai', 'model parse failed, using basic parser: ' + e.message);
     }
   }
   return parseCustomerMessageBasic(text, catalogNames);
@@ -742,7 +678,7 @@ async function parseVendorStock(text) {
   if (basic.length) return basic;
   if (modelAvailable()) {
     try {
-      const r = await claude(
+      const r = await model(
         'You parse WhatsApp stock lists from auto-parts vendors (any format/language). ' +
           'Reply ONLY with JSON: {"lines":[{"item":str,"qty":int,"price":number|null}]}. ' +
           'If the message is not a stock list, reply {"lines":[]}.',
@@ -750,15 +686,15 @@ async function parseVendorStock(text) {
       );
       if (r && Array.isArray(r.lines)) return r.lines.filter((l) => l.item && l.qty > 0);
     } catch (e) {
-      store.log('ai', 'Claude stock parse failed: ' + e.message);
+      store.log('ai', 'model stock parse failed: ' + e.message);
     }
   }
   return [];
 }
 
 // ---------------- photo orders ----------------
-// "Customer photograph mein order bheje" — read by VISION: Gemini first,
-// Claude behind it (see parseOrderImage). There is no local OCR any more and
+// "Customer photograph mein order bheje" — read by VISION: Gemini
+// (see parseOrderImage). There is no local OCR any more and
 // no OCR binary in the image: it was a Windows-only fast path, it was switched
 // off everywhere it actually ran, and a reader that only works on a developer's
 // desk is a reader the customer never benefits from. What it taught us is kept
@@ -809,14 +745,14 @@ function imageNote() {
   return lastImageNote;
 }
 
-// What Claude is told about a photo.
+// What the model is told about a photo.
 //
 // Customers do not only photograph lists. They photograph the BOX, the printed
 // label, another dealer's WhatsApp screen, an estimate, and the bare part
 // itself. Asking only for "order lists" made the model answer {"lines":[]} for
 // a perfectly readable label, and the customer was told to type it out.
 //
-// Handwriting (13 Sep, founder: "ye handwritten photo kyon nhi pd rha..claude
+// Handwriting (13 Sep, founder: "ye handwritten photo kyon nhi pd rha..AI
 // api lagaya hi isliye hai"). A coil box labelled "33400 M" with "68P10" written
 // after it came back twice as "33400M" and went to a person; 33400M68P10 is on
 // the portal. On a handwritten 22-line list "- 10" was read as x16 and
@@ -864,137 +800,63 @@ function visionFragment(lines) {
 
 async function parseOrderImage(base64, mediaType) {
   lastImageNote = null;
-  // GEMINI FIRST, Claude behind it.
-  //
-  // 21 Sep: the Anthropic key was revoked, and with the old local OCR off that
-  // left no reader at all — every photo went to a person. Gemini reads a label
-  // just as well (3s on the test fixture) and its key is the one that works,
-  // so it leads and Claude catches what it cannot do. A photo that Gemini
-  // reads but finds no part in is a finished answer, not a failure: it
-  // returns an empty list and nobody else is asked, exactly as Claude did
-  // when it led.
+  // GEMINI reads the photo. A photo it reads but finds no part in is a
+  // finished answer, not a failure: it returns an empty list.
   const primary = await geminiOrderImage(base64, mediaType);
-  if (primary) return primary;
-
-  // Gemini is not configured, or could not answer — Claude vision if available
-  if (config.ai.apiKey) {
-    try {
-      const image = { type: 'image', source: { type: 'base64', media_type: mediaType || 'image/jpeg', data: base64 } };
-      let r = await claude(VISION_PROMPT, [image, { type: 'text', text: 'Extract the order lines from this image.' }]);
-      // It stopped at the printed half of a number ("33400M"): one more look,
-      // told where the rest usually is. Used only if it then gives a longer
-      // number that starts the same way.
-      const fragment = r && Array.isArray(r.lines) ? visionFragment(r.lines) : null;
-      if (fragment) {
-        store.log('ai', `photo gave only "${fragment}" - asking again for the whole number`);
-        try {
-          const again = await claude(VISION_PROMPT, [
-            image,
-            {
-              type: 'text',
-              text:
-                'Extract the order lines from this image. The part number starting "' + fragment + '" is incomplete - ' +
-                'the rest is usually written by hand next to it or hidden under a sticker. Give the full part number.',
-            },
-          ]);
-          const norm = (v) => String(v || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-          const whole = (l) => {
-            const pn = norm(partNumberIn(String(l.item || '')) || String(l.item || '').split(/\s+/)[0]);
-            return pn.startsWith(fragment) && pn.length >= fragment.length + 4;
-          };
-          if (again && Array.isArray(again.lines) && again.lines.some(whole)) r = again;
-        } catch (e) {
-          store.log('ai', 'second look at the photo failed: ' + String((e && e.message) || e).slice(0, 90));
-        }
-      }
-      if (r && Array.isArray(r.lines)) {
-        const clean = sanitizeOrderLines(r.lines, null);
-        // Carried on the array so the caller can tell "a bill" from "could not
-        // read it" without a second call to the model. Callers that only use
-        // .length / .map are unaffected.
-        if (r.doc) clean.docType = String(r.doc).toLowerCase().slice(0, 20);
-        // A number plate in the photo is the customer's CAR, not a part.
-        // Carried on the array so media.js can look it up instead of sending
-        // an unreadable photo to a person.
-        if (r.plate) clean.plate = require('../integrations/vahan').plateIn(String(r.plate)) || null;
-        lastImageNote = clean.length ? null : "the photo was read, but no part number is visible in it";
-        // Say what happened either way. Without this the log fell silent
-        // whenever nothing was found, which reads as "the model was never
-        // called" when in fact it looked at the photo and saw no order — two
-        // different problems with the same symptom on the customer's screen.
-        store.log(
-          'ai',
-          clean.length
-            ? `photo order read via Claude vision: ${clean.length} line(s)`
-            : `Claude vision saw the photo but found no order lines (${r.lines.length} raw)`
-        );
-        return clean;
-      }
-      lastImageNote = "the model did not answer properly about this photo";
-      store.log('ai', 'Claude vision returned no usable JSON');
-    } catch (e) {
-      lastImageNote = "reading the photo failed: " + String((e && e.message) || e).slice(0, 90);
-      store.log('ai', 'Claude vision failed: ' + String((e && e.message) || e).slice(0, 120));
+  if (!primary) {
+    if (!modelAvailable()) {
+      lastImageNote = 'there is no AI key on this machine, so photos cannot be read';
+      store.log('ai', 'no vision key on this machine — the photo cannot be read');
     }
-    return [];
+    return null;
   }
-  lastImageNote = "there is no AI key on this machine, so photos cannot be read";
-  store.log('ai', 'no vision key on this machine — the photo cannot be read');
-  return null;
+
+  // It stopped at the printed half of a number ("33400M"): one more look,
+  // told where the rest usually is. Used only if it then gives a longer
+  // number that starts the same way.
+  const fragment = visionFragment(primary);
+  if (!fragment) return primary;
+  store.log('ai', `photo gave only "${fragment}" - asking again for the whole number`);
+  try {
+    const image = { type: 'image', source: { type: 'base64', media_type: mediaType || 'image/jpeg', data: base64 } };
+    const again = await model(VISION_PROMPT, [
+      image,
+      {
+        type: 'text',
+        text:
+          'Extract the order lines from this image. The part number starting "' + fragment + '" is incomplete - ' +
+          'the rest is usually written by hand next to it or hidden under a sticker. Give the full part number.',
+      },
+    ]);
+    const norm = (v) => String(v || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const whole = (l) => {
+      const pn = norm(partNumberIn(String(l.item || '')) || String(l.item || '').split(/\s+/)[0]);
+      return pn.startsWith(fragment) && pn.length >= fragment.length + 4;
+    };
+    if (again && Array.isArray(again.lines) && again.lines.some(whole)) {
+      const clean = sanitizeOrderLines(again.lines, null);
+      if (primary.docType) clean.docType = primary.docType;
+      if (primary.plate) clean.plate = primary.plate;
+      return clean;
+    }
+  } catch (e) {
+    store.log('ai', 'second look at the photo failed: ' + String((e && e.message) || e).slice(0, 90));
+  }
+  return primary;
 }
 
-// Ask Gemini to read the photo, in the same shape Claude is asked for.
+// Ask Gemini to read the photo.
 // Returns the cleaned lines, or null when Gemini is not configured or could
 // not answer — null means "nothing to add", never "the photo is empty".
 async function geminiOrderImage(base64, mediaType) {
-  const g = config.gemini;
-  if (!g.apiKey) return null;
+  if (!modelAvailable() && !modelStub) return null;
   try {
-    const url =
-      'https://generativelanguage.googleapis.com/v1beta/models/' +
-      encodeURIComponent(g.visionModel) +
-      ':generateContent';
-    // 503 means "the model is busy, ask again", NOT "this photo cannot be
-    // read" — and the two had the same ending: straight past a dead Claude
-    // key to a person. Measured 21 Sep: one in five calls came back 503 while
-    // the same photo read perfectly on the retry. Backs off 1s, 2s.
-    //
-    // 429 is NOT in that set on purpose. Google answers 429 both for "too
-    // fast, slow down" and for "your quota is gone until it resets", and the
-    // second is not worth three attempts — on 21 Sep a spent free-tier quota
-    // cost five seconds of retries per photo before the same failure. A
-    // rate-limited call is caught by the next photo anyway; an exhausted one
-    // needs a person to fix the billing, not a tighter loop.
-    const RETRY_ON = new Set([500, 502, 503, 504]);
-    let res = null;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      if (attempt) await new Promise((r) => setTimeout(r, 1000 * attempt));
-      res = await fetch(url + '?key=' + encodeURIComponent(g.apiKey), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [
-            {
-              parts: [
-                { text: VISION_PROMPT + '\n\nExtract the order lines from this image.' },
-                { inline_data: { mime_type: mediaType || 'image/jpeg', data: base64 } },
-              ],
-            },
-          ],
-        }),
-        signal: AbortSignal.timeout(g.timeoutMs),
-      });
-      if (res.ok || !RETRY_ON.has(res.status)) break;
-      store.log('ai', `Gemini vision HTTP ${res.status} (attempt ${attempt + 1}/3) — retrying`);
-    }
-    if (!res.ok) throw new Error('HTTP ' + res.status + ' ' + (await res.text()).slice(0, 120));
-    const data = await res.json();
-    const text = (((data.candidates || [])[0] || {}).content?.parts || [])
-      .map((p) => p.text || '')
-      .join('');
-    const json = text.match(/\{[\s\S]*\}/);
-    if (!json) throw new Error('no JSON in the reply');
-    const r = JSON.parse(json[0]);
+    // model() retries a busy model (500-class) with a 1 s, 2 s back-off — 21
+    // Sep, one in five calls came back 503 and read perfectly on the retry —
+    // and does NOT retry 429: that is either "slow down" or a spent quota,
+    // and neither is fixed by asking three times.
+    const image = { type: 'image', source: { type: 'base64', media_type: mediaType || 'image/jpeg', data: base64 } };
+    const r = await model(VISION_PROMPT, [image, { type: 'text', text: 'Extract the order lines from this image.' }]);
     if (!r || !Array.isArray(r.lines)) throw new Error('no lines array');
     const clean = sanitizeOrderLines(r.lines, null);
     if (r.doc) clean.docType = String(r.doc).toLowerCase().slice(0, 20);
@@ -1011,6 +873,7 @@ async function geminiOrderImage(base64, mediaType) {
     );
     return clean;
   } catch (e) {
+    lastImageNote = 'reading the photo failed: ' + String((e && e.message) || e).slice(0, 90);
     store.log('ai', 'Gemini vision failed: ' + String((e && e.message) || e).slice(0, 120));
     return null;
   }
@@ -1174,13 +1037,13 @@ module.exports = {
   bareQty,
   captionQty,
   // The raw model call, so core/smallTalk.js does not open a second one.
-  // Is there a model behind this bot at all — Anthropic, Gemini, either.
+  // Is there a model behind this bot at all?
   modelAvailable,
-  _claude: claude,
-  // With web search, for looking facts up (core/partNaming).
-  _claudeWeb: claudeWeb,
-  _setClaude: (fn) => {
-    claudeStub = fn || null;
+  _model: model,
+  // With Google Search, for looking facts up (core/partNaming).
+  _modelWeb: modelWeb,
+  _setModel: (fn) => {
+    modelStub = fn || null;
   },
   // exported for tests
   _internals: { scanPartTokens, maxTokensPerLine, isPartToken, isJunkItem, joinSpacedPartNumbers, sanitizeOrderLines, PART_TOKEN_RE, QTY_UNIT_TOKEN } };

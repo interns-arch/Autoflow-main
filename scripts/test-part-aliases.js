@@ -40,7 +40,7 @@ process.env.DATA_DIR = process.env.ALIAS_TEST_DATA_DIR || path.join(os.tmpdir(),
 require('fs').mkdirSync(process.env.DATA_DIR, { recursive: true });
 require('fs').writeFileSync(path.join(process.env.DATA_DIR, 'state.json'), '{}');
 process.env.ESCALATION_NUMBER = '919999492550';
-process.env.ANTHROPIC_API_KEY = '';
+process.env.GEMINI_API_KEY = '';
 process.env.GEMINI_API_KEY = '';
 let REAL_DB = false;
 if (!(process.env.DATABASE_URL || '').trim()) process.env.DATABASE_URL = 'postgres://stand-in/none';

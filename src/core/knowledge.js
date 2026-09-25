@@ -360,7 +360,7 @@ function noteAliasHit(phrase) {
 
 // Every learned phrase — offered to the message parser as its catalog.
 // Every learned NAME - offered to the message parser as its catalog. Typo
-// aliases are left out: given "26510m65l10" as a known item, Claude turned a
+// aliases are left out: given "26510m65l10" as a known item, the model turned a
 // customer's correct 16510M65L10 into it.
 function aliasNames() {
   return Object.keys(bank().aliases).filter((a) => !isPartShaped(a));

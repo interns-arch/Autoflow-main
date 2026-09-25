@@ -358,7 +358,7 @@ async function main() {
   const realEmbed = embeddings.embed;
   embeddings.embed = async (t) => fakeEmbed(t);
   embeddings.available = () => true;
-  ai._claude = async (system, user) => fakeValidate(system, user);
+  ai._model = async (system, user) => fakeValidate(system, user);
   ai.modelAvailable = () => true;
 
   const kb = require('../src/core/kb');
@@ -485,11 +485,11 @@ async function main() {
 
   await test('9. the rephraser cannot invent a figure', async () => {
     const entry = { id: 999, answer: 'Maximum 10 percent discount is available on this account.' };
-    ai._claude = async () => ({ reply: 'Aapko 25 percent discount mil jayega.' });
+    ai._model = async () => ({ reply: 'Aapko 25 percent discount mil jayega.' });
     const text = await kb.phrase(entry, 'kitna discount milega?', 'sim-1');
     assert(/10 percent/.test(text), 'an invented figure was sent: ' + text);
     assert(!/25/.test(text), 'the invented figure survived: ' + text);
-    ai._claude = async (s, u) => fakeValidate(s, u);
+    ai._model = async (s, u) => fakeValidate(s, u);
   });
 
   await test('10. commercial terms with no customer attached wait for review', async () => {

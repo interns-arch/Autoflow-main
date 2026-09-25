@@ -250,8 +250,6 @@ const config = {
   },
 
   ai: {
-    apiKey: (process.env.ANTHROPIC_API_KEY || '').trim(),
-    model: (process.env.ANTHROPIC_MODEL || 'claude-sonnet-5').trim(),
     // Phase 3 of the pipeline review: the Understand model runs beside the bot
     // and writes what it WOULD have decided to /shared/shadow.jsonl. It answers
     // nobody. AI_SHADOW=true switches it on (pipeline/shadow).
@@ -316,13 +314,9 @@ const config = {
     })(),
   },
 
-  // A SECOND pair of eyes on a photo, for when the first is unavailable.
-  //
-  // 21 Sep: the Anthropic key was revoked and every photo stopped being read —
-  // one dead credential took the whole photo path down, and with local OCR off
-  // there was nothing behind it. Claude is still tried first; this runs only
-  // when that fails or is not configured. Same GEMINI_API_KEY as the voice
-  // notes use, but its own model: reading a label is not transcribing audio.
+  // THE MODEL: every photo, free-text parse, reply and name the bot asks for
+  // goes to Gemini (core/ai.model). Same GEMINI_API_KEY as the voice notes
+  // use, but its own model: reading a label is not transcribing audio.
   gemini: {
     apiKey: (process.env.GEMINI_API_KEY || '').trim(),
     // gemini-2.5-flash is RETIRED (404 "no longer available to new users").
@@ -474,7 +468,7 @@ const config = {
     apiToken: (process.env.KNOWLEDGE_API_TOKEN || '').trim(),
   },
 
-  // Voice notes -> text, for the HELPER to read. Claude takes no audio at all,
+  // Voice notes -> text, for the HELPER to read. Audio needs a model that takes it,
   // so this is Google. Blank key = the whole feature is off and voice notes
   // reach a person exactly as they did before.
   //

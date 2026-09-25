@@ -1,7 +1,6 @@
 'use strict';
 // Text -> vector, using Gemini's embedding endpoint and the GEMINI_API_KEY the
-// vision and voice paths already use. Anthropic has no embeddings API, which
-// is the only reason this is not Claude like everything else in the bot.
+// vision and voice paths already use — one provider, one key, for everything.
 //
 // There is NO offline fallback on purpose. A "roughly similar" vector computed
 // from word overlap would look exactly like a real one to everything

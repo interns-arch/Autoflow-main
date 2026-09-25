@@ -2156,7 +2156,7 @@ class CustomerBot {
   // what they did before.
   async modelReading(m) {
     const understandMod = require('../pipeline/understand');
-    if (!config.ai.apiKey && !understandMod._stubbed()) return null;
+    if (!require('../core/ai').modelAvailable() && !understandMod._stubbed()) return null;
     try {
       const r = await require('../pipeline/shadow').decide(m);
       return r.decision;

@@ -79,7 +79,7 @@ async function structure(question, answer, ctx) {
   if (!ai.modelAvailable()) return null;
   let j = null;
   try {
-    j = await ai._claude(
+    j = await ai._model(
       SYSTEM,
       'Customer asked:\n' + String(question).slice(0, 600) + '\n\nManager replied:\n' + String(answer).slice(0, 2000),
     );

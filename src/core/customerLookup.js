@@ -391,7 +391,7 @@ async function classifyDesk(text) {
   if (!require('./ai').modelAvailable()) return null;
   let r = null;
   try {
-    r = await ai._claude(
+    r = await ai._model(
       'You sort one WhatsApp message from the Cartrends sales desk (Hindi, English or Hinglish) into what the person wants to look up. ' +
         'Reply ONLY with JSON: {"kind": "track"|"challan"|"billStatus"|"shortage"|"partStatus"|"incoming"|"none", "orderId": str|null, "part": str|null, "name": str|null}. ' +
         'track = where an order is / dispatched / delivered / POD. challan = the delivery challan or delivery slip document. ' +

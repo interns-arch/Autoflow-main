@@ -296,12 +296,12 @@ async function askModel(fields, b) {
     .join('\n');
   let out;
   try {
-    out = await ai._claudeWeb(RULES, user);
+    out = await ai._modelWeb(RULES, user);
   } catch (e) {
     // Web search can be switched off for the account, or time out; the
     // model's own knowledge and the examples still make a useful suggestion.
     store.log('naming', 'web research failed for ' + fields.partNo + ', asking without it: ' + String((e && e.message) || e).slice(0, 120));
-    out = await ai._claude(RULES, user);
+    out = await ai._model(RULES, user);
   }
   let name = tidy(out && out.name, fields.partNo, fields.brand);
   if (!name) {

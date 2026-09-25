@@ -282,8 +282,8 @@ const PASSED_ON =
 // bot exactly as silent as it used to be, not break the message.
 // opts.noHuman: the model decided nobody is asked; a hand-over is a refusal.
 async function respond(chatId, message, phone, opts = {}) {
-  // ANY model will do — ai.claude() falls back to Gemini on its own. This
-  // used to ask for the Anthropic key specifically, so when that key was
+  // ANY model will do — ai.model() is the one place that knows which. This
+  // used to ask for one provider's key specifically, so when that key was
   // revoked the bot went quiet on every conversational message even though
   // a perfectly good model was configured.
   if (!require('./ai').modelAvailable()) return null;
@@ -321,7 +321,7 @@ async function respond(chatId, message, phone, opts = {}) {
     // fact about THIS message like they are, not a standing style rule. The
     // brief already forbids stating a price or a stock figure, so either one
     // can only change how a reply reads, never what it is allowed to say.
-    r = await require('./ai')._claude(SYSTEM + profiles.briefFor(phone) + (opts.noHuman ? NO_HUMAN : ''), user);
+    r = await require('./ai')._model(SYSTEM + profiles.briefFor(phone) + (opts.noHuman ? NO_HUMAN : ''), user);
   } catch (e) {
     store.log('chat', 'smalltalk failed: ' + String((e && e.message) || e).slice(0, 100));
     // Said as a refusal, so the bot answers with where things stand instead
