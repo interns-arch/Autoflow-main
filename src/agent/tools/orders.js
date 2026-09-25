@@ -138,6 +138,32 @@ const confirmOrder = tool(
     const order = draftFor(contextFrom(config), false);
     if (!order || !order.lines.length) return NO_CART;
 
+    // PAYMENT FIRST (founder, 25 Sep). A customer who still owes Rs 1 or
+    // more gets no new order until it is settled: the order is held, the
+    // amount and a payment QR go to them, and the accountant confirms it
+    // (core/payments). The held order goes on by itself once it is settled.
+    const bot = config && config.configurable && config.configurable.bot;
+    const ctxNow = contextFrom(config);
+    if (bot && bot.holdForPayment && ctxNow.customer && ctxNow.customer.buyerId) {
+      const hold = await bot.holdForPayment(order, ctxNow.customer).catch((e) => {
+        store.log('agent', 'due check failed: ' + String((e && e.message) || e).slice(0, 90));
+        return null;
+      });
+      if (hold) {
+        return JSON.stringify({
+          placed: false,
+          paymentDue: true,
+          amountDue: 'Rs.' + hold.due,
+          paymentRequest: hold.req.id,
+          qrSent: hold.qrSent,
+          why:
+            'Their previous balance is not settled. Tell them, in their language: the previous amount of ' + ('Rs.' + hold.due) + ' has to be paid to settle the account before this new order goes ahead' +
+            (hold.qrSent ? '; the payment QR has been sent to them just now' : '; our team will share how to pay') +
+            '. The order is kept and goes for approval as soon as the payment is confirmed. When they say they have paid, call payment_done. It is NOT placed and NOT sent for approval yet.',
+        });
+      }
+    }
+
     let res;
     try {
       res = await orders.confirm(order);
@@ -207,4 +233,30 @@ const cancelOrder = tool(
   },
 );
 
-module.exports = { showCart, addToOrder, changeQuantity, removeFromOrder, confirmOrder, cancelOrder };
+// "Payment kar diya", "paid", "transfer done", a payment screenshot: the
+// accountant is asked to check it (core/payments, customerBot.paymentClaimed).
+const paymentDone = tool(
+  async ({ whatTheySaid }, config) => {
+    const ctx = contextFrom(config);
+    const bot = config && config.configurable && config.configurable.bot;
+    if (!bot || !bot.paymentClaimed) return JSON.stringify({ error: 'payments are not available here', askAPerson: true });
+    if (!ctx.customer || !ctx.customer.buyerId) return JSON.stringify({ error: 'this number has no account, so there is no balance to settle', askAPerson: true });
+    const r = await bot.paymentClaimed(ctx.chatId, ctx.phone, ctx.customer, whatTheySaid || null).catch(() => ({ unknown: true }));
+    if (r.nothingDue) return JSON.stringify({ nothingDue: true, note: 'their account shows nothing due — tell them their balance is already settled' });
+    if (r.unknown) return JSON.stringify({ error: 'the balance could not be read right now', askAPerson: true });
+    if (!r.sent) return JSON.stringify({ error: 'the accountant could not be reached', askAPerson: true });
+    return JSON.stringify({
+      sentToAccountant: true,
+      paymentRequest: r.req.id,
+      note: 'Tell them: thank you, our accounts team is checking the payment; they will hear as soon as it is confirmed' + (r.req.orderId ? ', and then their order goes for approval' : '') + '. Do NOT say it is confirmed or settled.',
+    });
+  },
+  {
+    name: 'payment_done',
+    description:
+      'The customer says they have paid what they owed ("payment kar diya", "paid", "transfer ho gaya", or sends a payment screenshot). Sends it to our accountant to check. Call it once per claim; the customer is told the result when the accountant confirms.',
+    schema: z.object({ whatTheySaid: z.string().optional().describe('their words about the payment, e.g. "22000 bhej diya UPI se"') }),
+  },
+);
+
+module.exports = { showCart, addToOrder, changeQuantity, removeFromOrder, confirmOrder, cancelOrder, paymentDone };

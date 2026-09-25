@@ -54,6 +54,7 @@ const TOOLS = [
   cart.changeQuantity,
   cart.removeFromOrder,
   cart.confirmOrder,
+  cart.paymentDone,
   cart.cancelOrder,
   knowledge.answerBusinessQuestion,
   knowledge.answerGeneralChat,
@@ -358,7 +359,7 @@ function approvalThisTurn(messages) {
     const m = list[i];
     if ((m.getType ? m.getType() : '') !== 'tool') continue;
     const text = textOf(m);
-    if (/"sentForApproval"\s*:\s*true|"requestId"\s*:\s*"(WA|ORD|DSC)-|"done"\s*:\s*"sent_for_review"/.test(text)) return true;
+    if (/"sentForApproval"\s*:\s*true|"sentToAccountant"\s*:\s*true|"paymentDue"\s*:\s*true|"requestId"\s*:\s*"(WA|ORD|DSC|PAY)-|"done"\s*:\s*"sent_for_review"/.test(text)) return true;
   }
   return false;
 }

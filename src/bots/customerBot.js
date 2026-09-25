@@ -111,6 +111,7 @@ const quotable = require('../core/chatState').slot('quotable');
 const rateOptions = require('../core/chatState').slot('rateOptions');
 const discountSetup = require('../core/discountSetup');
 const approvalLog = require('../core/approvalLog');
+const payments = require('../core/payments');
 // The car a customer last NAMED in words, for the half hour after. "Swift
 // Dzire bumper price", then "mera gaadi 2018 model hai, kaun sa rear bumper"
 // - the second never says the car again, and searching "rear bumper" alone
@@ -517,6 +518,9 @@ class CustomerBot {
     // thing that creates an account — checked before everything else, since
     // a request id is not a part number and must never be looked up as one.
     {
+      // THE ACCOUNTANT on a payment: "OK PAY-… <amount>" / "NO PAY-…".
+      const payDecision = payments.readDecision(text);
+      if (payDecision && payments.isAccountant(m.from)) return this.decidePayment(m, payDecision, reply, t);
       const decision = customerCreate.readDecision(text);
       if (decision && customerCreate.isApprover(m.from)) {
         if (/^DSC-/.test(decision.requestId)) return this.decideDiscount(m, decision, reply, t);
@@ -2821,6 +2825,7 @@ class CustomerBot {
         (config.inquiryOnlyNumbers || []).includes(p) ||
         salesOrder.isSalesPerson(p) ||
         customerCreate.isApprover(p) ||
+        payments.isAccountant(p) ||
         customerCreate.agentName(p),
     );
   }
@@ -3503,6 +3508,195 @@ class CustomerBot {
     approvalLog.record({ kind: 'discount', id: req.id, event: 'approved', by: who, customer: req.customer, detail: `${made.name} (created on the portal)` });
     await tell(t(`✅ Discount rule approved and created: ${made.name}`, `✅ Discount rule approve ho gaya, portal pe ban gaya: ${made.name}`));
     return reply(t(`Done — ${made.name}.`, `Ho gaya — ${made.name}.`));
+  }
+
+  // ---- payment before a new order (core/payments) ----
+
+  // At the order's "yes": does this customer still owe money? -> null when
+  // the order may go on, or { req, due, qrSent } when it is held.
+  async holdForPayment(order, customer) {
+    const due = await payments.dueOf(customer).catch(() => null);
+    if (!due || payments.settled(due.due)) return null;
+    const req = payments.open({
+      chatId: order.chatId,
+      phone: String(order.chatId || '').split('@')[0],
+      customer: customer.name,
+      buyerId: customer.buyerId,
+      due: due.due,
+      orderId: order.id,
+    });
+    order.status = 'awaitingPayment';
+    order.paymentId = req.id;
+    store.save();
+    store.log(this.key, `${order.id} held: ${customer.name} owes ${payments.money(due.due)} (${req.id})`);
+    approvalLog.record({ kind: 'payment', id: req.id, event: 'requested', by: 'bot (order ' + order.id + ')', customer: customer.name, phone: req.phone, detail: 'due ' + payments.money(due.due) + ' before ' + order.id, amount: due.due });
+    const qrSent = await this.sendPaymentQr(req, due.due);
+    return { req, due: due.due, qrSent };
+  }
+
+  // The QR for the amount, into the customer's chat. -> true when one went.
+  async sendPaymentQr(req, amount) {
+    const q = await payments.qr(amount, `${req.customer} ${req.id}`).catch(() => null);
+    if (!q || !this.transport.sendImage) return false;
+    const t = lang.for(req.chatId);
+    const caption = t(`Pay ${payments.money(amount)} — scan to pay (${req.id})`, `${payments.money(amount)} pay kijiye — scan karke (${req.id})`);
+    try {
+      const id = await this.transport.sendImage(req.chatId, q.buffer, q.mime, caption);
+      this.recordOutgoing(req.chatId, id, caption);
+      return true;
+    } catch (e) {
+      store.log(this.key, `${req.id}: payment QR not sent: ${String((e && e.message) || e).slice(0, 80)}`);
+      return false;
+    }
+  }
+
+  // The customer says they have paid: the accountant is asked to check.
+  // -> { sent, req } | { nothingDue } | { unknown }
+  async paymentClaimed(chatId, phone, customer, claim) {
+    let req = payments.forChat(chatId);
+    if (!req) {
+      // No held order, but they are paying what they owe: check it anyway.
+      const due = await payments.dueOf(customer).catch(() => null);
+      if (!due) return { unknown: true };
+      if (payments.settled(due.due)) return { nothingDue: true };
+      req = payments.open({ chatId, phone: store.normPhone(phone), customer: customer.name, buyerId: customer.buyerId, due: due.due, orderId: null });
+    }
+    req.status = 'checking';
+    req.claim = claim || null;
+    payments.save(req);
+    const text = payments.accountantText(req, claim);
+    const photo = incoming.heldPhoto(chatId); // a payment screenshot, if they sent one
+    let sent = 0;
+    for (const acc of Object.keys(config.payments.accountants || {})) {
+      try {
+        await escalation.ensureWindow(this.transport, acc, 'Payment to check — details follow');
+        if (photo && this.transport.sendImage) await this.transport.sendImage(acc, Buffer.from(photo.base64, 'base64'), photo.mime, text);
+        else await this.transport.sendText(acc, text);
+        sent++;
+      } catch (e) {
+        store.log(this.key, `${req.id}: could not reach accountant ${acc}: ${String((e && e.message) || e).slice(0, 80)}`);
+      }
+    }
+    store.log(this.key, `${req.id}: ${req.customer} says paid — sent to ${sent} accountant(s)`);
+    approvalLog.record({ kind: 'payment', id: req.id, event: 'claimed', by: 'customer (' + store.normPhone(phone) + ')', customer: req.customer, detail: claim ? String(claim).slice(0, 120) : 'says paid', amount: req.due });
+    return { sent: sent > 0, req };
+  }
+
+  // "OK PAY-7F3K 22002" / "NO PAY-7F3K" from the accountant.
+  async decidePayment(m, decision, reply, t) {
+    const req = payments.find(decision.requestId);
+    if (!req) return reply(t(`${decision.requestId} not found.`, `${decision.requestId} nahi mila.`));
+    if (req.status === 'settled') return reply(t(`${req.id} is already settled.`, `${req.id} pehle hi settle ho chuka hai.`));
+    const who = payments.accountantName(m.from);
+    const ct = lang.for(req.chatId);
+    const tell = async (text) => {
+      try {
+        const id = await this.transport.sendToChat(req.chatId, text);
+        this.recordOutgoing(req.chatId, id, text);
+      } catch (e) {
+        store.log(this.key, `${req.id}: could not tell the customer: ${String((e && e.message) || e).slice(0, 80)}`);
+      }
+    };
+
+    if (!decision.yes) {
+      req.status = 'waiting';
+      payments.save(req);
+      approvalLog.record({ kind: 'payment', id: req.id, event: 'rejected', by: who, customer: req.customer, detail: 'payment not received' });
+      await tell(
+        ct(
+          `We have not received the payment yet. ${payments.money(req.due)} is still due — please pay it and let us know.`,
+          `Payment abhi tak nahi aaya hai. ${payments.money(req.due)} abhi baaki hai — pay karke bata dijiye.`,
+        ),
+      );
+      await this.sendPaymentQr(req, req.due);
+      return reply(t(`Noted — ${req.customer} was told it has not come in.`, `Theek hai — ${req.customer} ko bata diya ki payment nahi aaya.`));
+    }
+
+    if (decision.amount) req.received.push({ amount: decision.amount, by: who, at: new Date().toISOString() });
+    // The balance as the portal has it NOW — after he recorded the receipt.
+    require('./../core/customers').forget(req.phone);
+    const now = await payments.dueOf({ name: req.customer, buyerId: req.buyerId }).catch(() => null);
+    const left = now ? now.due : null;
+    approvalLog.record({ kind: 'payment', id: req.id, event: 'approved', by: who, customer: req.customer, detail: `received ${decision.amount ? payments.money(decision.amount) : '(amount not given)'}; portal due now ${left === null ? 'unknown' : payments.money(left)}`, amount: decision.amount || null });
+
+    if (left === null) {
+      payments.save(req);
+      return reply(t(`Noted. I cannot read ${req.customer}'s balance on the portal right now — send OK ${req.id} again in a minute.`, `Note kar liya. ${req.customer} ka balance portal pe abhi nahi dikh raha — ek minute mein dobara OK ${req.id} bhejiye.`));
+    }
+    // Money came in, but the portal has not moved yet: the receipt is still to
+    // be recorded. The customer is not asked for the full amount again.
+    if (!payments.settled(left) && decision.amount && left >= req.due - 0.5) {
+      req.status = 'checking';
+      payments.save(req);
+      await tell(
+        ct(
+          `${payments.money(decision.amount)} received, thank you — your account is being updated. You will hear as soon as it is done.`,
+          `${payments.money(decision.amount)} mil gaya, shukriya — aapka account update ho raha hai. Hote hi bata denge.`,
+        ),
+      );
+      return reply(
+        t(
+          `Noted ${payments.money(decision.amount)}. The portal still shows ${payments.money(left)} due for ${req.customer} — record the receipt on the portal, then send *OK ${req.id}* again.`,
+          `${payments.money(decision.amount)} note kar liya. Portal pe ${req.customer} ka abhi bhi ${payments.money(left)} due hai — receipt portal pe update karke dobara *OK ${req.id}* bhejiye.`,
+        ),
+      );
+    }
+    if (!payments.settled(left)) {
+      req.due = left;
+      req.status = 'waiting';
+      payments.save(req);
+      await tell(
+        ct(
+          `${decision.amount ? payments.money(decision.amount) + ' received, thank you. ' : ''}${payments.money(left)} is still due — please pay it to settle your account before the new order.`,
+          `${decision.amount ? payments.money(decision.amount) + ' mil gaya, shukriya. ' : ''}Abhi ${payments.money(left)} baaki hai — naye order se pehle ise settle kar dijiye.`,
+        ),
+      );
+      await this.sendPaymentQr(req, left);
+      return reply(
+        t(
+          `The portal still shows ${payments.money(left)} due for ${req.customer}. The customer was asked for it. If the full amount has come in, record it on the portal and send *OK ${req.id}* again.`,
+          `Portal pe ${req.customer} ka abhi bhi ${payments.money(left)} due dikh raha hai. Customer ko bata diya. Agar poora amount aa gaya hai to portal pe update karke dobara *OK ${req.id}* bhejiye.`,
+        ),
+      );
+    }
+
+    // SETTLED. The customer is told, and the held order goes on.
+    req.status = 'settled';
+    req.due = left;
+    payments.save(req);
+    approvalLog.record({ kind: 'payment', id: req.id, event: 'settled', by: who, customer: req.customer, detail: 'balance settled' });
+    store.log(this.key, `${req.id}: ${req.customer} settled (portal due ${payments.money(left)}), confirmed by ${who}`);
+    const order = req.orderId ? store.orders().find((o) => o.id === req.orderId) : null;
+    let next = '';
+    if (order && order.status === 'awaitingPayment') {
+      const went = await this.releaseHeldOrder(order);
+      next = went;
+    }
+    await tell(
+      ct(`✅ Your balance is settled. Thank you!${next ? ' ' + next.en : ''}`, `✅ Aapka balance settle ho gaya. Shukriya!${next ? ' ' + next.hi : ''}`),
+    );
+    return reply(t(`Settled — ${req.customer}.${order ? ' Their order ' + order.id + ' has gone on.' : ''}`, `Settle ho gaya — ${req.customer}.${order ? ' Unka order ' + order.id + ' aage bhej diya.' : ''}`));
+  }
+
+  // The order that waited on the payment: placed, or — while placing is off —
+  // sent to the Sales Heads for approval. -> the words for the customer.
+  async releaseHeldOrder(order) {
+    order.status = 'draft';
+    store.save();
+    let res = null;
+    try {
+      res = await orders.confirm(order);
+    } catch (e) {
+      store.log(this.key, `${order.id}: placing after the payment failed: ${String((e && e.message) || e).slice(0, 100)}`);
+      const sent = await this.requestOrderApproval(order);
+      return sent ? { en: `Your order ${order.id} has gone for approval.`, hi: `Aapka order ${order.id} approval ke liye bhej diya hai.` } : null;
+    }
+    if (res && res.blocked) {
+      const sent = await this.requestOrderApproval(order);
+      return sent ? { en: `Your order ${order.id} has gone for approval.`, hi: `Aapka order ${order.id} approval ke liye bhej diya hai.` } : null;
+    }
+    if (res && res.soNumber) return { en: `Your order is placed — order no. ${res.soNumber}.`, hi: `Aapka order place ho gaya — order no. ${res.soNumber}.` };
+    return null;
   }
 
   // ---- orders approved by the Sales Head ----

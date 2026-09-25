@@ -278,6 +278,20 @@ const config = {
   //
   // The phone:name lists were already in .env and read by nothing; this is
   // what finally uses them.
+  // PAYMENT BEFORE A NEW ORDER (founder, 25 Sep). A customer with a due
+  // balance of Rs 1 or more is asked to settle it first, with a payment QR;
+  // the accountant confirms what came in (core/payments).
+  payments: {
+    // "919971194578:Anurag" — who confirms a payment arrived.
+    accountants: nameMap(process.env.ACCOUNTANT_NUMBERS || '919971194578:Anurag'),
+    // The QR: built for the exact amount from a UPI id, or a fixed image.
+    upiId: (process.env.PAYMENT_UPI_ID || '').trim(),
+    upiName: (process.env.PAYMENT_UPI_NAME || 'Cartrends').trim(),
+    qrImage: (process.env.PAYMENT_QR_IMAGE || '').trim(),
+    // Below this, a balance counts as settled.
+    settledBelow: Number(process.env.PAYMENT_SETTLED_BELOW || 1),
+  },
+
   creation: {
     // Who may be asked to fill one in, and what to call them.
     team: nameMap(process.env.CREATION_TEAM_NUMBERS),

@@ -296,7 +296,12 @@ async function customerCard(row, t) {
     full.person ? 'Contact: ' + full.person : null,
     agentOf(full) ? 'Agent: ' + agentOf(full) : null,
     full.credit_limit != null ? `Credit: ${money(full.credit_limit)}${full.credit_days != null ? ' · ' + full.credit_days + ' day(s)' : ''}` : null,
-    full.balance != null ? 'Balance: ' + money(full.balance) : null,
+    // What they owe — Odoo's receivable, as the portal reads it live.
+    full.balance != null
+      ? Number(full.balance) >= 1
+        ? t('Due balance: ', 'Due balance: ') + money(full.balance) + t(' (to be settled before a new order)', ' (naye order se pehle settle karna hai)')
+        : t('Due balance: nil (settled)', 'Due balance: nil (settle hai)')
+      : null,
     'Portal id: ' + full.id,
     discounts.length
       ? t('Discounts now: ', 'Abhi discount: ') + discounts.map((d) => `${d.on} ${d.percent}%${d.validTill ? ' (till ' + d.validTill + ')' : ''}`).join('; ')
@@ -1234,7 +1239,12 @@ async function handle(bot, m, text, reply, t) {
     const items = takeItems(m.chatId);
     start(m.chatId, rows.slice(0, MAX_CANDIDATES), items);
     store.log('sales', m.from + ' picked the customer by ' + (key.phone ? 'phone' : 'GST') + ' ' + what + ': ' + rows.length + ' account(s)' + (items ? ', with held parts' : ''));
-    if (rows.length === 1) return reply(t(label(rows[0]) + ' - this one?', label(rows[0]) + ' - yahi wale?'));
+    // One account: everything about it — its due balance included — and
+    // whether the order is for them. The card answers "what does X owe?" too.
+    if (rows.length === 1) {
+      const card = await customerCard(rows[0], t);
+      return reply(card + '\n\n' + t('Is the order for this customer? (yes / no)', 'Order isi customer ke liye hai? (haan / nahi)'));
+    }
     const listed = rows.slice(0, MAX_CANDIDATES).map((r, i) => i + 1 + '. ' + label(r)).join('\n');
     return reply(t('Which one?\n' + listed, 'Kaunsa wala?\n' + listed));
   }
