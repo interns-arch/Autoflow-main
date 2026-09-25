@@ -274,6 +274,37 @@ function label(row) {
   return extra ? row.name + ' (' + extra + ')' : row.name;
 }
 
+// EVERYTHING ABOUT ONE CUSTOMER, for the agent to check before acting on
+// the account (founder, 25 Sep: "show complete detail about the customer to
+// agent and after that agent say yes"). The portal's account row carries the
+// credit terms and balance; a row that came from the phone lookup is filled
+// in from the name search. The discounts are the ones that apply today.
+async function customerCard(row, t) {
+  const portal = require('../integrations/dealerPortal');
+  let full = row;
+  if (row && row.credit_limit === undefined && row.name) {
+    const rows = await portal.searchAccounts(row.name).catch(() => []);
+    full = { ...row, ...(rows.find((r) => Number(r.id) === Number(row.id)) || {}) };
+  }
+  const money = (v) => (v === null || v === undefined || v === '' ? null : '₹' + Number(v).toLocaleString('en-IN', { maximumFractionDigits: 2 }));
+  const discounts = await portal.activeDiscounts(full.id).catch(() => []);
+  const lines = [
+    `*${full.name}*`,
+    full.phone || full.mobile ? 'Phone: ' + (full.phone || full.mobile) : null,
+    full.gst_no ? 'GSTIN: ' + full.gst_no : null,
+    full.address || full.state_name ? 'Address: ' + [full.address, full.state_name].filter(Boolean).join(', ') : null,
+    full.person ? 'Contact: ' + full.person : null,
+    agentOf(full) ? 'Agent: ' + agentOf(full) : null,
+    full.credit_limit != null ? `Credit: ${money(full.credit_limit)}${full.credit_days != null ? ' · ' + full.credit_days + ' day(s)' : ''}` : null,
+    full.balance != null ? 'Balance: ' + money(full.balance) : null,
+    'Portal id: ' + full.id,
+    discounts.length
+      ? t('Discounts now: ', 'Abhi discount: ') + discounts.map((d) => `${d.on} ${d.percent}%${d.validTill ? ' (till ' + d.validTill + ')' : ''}`).join('; ')
+      : t('Discounts now: none', 'Abhi discount: koi nahi'),
+  ];
+  return lines.filter(Boolean).join('\n');
+}
+
 // The same shape customers.resolve() returns, so the order and confirm paths
 // cannot tell a picked customer from one found by phone.
 function ctxFor(row) {
@@ -1652,6 +1683,7 @@ function _resetDirectory() {
 }
 
 module.exports = {
+  customerCard,
   readCustomerKey,
   findByKey,
   holdItems,

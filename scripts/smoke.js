@@ -2486,31 +2486,43 @@ async function main() {
       await customer.decideNewCustomer({ chatId: 'sim-' + APPR20, from: APPR20 }, { yes: false, requestId: 'WA-DSC21' }, async () => true, tt20);
       check('a rejected account takes its discount rules with it', !ds20.find(id21));
 
-      // ---- an EXISTING customer changes their discount ----
+      // ---- an AGENT changes an EXISTING customer's discount ----
+      // Only the sales team sets discounts (founder, 25 Sep): the agent names
+      // the customer by phone, is shown the account, and says yes first.
       portal._setMockDiscountRules([
         { id: 501, rule_id: 501, rule_type: 'BRAND', brand: 'CARTRENDS', dealer_id: 1, discount_mode: 'PERCENT', discount_value: 12, is_active: true, rule_name: 'Mock Customer CARTRENDS 12%' },
         { id: 502, rule_id: 502, rule_type: 'BRAND', brand: 'BOSCH', dealer_id: 999, discount_mode: 'PERCENT', discount_value: 5, is_active: true, rule_name: 'Other BOSCH 5%' },
       ]);
+      portal.setMockCustomers([{ id: 1, name: 'Mock Customer', phone: '919000000304', gst_no: '07AAAAA0000A1Z5', address: 'Karol Bagh, Delhi', credit_limit: '50000.00', credit_days: 7, balance: '1200' }]);
+      const teamWas22 = cr20.team;
+      cr20.team = { ...(teamWas22 || {}), [AGENT20]: 'Shubham' };
       const CUST22 = '919000000304';
-      const list22 = text20(await say20(CUST22, 'mera discount change karna hai'));
-      check('an existing customer is shown their own rules only', /1\. Mock Customer CARTRENDS 12% — 12%/.test(list22) && !/BOSCH/.test(list22));
-      check('...and asked the new %', /Abhi 12% hai\. Naya discount %/.test(text20(await say20(CUST22, '1'))));
+      check('a customer asking is not given a discount setup', !/Kis customer ka discount|discount rules/i.test(text20(await say20(CUST22, 'mera discount change karna hai'))));
+      check('an agent is asked for the customer by phone or GST', /phone number ya GST number/i.test(text20(await say20(AGENT20, 'discount change karna hai'))));
+      const card22 = text20(await say20(AGENT20, '9000000304'));
+      check('...shown the customer in full before anything starts', /\*Mock Customer\*/.test(card22) && /GSTIN: 07AAAAA0000A1Z5/.test(card22) && /Isi customer ka discount setup karein/.test(card22));
+      const list22 = text20(await say20(AGENT20, 'haan'));
+      check('...then shown their rules only', /1\. Mock Customer CARTRENDS 12% — 12%/.test(list22) && !/BOSCH/.test(list22));
+      check('...and asked the new %', /Abhi 12% hai\. Naya discount %/.test(text20(await say20(AGENT20, '1'))));
       // The new % sends it: there is no "Send for approval?" any more (25 Sep,
       // live — the next message was read as a no and the change was lost).
-      const sent22 = await say20(CUST22, '15');
+      const sent22 = await say20(AGENT20, '15');
       check('...shown the change as it is sent', /12% → 15%/.test(text20(sent22)));
       const id22 = dscIn20(sent22);
       check('the change goes to the Sales Head, not the portal', /\*Discount change\*/.test(sent22.filter((o) => o.to === APPR20).map((o) => o.text).join('\n')) && (await portal.listDiscountRules())[0].discount_value === 12);
       const ok22 = await say20(APPR20, 'OK ' + id22);
       const rule22 = (await portal.listDiscountRules())[0];
       check('"OK DSC-…" updates only the discount on the portal', rule22.discount_value === 15 && rule22.brand === 'CARTRENDS' && rule22.rule_name === 'Mock Customer CARTRENDS 15%');
-      check('...and the customer is told', ok22.some((o) => String(o.to).indexOf(CUST22) >= 0 && /12% → 15%/.test(o.text || '')));
+      check('...and the agent is told', ok22.some((o) => String(o.to).indexOf(AGENT20) >= 0 && /12% → 15%/.test(o.text || '')));
       // a NO leaves it as it was
-      await say20(CUST22, 'discount change karna hai');
-      await say20(CUST22, '1');
-      const id23 = dscIn20(await say20(CUST22, '20'));
+      await say20(AGENT20, 'discount change karna hai');
+      await say20(AGENT20, '9000000304');
+      await say20(AGENT20, 'haan');
+      await say20(AGENT20, '1');
+      const id23 = dscIn20(await say20(AGENT20, '20'));
       await say20(APPR20, 'NO ' + id23);
       check('"NO DSC-…" changes nothing', (await portal.listDiscountRules())[0].discount_value === 15);
+      cr20.team = teamWas22;
 
       // ---- the same flow with NOTHING TAPPED ----
       // The bot sends no buttons any more, so every step above has to work

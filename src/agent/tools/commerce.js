@@ -93,8 +93,8 @@ const myDiscounts = tool(
     const list = await discountsOf(ctx.customer);
     return JSON.stringify(
       list.length
-        ? { discounts: list, note: 'these are already in every price check_stock_and_price gives them. To change one, the setup starts when they ask to change their discount.' }
-        : { discounts: [], note: 'no discount on this account today — prices are MRP. They can ask for one ("discount setup karo").' },
+        ? { discounts: list, note: 'these are already in every price check_stock_and_price gives them. Discounts are set up only by our sales team: if they want a new one or a change, say their sales representative will take it up, and call ask_a_person with what they asked.' }
+        : { discounts: [], note: 'no discount on this account today — prices are MRP. Discounts are set up only by our sales team: if they want one, say their sales representative will take it up, and call ask_a_person with what they asked.' },
     );
   },
   {

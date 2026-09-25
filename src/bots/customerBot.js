@@ -471,21 +471,10 @@ class CustomerBot {
         rememberMsg(m.chatId, sentId, 'us', text);
         return true;
       };
-      // A CUSTOMER SETTING UP THEIR OWN DISCOUNT. Anyone may ask for one, not
-      // only an agent; the rule goes to the Sales Head ("OK DSC-…") before the
-      // portal is touched, whoever asked. Its answers — "12", "3 mahine" — are
-      // the setup's, so an open one is checked before the agent sees them. A
-      // question asked in the middle (answerDiscount -> null) goes on to it.
-      const said = String(m.body || '').trim();
-      if (said && !['image', 'video', 'document', 'audio', 'ptt', 'sticker'].includes(m.mediaType)) {
-        if (discountSetup.pending(m.chatId)) {
-          const done = await this.answerDiscount(m, said, asWritten, t);
-          if (done) return done;
-        } else if (discountSetup.wantsSetup(said)) {
-          store.log(this.key, `${m.from} asked to set up a discount: "${said.slice(0, 60)}"`);
-          return this.startDiscountChange(m, said, asWritten, t);
-        }
-      }
+      // DISCOUNTS ARE SET UP BY THE SALES TEAM, not by customers (founder,
+      // 25 Sep). A customer asking for one is answered by the agent, which
+      // passes it to a person; a setup left open from before is dropped.
+      if (discountSetup.pending(m.chatId)) discountSetup.cancel(m.chatId);
       return this.answerCustomer(m, asWritten, t);
     }
 
@@ -2439,10 +2428,12 @@ class CustomerBot {
         `Shukriya — approval ke liye bhej diya (${form.answers.requestId}). Account khulte hi bata dunga.`,
       ),
     );
-    // The discount is set up now, while the approval runs — by whoever filled
-    // the form, an agent or the customer registering themselves. Every rule
-    // still goes to the Sales Head before the portal is touched.
-    return this.startDiscountSetup(m, form, reply, t);
+    // A SALES-TEAM AGENT who opened it sets its discount now, while the
+    // approval runs (founder, 25 Sep: only the sales team sets discounts). A
+    // customer registering themselves is not asked. Every rule still goes to
+    // the Sales Head before the portal is touched.
+    if (form.byName) return this.startDiscountSetup(m, form, reply, t);
+    return true;
   }
 
 
@@ -2993,27 +2984,43 @@ class CustomerBot {
 
   // AN EXISTING CUSTOMER'S DISCOUNT, changed. The customer asks for their own;
   // an agent or the desk says whose.
+  // ONLY THE SALES TEAM SETS UP A DISCOUNT, and only for a customer that
+  // exists (founder, 25 Sep). The agent names the customer by phone or GST
+  // number (or name), is shown everything the portal has on them, and says
+  // yes before the setup starts. A customer that is not on the portal yet is
+  // opened first ("customer bana do"), which asks for its discount at the end.
   async startDiscountChange(m, text, reply, t) {
     const agent = customerCreate.agentName(m.from);
     const staff = Boolean(agent) || salesOrder.isSalesPerson(m.from) || this.isOwnTeam(m);
-    const st = { mode: 'change', step: 'customer', draft: {}, count: 0, setBy: staff ? agent || m.profileName || m.from : 'customer (' + m.from + ')' };
     if (!staff) {
-      const me = await customers.resolve(m.from).catch(() => null);
-      if (!me || !me.found) {
-        return reply(t('Your number is not on our system yet, so there is no discount to change.', 'Aapka number abhi system mein nahi hai, isliye discount change nahi ho sakta.'));
-      }
-      st.dealerId = me.buyerId;
-      st.customer = me.name;
-      return this.showDiscountRules(m, st, reply, t);
+      return reply(
+        t(
+          'Discounts are set up by our sales team — please speak to your sales representative.',
+          'Discount hamari sales team set karti hai — apne sales representative se baat kijiye.',
+        ),
+      );
     }
+    const st = { mode: 'change', step: 'customer', draft: {}, count: 0, setBy: agent || m.profileName || m.from };
     const picked = salesOrder.activeCustomer(m.chatId);
     if (picked && picked.buyerId) {
-      st.dealerId = picked.buyerId;
-      st.customer = picked.name;
-      return this.showDiscountRules(m, st, reply, t);
+      return this.confirmDiscountCustomer(m, st, { ...(picked.raw || {}), id: picked.buyerId, name: picked.name }, reply, t);
     }
     discountSetup.save(m.chatId, st);
-    return reply(t('Whose discount? Send the customer name.', 'Kis customer ka discount? Customer ka naam bhejiye.'));
+    return reply(
+      t(
+        "Whose discount? Send the customer's phone number or GST number (or the name).",
+        'Kis customer ka discount? Customer ka phone number ya GST number bhejiye (ya naam).',
+      ),
+    );
+  }
+
+  // The customer, in full, and one question: this one?
+  async confirmDiscountCustomer(m, st, row, reply, t) {
+    st.row = row;
+    st.step = 'confirmCustomer';
+    discountSetup.save(m.chatId, st);
+    const card = await salesOrder.customerCard(row, t);
+    return reply(card + '\n\n' + t('Set up the discount for this customer? (yes / no)', 'Isi customer ka discount setup karein? (haan / nahi)'));
   }
 
   async showDiscountRules(m, st, reply, t) {
@@ -3143,18 +3150,51 @@ class CustomerBot {
         const n = /^(\d{1,2})[.)]?$/.exec(said);
         let row = n && st.candidates ? st.candidates[Number(n[1]) - 1] : null;
         if (!row) {
-          const found = await salesOrder.findCustomers(said).catch(() => ({ top: [] }));
-          const top = found.top || [];
-          if (!top.length) return next('customer', t(`No customer called "${said}". Send the name again.`, `"${said}" naam ka customer nahi mila. Naam dobara bhejiye.`));
-          if (top.length > 1) {
-            st.candidates = top.slice(0, 6).map((r) => ({ id: r.id, name: r.name, label: salesOrder.label(r) }));
-            return next('customer', t('Which one?', 'Kaunsa?') + '\n' + st.candidates.map((c, i) => `${i + 1}. ${c.label}`).join('\n'));
+          // By phone or GST number first — one account — and by name otherwise.
+          const key = salesOrder.readCustomerKey(said);
+          let rows = [];
+          if (key) rows = await salesOrder.findByKey(key).catch(() => []);
+          else rows = ((await salesOrder.findCustomers(said).catch(() => ({ top: [] }))).top || []);
+          if (!rows.length) {
+            return next(
+              'customer',
+              key
+                ? t(
+                    `No customer on the portal with ${key.phone ? key.phone.slice(-10) : key.gst}. Open the account first ("customer bana do") — its discount is asked for at the end — or send another number.`,
+                    `${key.phone ? key.phone.slice(-10) : key.gst} pe portal mein koi customer nahi hai. Pehle customer banaiye ("customer bana do") — discount wahi end mein poochha jayega — ya dusra number bhejiye.`,
+                  )
+                : t(`No customer called "${said}". Send the phone number or GST number.`, `"${said}" naam ka customer nahi mila. Phone number ya GST number bhejiye.`),
+            );
           }
-          row = { id: top[0].id, name: top[0].name };
+          if (rows.length > 1) {
+            st.candidates = rows.slice(0, 6);
+            return next('customer', t('Which one?', 'Kaunsa?') + '\n' + st.candidates.map((c, i) => `${i + 1}. ${salesOrder.label(c)}`).join('\n'));
+          }
+          row = rows[0];
         }
-        st.dealerId = row.id;
-        st.customer = row.name;
         delete st.candidates;
+        return this.confirmDiscountCustomer(m, st, row, reply, t);
+      }
+      // ---- the agent has seen the customer's details: this one? ----
+      case 'confirmCustomer': {
+        if (discountSetup.NO.test(said) || m.buttonId === 'DSC_NO') {
+          delete st.row;
+          return next('customer', t("Then send the right customer's phone number or GST number.", 'Theek hai — sahi customer ka phone number ya GST number bhejiye.'));
+        }
+        if (!discountSetup.YES.test(said) && m.buttonId !== 'DSC_YES') {
+          // Another phone or GST number here is another customer.
+          if (salesOrder.readCustomerKey(said)) {
+            st.step = 'customer';
+            delete st.row;
+            discountSetup.save(m.chatId, st);
+            return this.answerDiscount(m, said, reply, t);
+          }
+          return next('confirmCustomer', t(`Set up the discount for ${st.row.name}? yes or no`, `${st.row.name} ka discount setup karein? haan ya nahi`));
+        }
+        st.dealerId = st.row.id;
+        st.customer = st.row.name;
+        delete st.row;
+        store.log(this.key, `${m.from} confirmed ${st.customer} (${st.dealerId}) for a discount setup`);
         return this.showDiscountRules(m, st, reply, t);
       }
       // ---- which rule ----
