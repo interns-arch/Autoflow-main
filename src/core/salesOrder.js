@@ -229,6 +229,37 @@ async function findByKey(key) {
   return [];
 }
 
+// "Customer ka order punch karna hai" names nobody: "customer" is the word
+// for the person, not their name. 25 Sep, live: it was searched as a name and
+// listed "BIKE OIL CUSTOMER", "Walk In Customer"… — so a generic word asks
+// whose order it is instead.
+const GENERIC_NAME = /^(?:(?:ek|kisi|koi|new|naya|nayi|another|dusre|doosre|is|us|mere|mera|apne)\s+)?(?:customer|customers|cust|party|client|dealer|shop|dukaan|dukan|garage|account)(?:\s+(?:ka|ke|ki|ko|ne))?$/i;
+const isGenericName = (name) => GENERIC_NAME.test(String(name || '').trim());
+
+// A reply that can only be a customer's name: a few words, letters, no part
+// number, no question, not a yes/no.
+function looksLikeName(text) {
+  const s = String(text || '').trim();
+  if (s.length < 3 || s.length > 60 || s.split(/\s+/).length > 6) return false;
+  if (PART_LIKE.test(s) || /\d{3,}/.test(s) || /\?/.test(s)) return false;
+  if (/^(haan|han|ha|yes|ok|okay|nahi|nhi|no|na|cancel|rehne do|thik|theek|done)\b/i.test(s)) return false;
+  if (/\b(kya|kitna|kitne|kaise|kab|kahan|rate|price|stock|order|discount|detail|check)\b/i.test(s)) return false;
+  return /[a-z]/i.test(s);
+}
+
+// ASKING ABOUT A CUSTOMER: "customer ki detail", "check customer 9654078241",
+// "is GST ka account", "customer ka due kitna hai", "mere number pe koi
+// account hai". Answered with the customer card — due balance included.
+const INFO_RE = /\b(customer|party|client|account|khata|gst|gstin)\b[\s\S]{0,40}\b(detail|details|info|information|jankari|jaankari|check|search|dhundh\w*|find|kaun|hai\s*kya|due|balance|baaki|baki|outstanding)\b|\b(detail|details|info|check|search|find|dhundh\w*|due|balance)\b[\s\S]{0,30}\b(customer|party|client|account|gst|gstin)\b|\b(mere|mera|my)\s+(number|no\.?)\b[\s\S]{0,30}\b(account|khata)\b|\b(gst|gstin|number|no\.?)\b[\s\S]{0,40}\b(ka|ki|ke|kiska|kaun|whose)\b[\s\S]{0,20}\b(account|customer|party|khata)\b/i;
+// A phone number or GSTIN anywhere in a sentence.
+function findKeyIn(text) {
+  const s = String(text || '');
+  const g = s.toUpperCase().match(/\b[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9A-Z]Z[0-9A-Z]\b/);
+  if (g) return { gst: g[0] };
+  const p = s.replace(/[\s-]/g, ' ').match(/(?:\+?91\s?)?\b([6-9]\d{9})\b/) || s.replace(/[\s-]/g, '').match(/(?:\+?91)?([6-9]\d{9})/);
+  return p ? { phone: '91' + p[1] } : null;
+}
+
 // PARTS SENT BEFORE THE CUSTOMER. A salesman sends the parts and is asked
 // whose order it is; the parts are kept here (as the lines he would have
 // typed) and become that customer's draft the moment he answers.
@@ -1206,6 +1237,36 @@ function afterPunch(chatId, result, t) {
 
 // Everything a salesman's message can mean here. true = answered; false = let
 // the normal flow have it.
+// A name: one account -> its card and "this one?"; several -> the list; none
+// -> say so, and how else to find them.
+async function searchByName(m, name, items, reply, t) {
+  let found;
+  try {
+    found = await findCustomers(name);
+  } catch (e) {
+    store.log('sales', 'customer search failed: ' + String((e && e.message) || e).slice(0, 140));
+    return reply(t("I can't open the customer list right now - try again in a minute?", 'Customer list abhi khul nahi rahi - ek minute mein phir bhejiye?'));
+  }
+  if (!found.total) {
+    sessions.set(m.chatId, { stage: 'askCustomer', items: items || null, at: Date.now() });
+    return reply(
+      t(
+        'No customer called "' + name + '". Send their phone number or GST number, or more of the name.',
+        '"' + name + '" naam se koi customer nahi mila. Unka phone number ya GST number bhejiye, ya naam thoda aur.',
+      ),
+    );
+  }
+  start(m.chatId, found.top, items || null);
+  store.log('sales', m.from + ' searched "' + name + '": ' + found.total + ' match(es)');
+  if (found.top.length === 1) {
+    const card = await customerCard(found.top[0], t);
+    return reply(card + '\n\n' + t('Is the order for this customer? (yes / no)', 'Order isi customer ke liye hai? (haan / nahi)'));
+  }
+  const listed = found.top.map((r, i) => i + 1 + '. ' + label(r)).join('\n');
+  const more = found.total > found.top.length ? t('\n...and a few more - give me a bit more of the name.', '\n...aur bhi hain, thoda poora naam bata dijiye.') : '';
+  return reply(t('Which one?\n' + listed + more, 'Kaunsa wala?\n' + listed + more));
+}
+
 async function handle(bot, m, text, reply, t) {
   const orders = require('./orders');
   const s = session(m.chatId);
@@ -1216,9 +1277,31 @@ async function handle(bot, m, text, reply, t) {
   // 1b. The customer's name for parts sent in a file, sent on its own.
   if (await fileAnalysisName(bot, m, text, reply, t)) return true;
 
+  // 1c0. ASKING ABOUT A CUSTOMER — "customer ki detail", "check customer
+  // 9654078241", "mere number pe koi account hai". The phone or GSTIN in it is
+  // looked up below; without one, whose is asked.
+  let infoKey = null;
+  if (INFO_RE.test(text) && !parseOrderFor(text)) {
+    infoKey = findKeyIn(text) || (/\b(mere|mera|my)\s+(number|no\.?)\b/i.test(text) ? { phone: store.normPhone(m.from) } : null);
+    if (!infoKey) {
+      sessions.set(m.chatId, { stage: 'askCustomer', items: null, at: Date.now() });
+      return reply(
+        t(
+          "Send the customer's phone number or GST number (or their name) — I'll show you their full details and due balance.",
+          'Customer ka phone number ya GST number bhejiye (ya naam) — poori detail aur due balance bata deta hoon.',
+        ),
+      );
+    }
+  }
+
+  // 1c1. The customer's NAME, after "kis customer ke liye?".
+  if (s && s.stage === 'askCustomer' && !readCustomerKey(text) && !findKeyIn(text) && looksLikeName(text)) {
+    return searchByName(m, text, s.items || takeItems(m.chatId), reply, t);
+  }
+
   // 1c. THE CUSTOMER BY PHONE OR GSTIN. Not while a list is open: "2" there is
   // a pick, and a list answer never looks like a phone number anyway.
-  const key = !(s && s.stage === 'choose' && readChoice(text, s.candidates.length) !== null) ? readCustomerKey(text) : null;
+  const key = infoKey || (!(s && s.stage === 'choose' && readChoice(text, s.candidates.length) !== null) ? readCustomerKey(text) : null);
   if (key) {
     let rows = [];
     try {
@@ -1294,6 +1377,10 @@ async function handle(bot, m, text, reply, t) {
     // Not an answer. A new "X ka SO" starts over; anything else gets the
     // question again. Never a fall-through: a stray "haan" here would reach
     // the order confirm and punch whatever cart was open.
+    // A different name typed instead of a number: search that one.
+    if (!parseOrderFor(text) && !lookup.parse(text) && looksLikeName(text)) {
+      return searchByName(m, text, s.items || null, reply, t);
+    }
     if (!parseOrderFor(text) && !lookup.parse(text)) {
       const n = s.candidates.length;
       return reply(t('Which customer first - ' + oneOf(n, 'or') + '?', 'Pehle ye bata dijiye kaunsa customer - ' + oneOf(n, 'ya') + '?'));
@@ -1645,6 +1732,17 @@ async function handle(bot, m, text, reply, t) {
   // 4. "X ka SO bana do".
   const req = parseOrderFor(text);
   if (!req) return false;
+  // "Customer ka order punch karna hai": nobody named — ask whose.
+  if (isGenericName(req.customer)) {
+    sessions.set(m.chatId, { stage: 'askCustomer', items: null, at: Date.now() });
+    store.log('sales', m.from + ' wants to order for a customer not yet named');
+    return reply(
+      t(
+        "Which customer is it for? Send the customer's phone number or GST number (or their full name).",
+        'Kis customer ke liye? Customer ka phone number ya GST number bhejiye (ya poora naam).',
+      ),
+    );
+  }
   let found;
   try {
     found = await findCustomers(req.customer);
@@ -1675,7 +1773,8 @@ async function handle(bot, m, text, reply, t) {
   start(m.chatId, found.top, req.items || takeItems(m.chatId));
   store.log('sales', m.from + ' asked to order for "' + req.customer + '": ' + found.total + ' match(es)');
   if (found.top.length === 1) {
-    return reply(t(label(found.top[0]) + ' - this one?', label(found.top[0]) + ' - yahi wale?'));
+    const card = await customerCard(found.top[0], t);
+    return reply(card + '\n\n' + t('Is the order for this customer? (yes / no)', 'Order isi customer ke liye hai? (haan / nahi)'));
   }
   const listed = found.top.map((r, i) => i + 1 + '. ' + label(r)).join('\n');
   const more =

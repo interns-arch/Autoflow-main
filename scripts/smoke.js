@@ -2655,7 +2655,7 @@ async function main() {
     return sent(customer);
   };
   const maan21a = await say21(SALES21, 'Maan Motors ka SO bana do');
-  check('the salesman is asked whether it is this customer, by name', /Maan Motors/.test(maan21a) && /this one|yahi wale/i.test(maan21a));
+  check('the salesman is asked whether it is this customer, by name', /Maan Motors/.test(maan21a) && /this one|yahi wale|isi customer ke liye/i.test(maan21a));
   await say21(SALES21, 'haan');
   await say21(SALES21, '16510M65L10 2');
   const draft21a = orders.findDraft('sim-' + SALES21);
