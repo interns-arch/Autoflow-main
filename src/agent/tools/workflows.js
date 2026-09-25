@@ -194,7 +194,9 @@ const accountForm = tool(
     description:
       'Open a customer account on the portal, one question at a time: GST number, shop name, a photo of the shop, a location pin and so on. The request then goes to the Sales Head for approval. ' +
       'action "start" when they ask to open an account (forSomeoneElse: true when it is for someone else); "answer" with what they said whenever a form is open — a photo or a location they send is passed on automatically; "cancel" if they drop it; "status" to check. ' +
-      'It returns what the form needs next ("nextQuestion" / "formSays") as a fact: ask it in your own words and the customer\'s language, one question at a time.',
+      'It returns what the form needs next ("nextQuestion" / "formSays") as a fact: ask it in your own words and the customer\'s language, one question at a time. ' +
+      'If they cannot send the shop photo or the location ("photo not available", "location nahi hai"), call "answer" with exactly what they said — the form records that it is missing, tells the approver, and moves on. ' +
+      'The request has gone for approval ONLY when this tool returns done:true with a requestId — then say so and give the requestId. Until then it has NOT been sent: never say it has, and never name an approver.',
     schema: z.object({
       action: z.enum(['start', 'answer', 'cancel', 'status']),
       forSomeoneElse: z.boolean().optional().describe('the account is for another person or shop, not this number'),

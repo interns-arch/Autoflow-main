@@ -43,6 +43,14 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 const PIN_RE = /^[1-9][0-9]{5}$/;
 
 const SKIP = /^(skip|nahi|nhi|no|na|-|n\/a|none|baad mein|later)$/i;
+
+// THE PHOTO OR THE PIN IS NOT TO BE HAD. Somebody opening an account for a
+// shop in Madurai from Delhi cannot photograph it or stand in it (25 Sep,
+// live: "Photo not available request come from jain sir" — the form waited
+// for a photo that was never coming, and nothing reached an approver). The
+// form goes on, the approver is told plainly that it has no photo / no pin,
+// and it is theirs to decide.
+const NOT_AVAILABLE = /\b(skip|not\s*available|unavailable|no\s*photo|without\s*photo|photo\s*(nahi|nhi|nahin)|location\s*(nahi|nhi|nahin)|nahi\s*hai|nhi\s*hai|nahin\s*hai|available\s*(nahi|nhi)|nahi\s*mil|nhi\s*mil|nahi\s*de\s*sakte|possible\s*nahi)\b/i;
 // A way OUT. Once the form is open every message is an answer to it, so
 // without this a customer who changed their mind would be filling in a shop
 // address to escape. Their cart is untouched — only the form closes.
@@ -363,6 +371,17 @@ async function answer(chatId, m, text, t) {
       quit: true,
       form,
     };
+  }
+
+  // No photo / no pin to be had: recorded for the approver, and the form goes
+  // on. Checked BEFORE notAnAnswer, which passes typed text at these steps on
+  // to the agent — that is how the form sat waiting for a photo while the
+  // agent told the customer it had gone for approval (25 Sep, live).
+  if ((field.type === 'photo' || field.type === 'location') && said && !(m && (m.mediaBase64 || m.location)) && (NOT_AVAILABLE.test(said) || SKIP.test(said))) {
+    if (field.type === 'photo') form.answers.photoNote = 'NO SHOP PHOTO — ' + said.slice(0, 120);
+    else form.answers.locationNote = 'not given — ' + said.slice(0, 120);
+    store.log('create', `${chatId}: no ${field.type === 'photo' ? 'shop photo' : 'location'} — "${said.slice(0, 60)}"`);
+    return advance(form, t);
   }
 
   if (notAnAnswer(field, m, said)) {
@@ -950,7 +969,7 @@ function summary(form, t) {
     line('City', a.city),
     line('State', a.state),
     line('PIN', a.pin),
-    a.lat ? `Location: ${a.lat}, ${a.lng}` : null,
+    a.lat ? `Location: ${a.lat}, ${a.lng}` : a.locationNote ? 'Location: ' + a.locationNote : null,
     '',
     a.bannerText ? 'Board reads: ' + a.bannerText : null,
     a.photoNote ? 'Photo: ' + a.photoNote : null,

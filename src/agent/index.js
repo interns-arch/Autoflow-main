@@ -319,10 +319,48 @@ async function run(who, input, what) {
     return { handled: false, reply: null, paused: false };
   }
 
+  // NOTHING IS "SENT FOR APPROVAL" UNLESS IT WAS. 25 Sep, live: the account
+  // form was still waiting for a shop photo when the reply said "request
+  // Sales Head (Jain sir) ke paas approval ke liye chali gayi hai" — no
+  // request existed, no approver had it, and the customer believed it was in
+  // hand. A reply that says so needs a tool, THIS turn, that returned a
+  // request: account_form done with a requestId, or an order sentForApproval.
+  if (claimsSentForApproval(reply) && !approvalThisTurn(messages)) {
+    store.log('agent', `${who.chatId} reply NOT sent — it says something went for approval, and no tool sent anything: "${reply.slice(0, 100)}"`);
+    return { handled: false, reply: null, paused: false };
+  }
+
   // "(no reply)": the model decided there is nothing to say — a reaction taken
   // back, a sticker after the deal. Handled, and nothing is sent.
   if (/^\(?\s*no reply\s*\)?\.?$/i.test(reply)) return { handled: true, reply: null, paused: false };
   return { handled: true, reply: reply || null, paused: false };
+}
+
+// "approval ke liye bhej diya", "request Sales Head ke paas chali gayi",
+// "sent for approval", "forwarded to the Sales Head for approval".
+const APPROVAL_SENT =
+  /(approv\w*|sales\s*head|jain\s*sir|prateek|arun\s*sir).{0,60}(bhej\s*di|bhej\s*diya|bhej\s*dia|chali\s*gayi|chala\s*gaya|chali\s*gai|pahunch|sent|forwarded|submitted)|(bhej\s*di|bhej\s*diya|sent|forwarded|submitted).{0,40}(for\s+approval|approval\s+ke\s+liye|sales\s*head)/i;
+function claimsSentForApproval(reply) {
+  return APPROVAL_SENT.test(String(reply || ''));
+}
+// A tool in the CURRENT turn — after the last thing the customer said — that
+// actually filed a request.
+function approvalThisTurn(messages) {
+  const list = messages || [];
+  let start = 0;
+  for (let i = list.length - 1; i >= 0; i--) {
+    if ((list[i].getType ? list[i].getType() : '') === 'human') {
+      start = i + 1;
+      break;
+    }
+  }
+  for (let i = start; i < list.length; i++) {
+    const m = list[i];
+    if ((m.getType ? m.getType() : '') !== 'tool') continue;
+    const text = textOf(m);
+    if (/"sentForApproval"\s*:\s*true|"requestId"\s*:\s*"(WA|ORD|DSC)-|"done"\s*:\s*"sent_for_review"/.test(text)) return true;
+  }
+  return false;
 }
 
 // Gemini returns content as parts when it feels like it.
@@ -356,4 +394,4 @@ function textOf(msg) {
   return '';
 }
 
-module.exports = { handle, resume, followUp, warmUp, enabled, TOOLS, _build: build, _inventedMoney: inventedMoney };
+module.exports = { handle, resume, followUp, warmUp, enabled, TOOLS, _build: build, _inventedMoney: inventedMoney, _claimsSentForApproval: claimsSentForApproval, _approvalThisTurn: approvalThisTurn };
