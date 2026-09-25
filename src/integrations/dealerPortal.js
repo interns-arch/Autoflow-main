@@ -965,6 +965,30 @@ module.exports = {
     store.log('portal', `discount rule ${ruleId} updated: ${JSON.stringify(body).slice(0, 120)}`);
     return data;
   },
+  // A rule the portal is holding as PENDING, approved there too. The Sales
+  // Head has already said yes on WhatsApp ("OK DSC-…"); without this the rule
+  // would sit in the portal's own queue and never apply. `action` is a query
+  // parameter the spec does not enumerate, so the spellings are tried in turn.
+  async reviewDiscountRule(ruleId, decision = 'approve') {
+    if (isMock()) {
+      const r = mockDiscountRules.find((x) => x.id === ruleId || x.rule_id === ruleId);
+      if (r) r.approval_status = decision === 'approve' ? 'APPROVED' : 'REJECTED';
+      return r;
+    }
+    const tries = decision === 'approve' ? ['approve', 'APPROVE', 'APPROVED'] : ['reject', 'REJECT', 'REJECTED'];
+    let last;
+    for (const action of tries) {
+      try {
+        const data = await api('POST', `/discount-rules/${encodeURIComponent(ruleId)}/review?action=${action}`, null, true, 'admin');
+        store.log('portal', `discount rule ${ruleId} reviewed: ${action}`);
+        return data;
+      } catch (e) {
+        last = e;
+        if (e && e.status && e.status !== 400 && e.status !== 422) break;
+      }
+    }
+    throw last;
+  },
   _setMockDiscountRules: (list) => {
     mockDiscountRules.length = 0;
     for (const r of list || []) mockDiscountRules.push(r);

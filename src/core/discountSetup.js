@@ -95,6 +95,8 @@ function toPortal(r, dealerId, customerName, from = new Date()) {
     min_amount: r.minAmount || null,
     max_amount: r.maxAmount || null,
     is_active: true,
+    // Only ever sent after a Sales Head said "OK DSC-…" on WhatsApp.
+    approval_status: 'APPROVED',
     valid_from: iso(start),
     valid_to: end ? iso(end) : null,
     priority: 100,

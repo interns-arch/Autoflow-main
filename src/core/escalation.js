@@ -213,7 +213,7 @@ function pickSender(customerBot) {
 // with a short heads-up so the helper knows a question is coming.
 const WINDOW_MS = 22 * 60 * 60 * 1000; // 22h with 2h safety margin
 const TEMPLATE_NAME = (process.env.ESCALATION_TEMPLATE || 'order_update').trim();
-async function ensureWindow(sender, helperPhone) {
+async function ensureWindow(sender, helperPhone, headsUp = 'New customer question incoming — details follow') {
   if (!sender.sendTemplate) return; // not Cloud API
   const norm = store.normPhone(helperPhone);
   const last = helperLastInbound.get(norm) || 0;
@@ -225,7 +225,7 @@ async function ensureWindow(sender, helperPhone) {
         type: 'body',
         parameters: [
           { type: 'text', text: 'Helper' },
-          { type: 'text', text: 'New customer question incoming — details follow' },
+          { type: 'text', text: headsUp },
         ],
       },
     ];
@@ -1575,8 +1575,18 @@ function attach(bots) {
   for (const b of Object.values(bots)) b._allBots = bots; // for pickSender
 }
 
+// Anyone who writes to us opens their own 24h window — a Sales Head
+// approving an account as much as the helper answering a question — so every
+// inbound message is noted, and ensureWindow can be used for any staff number.
+function noteInbound(phone) {
+  const norm = store.normPhone(phone);
+  if (norm) helperLastInbound.set(norm, Date.now());
+}
+
 module.exports = {
   helperFor,
+  noteInbound,
+  ensureWindow,
   helperNumbers,
   attach,
   create,

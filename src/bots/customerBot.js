@@ -380,6 +380,10 @@ class CustomerBot {
     // not a Cartrends person talking in a group (pipeline/route).
     if (!route.forBot(m)) return false;
 
+    // They wrote, so their 24h window is open: an approval sent to them in
+    // the next day goes as plain text, with no template in front of it.
+    if (!m.isGroup) escalation.noteInbound(m.from);
+
     // Whatever recording the last message left behind is finished with. A
     // voice note's clip is held only for as long as its own words are being
     // handled (core/voiceNote), so a question raised two messages later never
@@ -666,9 +670,15 @@ class CustomerBot {
         );
       }
       let greetingReply = mirrorGreeting(text);
-      const cHit = store.customers().find((c) => store.normPhone(c.phone) === store.normPhone(m.from));
-      if (cHit && cHit.name) {
-        greetingReply += ' ' + cHit.name;
+      // Staff by their own name. Prateek sir's number is also on a customer
+      // account (Fixit Auto), and greeting a Sales Head as "Fixit Auto Private
+      // Limited" is wrong. Only a customer is greeted by their account's name.
+      const staffName = (customerCreate.isApprover(m.from) && customerCreate.approverName(m.from)) || customerCreate.agentName(m.from);
+      if (staffName) {
+        greetingReply += ' ' + staffName;
+      } else if (!this.isOperator(m)) {
+        const cHit = store.customers().find((c) => store.normPhone(c.phone) === store.normPhone(m.from));
+        if (cHit && cHit.name) greetingReply += ' ' + cHit.name;
       }
       await reply(greetingReply);
       // In a group the Cartrends people carry it on from here: no nudge.
@@ -2404,6 +2414,8 @@ class CustomerBot {
     const text = customerCreate.summary(form, t);
     for (const phone of approvers) {
       try {
+        // Outside the 24h window a plain text is silently dropped (escalation.ensureWindow).
+        await escalation.ensureWindow(this.transport, phone, 'Account approval coming — details follow');
         const sentId =
           form._photo && this.transport.sendImage
             ? await this.transport.sendImage(phone, Buffer.from(form._photo, 'base64'), form.answers.shopPhoto.mime, text)
@@ -2441,6 +2453,8 @@ class CustomerBot {
     const text = customerCreate.summary(form, t);
     for (const phone of approvers) {
       try {
+        // Outside the 24h window a plain text is silently dropped (escalation.ensureWindow).
+        await escalation.ensureWindow(this.transport, phone, 'Account approval coming — details follow');
         customerCreate.noteSummary(await this.transport.sendText(phone, text), form.answers.requestId);
       } catch (e) {
         store.log(this.key, `could not reach approver ${phone}: ${String((e && e.message) || e).slice(0, 90)}`);
@@ -2883,6 +2897,8 @@ class CustomerBot {
     let sent = 0;
     for (const phone of Object.keys(config.creation.approvers)) {
       try {
+        // Outside the 24h window a plain text is silently dropped (escalation.ensureWindow).
+        await escalation.ensureWindow(this.transport, phone, 'Discount approval coming — details follow');
         await this.transport.sendText(phone, text);
         sent++;
       } catch (e) {
@@ -3275,7 +3291,13 @@ class CustomerBot {
     if (!dealerId) return { ok: false, name: req.rule.ruleName, why: 'customer not found on the portal yet' };
     const body = discountSetup.toPortal({ ...req.rule, requestId: req.id, setBy: req.by }, dealerId, name);
     try {
-      await portal.createDiscountRule(body);
+      const made = await portal.createDiscountRule(body);
+      // Approved here means approved there: a rule the portal parked as
+      // PENDING is put through its own review, or it never applies.
+      const id = made && (made.rule_id || made.id);
+      if (id && made.approval_status && String(made.approval_status).toUpperCase() !== 'APPROVED') {
+        await portal.reviewDiscountRule(id, 'approve').catch((e) => store.log(this.key, `rule ${id} created but left ${made.approval_status}: ${String((e && e.message) || e).slice(0, 80)}`));
+      }
       return { ok: true, name: body.rule_name };
     } catch (e) {
       return { ok: false, name: body.rule_name, why: String((e && e.message) || e).slice(0, 100) };
@@ -3306,10 +3328,13 @@ class CustomerBot {
 
     if (req.type === 'change') {
       try {
-        await portal.updateDiscountRule(req.ruleId, {
+        const updated = await portal.updateDiscountRule(req.ruleId, {
           discount_value: req.rule.value,
           rule_name: discountSetup.ruleName(req.customer, req.rule.target, req.rule.value),
         });
+        if (updated && updated.approval_status && String(updated.approval_status).toUpperCase() !== 'APPROVED') {
+          await portal.reviewDiscountRule(req.ruleId, 'approve').catch((e) => store.log(this.key, `rule ${req.ruleId} updated but left ${updated.approval_status}: ${String((e && e.message) || e).slice(0, 80)}`));
+        }
       } catch (e) {
         const why = String((e && e.message) || e).slice(0, 120);
         store.log(this.key, `${req.id} discount update FAILED: ${why}`);
