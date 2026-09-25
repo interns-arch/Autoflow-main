@@ -187,7 +187,7 @@ function approvalText(req) {
 // rather than changed — banao, chahiye, lagwana, karwana.
 const VERB =
   '(?:change|chnage|badal\\w*|update|badha\\w*|kam\\s*kar\\w*|increase|decrease|revise|' +
-  'set\\s*up|setup|set|lagao|lagana|laga\\s*do|lagw\\w*|naya|new|' +
+  'set\\s*up|setup|set|lagao|lagana|laga\\s*do|lagw\\w*|naya|new|create|make|start|add|chalu|shuru\\w*|' +
   'bana\\w*|banw\\w*|karw\\w*|kar\\s*do|kardo|karo|karna|chahiye|chaiye|de\\s*do|dedo)';
 
 const WANTS_RE = new RegExp(

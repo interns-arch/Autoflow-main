@@ -40,6 +40,11 @@ const ok = (name, cond, detail) => {
 console.log('\nASKING FOR ONE STARTS THE SETUP\n');
 for (const say of [
   'mera discount setup kardo', // the live miss
+  'Create discount setup', // live, 25 Sep — went to the agent and got "our specialist will confirm"
+  'create discount',
+  'make a discount for me',
+  'discount rule add karna hai',
+  'discount shuru karo',
   'mera discount set up kar do',
   'discount setup karo',
   'discount setup',
