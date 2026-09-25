@@ -188,7 +188,30 @@ function readCustomerKey(text) {
 // the candidates, and only the one carrying this GSTIN is kept.
 async function findByKey(key) {
   const portal = require('../integrations/dealerPortal');
-  if (key.phone) return portal.searchAccountsByMobile(key.phone);
+  if (key.phone) {
+    // The portal's customer_mobile filter reads the `mobile` column, which
+    // accounts the bot opened leave empty (the number is in `phone`) — live,
+    // 25 Sep, MIYA JI MOTORS was not found by it. The lookup every customer
+    // message already uses finds them; the mobile search adds any others.
+    const rows = [];
+    const c = await portal.lookupCustomer(key.phone).catch(() => null);
+    if (c && c.found && c.buyerId) {
+      const raw = c.raw || {};
+      rows.push({
+        id: c.buyerId,
+        name: c.name,
+        gst_no: c.gstNo || raw.gst_no || null,
+        phone: key.phone,
+        address: raw.address || null,
+        state_name: raw.state_name || null,
+        home_branch_dealer_id: c.branchId || raw.home_branch_dealer_id || null,
+      });
+    }
+    for (const r of await portal.searchAccountsByMobile(key.phone).catch(() => [])) {
+      if (!rows.some((x) => Number(x.id) === Number(r.id))) rows.push(r);
+    }
+    return rows;
+  }
   if (key.gst) {
     const firm = await require('../integrations/gst').lookup(key.gst).catch(() => null);
     const names = [firm && firm.name, firm && firm.tradeName, firm && firm.legalName].filter(Boolean);
