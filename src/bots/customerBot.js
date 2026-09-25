@@ -3479,7 +3479,11 @@ class CustomerBot {
   async requestOrderApproval(order) {
     const inStock = (l) => l.source !== 'unidentified' && l.source !== 'unknown' && l.source !== 'unavailable' && (Number(l.available) || 0) > 0;
     const pc = order.portalCustomer || {};
+    // order.customer is the agent's customer RECORD, not a name — printed as
+    // is it read "Customer: [object Object]" (25 Sep, live).
+    const oc = order.customer && typeof order.customer === 'object' ? order.customer.name : order.customer;
     const phone = String(order.chatId || '').split('@')[0];
+    const custName = pc.name || oc || phone;
     const rows = order.lines.map((l, i) => {
       const got = Math.min(Number(l.qty) || 0, Number(l.available) || 0);
       const stock = inStock(l) ? (got < l.qty ? `${got} in stock, rest on order` : 'in stock') : 'on order — not punched';
@@ -3489,7 +3493,7 @@ class CustomerBot {
     const total = punchable.reduce((s, l) => s + (Number(l.rate) || Number(l.mrp) || 0) * Math.min(Number(l.qty) || 0, Number(l.available) || 0), 0);
     const text = [
       `*Order approval* — ${order.id}`,
-      `Customer: ${pc.name || order.customer || phone}${phone ? ` (+${phone})` : ''}`,
+      `Customer: ${custName}${phone ? ` (+${phone})` : ''}`,
       '',
       ...rows,
       '',
@@ -3508,7 +3512,7 @@ class CustomerBot {
       store.save();
     }
     store.log(this.key, `${order.id} sent to ${sent} approver(s) for approval`);
-    if (sent) approvalLog.record({ kind: 'order', id: order.id, event: 'requested', by: 'customer (' + phone + ')', customer: pc.name || order.customer || phone, phone, detail: `${order.lines.length} line(s)`, amount: Math.round(total) });
+    if (sent) approvalLog.record({ kind: 'order', id: order.id, event: 'requested', by: 'customer (' + phone + ')', customer: custName, phone, detail: `${order.lines.length} line(s)`, amount: Math.round(total) });
     return sent;
   }
 
