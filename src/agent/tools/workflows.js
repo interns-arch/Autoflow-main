@@ -18,6 +18,8 @@ const { tool } = require('langchain');
 const { z } = require('zod');
 
 const availability = require('../../core/availability');
+const { partFacts } = require('./partFacts');
+const { STATUS_HELP, discountsOf } = require('./commerce');
 const customerCreate = require('../../core/customerCreate');
 const customers = require('../../core/customers');
 const lookup = require('../../core/customerLookup');
@@ -109,21 +111,19 @@ const resolveOrderList = tool(
         }
         return {
           ...base,
-          partNo: l.partNo || w.part,
-          name: availability.displayName(l),
-          status: statusOf(src),
-          price: availability.priceOf(l).replace(/^\s*—\s*/, '') || null,
-          etaDays: src === 'unavailable' || src === 'partial' ? eta : null,
+          ...partFacts(l, { asked: w.part, qty: w.qty, qtyGiven: w.qtyGiven }),
           packOf: packOf(l.partNo),
         };
       }),
+      yourDiscounts: await discountsOf(ctx.customer),
     });
   },
   {
     name: 'resolve_order_list',
     description:
       'Check a whole ORDER LIST in one call — several part numbers with quantities, typed or read off a photo or a document. Faster than one check_stock_and_price per part, and it also finds the CLOSE MATCH for a number the portal does not know (a catalogue part that starts the same way, often the pack version). ' +
-      'Returns facts per line: status, price (already right for this customer — quote it exactly), etaDays, and for "close_match_only" the suggested part. It adds nothing to the cart: when they are ordering, add the matched lines with add_to_order, then ask about each close match (a short numbered list is fine). Never tell the customer a stock count.',
+      'Returns facts per line, and for "close_match_only" the suggested part. It adds nothing to the cart: when they are ordering, add the matched lines with add_to_order, then ask about each close match (a short numbered list is fine). ' +
+      STATUS_HELP,
     schema: z.object({
       items: z
         .array(z.object({ part: z.string().describe('the part number as written'), qty: z.number().optional().describe('how many they want, if they said') }))

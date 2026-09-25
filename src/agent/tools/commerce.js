@@ -17,6 +17,24 @@ const appConfig = require('../../config');
 const availability = require('../../core/availability');
 const store = require('../../store');
 const { contextFrom } = require('../context');
+const portal = require('../../integrations/dealerPortal');
+const { partFacts } = require('./partFacts');
+
+// The customer's discounts that apply today — so the reply can say "aapka
+// MARUTI par 10% discount laga hai" under the list. Empty for a number the
+// portal does not know: nobody else's discount is ever shown.
+async function discountsOf(customer) {
+  if (!customer || !customer.buyerId) return [];
+  return portal.activeDiscounts(customer.buyerId).catch(() => []);
+}
+
+// What each status means, and how the reply is built. Shared with
+// resolve_order_list (agent/tools/workflows), which answers a whole list.
+const STATUS_HELP =
+  'Each part: "in_stock" — their quantity is there; "short" — we can send canSupplyNow of the qtyAsked now and the rest (restOnOrder) comes in about etaDays days: SAY BOTH NUMBERS; "out_of_stock" — none today, it comes in about etaDays days (say that, never "not available"); "not_recognised_by_portal" — never say it does not exist, call ask_a_person; "not_confirmed_yet" — say you are confirming it. ' +
+  'When they sent a part number or a list, answer with ONE short list, a line per part: the part, whether it is in stock / how many now and when the rest / out of stock and when, and its price. ' +
+  'Where a part has "discount", its line says so: MRP, their discount % and the price after it (GST included) — e.g. "35121M55RB0 — MRP Rs.21310, 10% discount → Rs.19179 (GST incl.)". If yourDiscounts is not empty, end with one line naming them (e.g. "Aapka MARUTI parts par 10% discount laga hai, 26 Sep tak"). ' +
+  'The price field is already right for THIS customer — quote it exactly; never calculate, discount, total or convert a price yourself. Never tell them how many we have in stock; the only count you may say is canSupplyNow when we are short. If qtyAsked is null they did not say how many: ask.';
 
 const checkStockAndPrice = tool(
   async ({ partNumbers, quantities }, config) => {
@@ -42,30 +60,11 @@ const checkStockAndPrice = tool(
     // statuses named for what they MEAN to the customer — "unavailable" read
     // as "not available", which is the one thing the founder said never to
     // say: we can get it, and the answer is when.
-    const eta = appConfig.onOrderEtaDays;
+    const qtyAt = (i) => Math.max(1, Math.floor(Number((quantities || [])[i])) || 1);
+    const given = (i) => Number((quantities || [])[i]) > 0;
     return JSON.stringify({
-      parts: lines.map((l) => {
-        const src = l.source || 'unknown';
-        return {
-          partNo: l.partNo || l.item,
-          name: availability.displayName(l),
-          status:
-            src === 'available'
-              ? 'in_stock'
-              : src === 'partial'
-                ? 'part_in_stock_rest_on_order'
-                : src === 'unavailable'
-                  ? 'on_order'
-                  : src === 'unidentified'
-                    ? 'not_recognised_by_portal'
-                    : 'not_confirmed_yet',
-          // Already correct for THIS customer and already censored: the only
-          // money that may be stated. Quote it exactly; never convert,
-          // discount or multiply it.
-          price: availability.priceOf(l).replace(/^\s*—\s*/, '') || null,
-          etaDays: src === 'unavailable' || src === 'partial' ? eta : null,
-        };
-      }),
+      parts: lines.map((l, i) => partFacts(l, { asked: wanted[i], qty: qtyAt(i), qtyGiven: given(i) })),
+      yourDiscounts: await discountsOf(ctx.customer),
     });
   },
   {
@@ -74,7 +73,7 @@ const checkStockAndPrice = tool(
       'Ask the dealer portal whether we have these parts and what they cost. ALWAYS call this once you have a part number — the customer should get the price without having to ask for it. ' +
       'Takes exact part numbers only, never a description; get the number from lookup_known_part, search_catalogue_index or search_portal_catalogue first. Several numbers in one call is cheaper than one call each. ' +
       'Returns FACTS per part; you write the reply. The "price" field is already correct for THIS customer and is the only money you may state — quote it exactly as given. If it is null, say nothing about price. Never calculate, discount, total or convert a price yourself. ' +
-      'Status: "in_stock"; "part_in_stock_rest_on_order" (some now, the rest in etaDays days); "on_order" — we do not have it today but can get it, so say it arrives in about etaDays days, NEVER that it is not available; "not_recognised_by_portal" — do not tell the customer it does not exist, call ask_a_person; "not_confirmed_yet" — say you are confirming it.',
+      STATUS_HELP,
     schema: z.object({
       partNumbers: z.array(z.string()).describe('exact dealer part numbers, e.g. ["CTWBSI26P-16 Inch", "13780M68P01"]'),
       quantities: z
@@ -85,4 +84,25 @@ const checkStockAndPrice = tool(
   },
 );
 
-module.exports = { checkStockAndPrice };
+// "Mera discount kitna hai", "kis par discount hai" — the customer's own
+// rules that apply today. 25 Sep, live: that question went to a person.
+const myDiscounts = tool(
+  async (_input, config) => {
+    const ctx = contextFrom(config);
+    if (!ctx.customer || !ctx.customer.buyerId) return JSON.stringify({ registered: false, note: 'this number has no account, so no discount — prices are MRP' });
+    const list = await discountsOf(ctx.customer);
+    return JSON.stringify(
+      list.length
+        ? { discounts: list, note: 'these are already in every price check_stock_and_price gives them. To change one, the setup starts when they ask to change their discount.' }
+        : { discounts: [], note: 'no discount on this account today — prices are MRP. They can ask for one ("discount setup karo").' },
+    );
+  },
+  {
+    name: 'my_discounts',
+    description:
+      "The customer's own discounts that apply today: on which brand or part, how much %, from what quantity, and until when. Use when they ask what discount they get, or which parts have one. Reads only.",
+    schema: z.object({}),
+  },
+);
+
+module.exports = { checkStockAndPrice, myDiscounts, STATUS_HELP, discountsOf };

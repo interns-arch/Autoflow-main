@@ -171,5 +171,33 @@ console.log('\nA CHANGE, AS THE SALES HEAD READS IT\n');
   ok('it asks for a decision', /OK DSC-CHG1/.test(text) && /NO DSC-CHG1/.test(text));
 }
 
+console.log('\nWHAT A CUSTOMER IS TOLD ABOUT STOCK\n');
+{
+  const { stockOf } = require('../src/agent/tools/partFacts');
+  const s1 = stockOf({ source: 'available', available: 50 }, 10);
+  ok('enough for their quantity is "in_stock", with no count', s1.status === 'in_stock' && s1.canSupplyNow === undefined);
+  const s2 = stockOf({ source: 'available', available: 6 }, 10);
+  ok('short: how many of THEIR pieces go now, and the rest', s2.status === 'short' && s2.canSupplyNow === 6 && s2.restOnOrder === 4 && s2.etaDays > 0);
+  const s3 = stockOf({ source: 'unavailable', available: 0 }, 3);
+  ok('none: out of stock, with when', s3.status === 'out_of_stock' && s3.etaDays > 0);
+  ok('an unknown number is not called out of stock', stockOf({ source: 'unidentified' }, 1).status === 'not_recognised_by_portal');
+}
+
+console.log('\nTHEIR DISCOUNTS TODAY\n');
+{
+  const now = new Date('2026-09-25T12:00:00Z');
+  const rules = [
+    { dealer_id: 8328, rule_type: 'BRAND', brand: 'MARUTI', discount_value: 10, is_active: true, approval_status: 'PENDING', rule_metadata: { source: 'whatsapp-bot' }, valid_to: '2026-09-26T23:59:59' },
+    { dealer_id: 8328, rule_type: 'ITEM', part_no: '35121M55RB0', discount_value: 15, is_active: true, approval_status: 'APPROVED', min_qty: 2 },
+    { dealer_id: 8328, rule_type: 'BRAND', brand: 'BOSCH', discount_value: 20, is_active: true, approval_status: 'PENDING' },
+    { dealer_id: 1002, rule_type: 'BRAND', brand: 'MARUTI', discount_value: 12, is_active: true, approval_status: 'APPROVED' },
+  ];
+  const mine = d.activeRules(rules, 8328, now);
+  ok('both of their rules that count are listed', mine.length === 2, JSON.stringify(mine));
+  ok('with what, how much and until when', mine[0].on === 'all MARUTI parts' && mine[0].percent === 10 && mine[0].validTill === '2026-09-26');
+  ok('a part rule names the part and its minimum', mine[1].on === 'part 35121M55RB0' && mine[1].minQty === 2);
+  ok('after it ends it is not listed', d.activeRules(rules, 8328, new Date('2026-10-01')).length === 1);
+}
+
 console.log('\n' + pass + ' passed, ' + fail + ' failed\n');
 process.exit(fail ? 1 : 0);

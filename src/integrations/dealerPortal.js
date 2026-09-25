@@ -1047,6 +1047,13 @@ module.exports = {
     }
     throw last;
   },
+  // The customer's discounts that apply today (core/discountSetup.activeRules),
+  // from the same five-minute copy of the rules the prices use.
+  async activeDiscounts(dealerId) {
+    if (!dealerId) return [];
+    const rules = isMock() ? mockDiscountRules.slice() : await discountRules();
+    return require('../core/discountSetup').activeRules(rules, dealerId);
+  },
   _setMockDiscountRules: (list) => {
     mockDiscountRules.length = 0;
     for (const r of list || []) mockDiscountRules.push(r);

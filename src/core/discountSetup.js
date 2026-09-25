@@ -148,6 +148,24 @@ function ruleFor(rules, { dealerId, partNo, brand, qty = 1, now = new Date() } =
   return best ? best.r : null;
 }
 
+// Every rule this customer has today that counts (see ruleFor), for "mere
+// discount kya hain" and for the note under a price list.
+function activeRules(rules, dealerId, now = new Date()) {
+  const t = new Date(now).getTime();
+  return (rules || [])
+    .filter((r) => Number(r.dealer_id) === Number(dealerId) && counts(r) && Number(r.discount_value) > 0)
+    .filter((r) => (!r.valid_from || new Date(r.valid_from).getTime() <= t) && (!r.valid_to || new Date(r.valid_to).getTime() >= t))
+    .map((r) => {
+      const type = String(r.rule_type || '').toUpperCase();
+      return {
+        on: type === 'ITEM' ? `part ${r.part_no}` : type === 'BRAND' ? `all ${r.brand} parts` : 'all parts',
+        percent: Number(r.discount_value),
+        minQty: Number(r.min_qty) > 1 ? Number(r.min_qty) : null,
+        validTill: r.valid_to ? String(r.valid_to).slice(0, 10) : null,
+      };
+    });
+}
+
 // ---- approval ----
 // Every rule - a new one, or a change to one that exists - goes to the Sales
 // Head first (founder, 22 Sep), and the portal is only touched after "OK DSC-…".
@@ -291,5 +309,5 @@ const CHANGE_RE = WANTS_RE;
 
 module.exports = {
   open, get, pending, save, cancel, STEPS, SKIP, LATER, YES, NO, readNumber, readDuration, ruleName, describe, toPortal,
-  requests, file, find, drop, forAccount, approvalText, pctFromPrice, priceAt, money, CHANGE_RE, wantsSetup, ruleFor,
+  requests, file, find, drop, forAccount, approvalText, pctFromPrice, priceAt, money, CHANGE_RE, wantsSetup, ruleFor, activeRules,
 };
