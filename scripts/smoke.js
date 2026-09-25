@@ -5549,6 +5549,8 @@ async function main() {
     const CHDA = 'sim-create66-dup-agent';
     cc66.cancel(CHDA);
     cc66.start(CHDA, '919811100066', t66, { forSomeoneElse: false });
+    // An agent is always opening it for a customer: the customer's number first.
+    await cc66.answer(CHDA, {}, '9811100099', t66);
     const dupA66 = await cc66.answer(CHDA, {}, '33AAACC1206D1ZN', t66);
     check('an agent entering a registered GSTIN is told whose it is', /Existing Traders ke naam se/.test(dupA66.reply));
     check('...and no new account is opened', /Naya account nahi banega/.test(dupA66.reply) && !cc66.pending(CHDA));

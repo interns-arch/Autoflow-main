@@ -578,7 +578,7 @@ class CustomerBot {
       // A SALES AGENT is never told they already have an account: opening
       // one for a customer standing at their counter is their job, and the
       // account goes on the portal under their name.
-      const agent = customerCreate.agentName(m.from);
+      const agent = customerCreate.agentName(m.from) || (salesOrder.isSalesPerson(m.from) ? 'sales team' : null);
       const forElse = createAnswer === 'yes' || customerCreate.wantsSomeoneElse(text);
 
       if (!agent && !forElse) {
@@ -3604,8 +3604,8 @@ class CustomerBot {
       return (
         sorry +
         t(
-          'To place an order, pick the customer first - like: Kalra Motors ka SO bana do',
-          'Order ke liye pehle customer chuniye - jaise: Kalra Motors ka SO bana do',
+          "To place an order, pick the customer first: send the customer's phone number or GST number (or \"Kalra Motors ka SO bana do\").",
+          'Order ke liye pehle customer chuniye: customer ka phone number ya GST number bhejiye (ya "Kalra Motors ka SO bana do").',
         )
       );
     }
@@ -4018,6 +4018,19 @@ class CustomerBot {
       const shown = usable.map((l) => availability.describe(l, m.chatId)).join(String.fromCharCode(10));
       store.log(this.key, `inquiry-only number ${m.from}: answered ${usable.length} line(s), no draft`);
       const NL = String.fromCharCode(10, 10);
+      // A SALESMAN with no customer picked yet: the parts are kept, and he
+      // is asked whose order it is — by phone or GST number, so the portal
+      // and Odoo know who is billed and where it ships (founder, 25 Sep).
+      // Answered, the parts become that customer's draft.
+      if (salesOrder.isSalesPerson(m.from) && !(config.inquiryOnlyNumbers || []).includes(store.normPhone(m.from))) {
+        salesOrder.holdItems(m.chatId, usable);
+        const n = salesOrder.heldCount(m.chatId);
+        const ask = t(
+          `To order ${n > 1 ? 'these ' + n + ' parts' : 'this'}, which customer is it for? Send the customer's phone number or GST number.`,
+          `Order karna hai to ${n > 1 ? 'ye ' + n + ' parts' : 'ye'} kis customer ke liye hai? Customer ka phone number ya GST number bhejiye.`,
+        );
+        return reply([shown, askText, ask].filter(Boolean).join(NL));
+      }
       return reply(askText ? shown + NL + askText : shown);
     }
     const checking = resolved.filter((l) => l.source === 'unknown');

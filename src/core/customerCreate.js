@@ -359,12 +359,17 @@ function fieldAt(i) {
 function start(chatId, phone, t, opts) {
   sweep();
   const filler = store.normPhone(phone);
-  const forSomeoneElse = Boolean(opts && opts.forSomeoneElse);
+  // A SALES-TEAM MEMBER IS ALWAYS OPENING IT FOR A CUSTOMER (founder, 25
+  // Sep): the account's number is the customer's, asked first, and never
+  // the agent's own — company SIMs saved as customer numbers is how the
+  // helper's 9999492550 came to be "Fixit Auto".
+  const isAgent = Boolean(config.creation.team[filler]) || require('./salesOrder').isSalesPerson(filler);
+  const forSomeoneElse = Boolean(opts && opts.forSomeoneElse) || isAgent;
   // A number on the creation team is a colleague filling this in; anyone
   // else is the customer registering themselves. Recorded because the
   // approver needs to know which they are reading — and because the portal
   // keeps it as the sales representative on the account.
-  const agent = config.creation.team[filler] || null;
+  const agent = config.creation.team[filler] || (isAgent ? 'Sales team ' + filler : null);
   const form = {
     at: Date.now(),
     chatId,
@@ -667,6 +672,17 @@ async function answer(chatId, m, text, t) {
     // The first field, when an agent is opening this for someone else,
     // sets the account's OWN number — not a contact number.
     if (field.key === 'phoneFor') {
+      // The customer's number, not the one this is being typed from.
+      if (norm === form.phone) {
+        return {
+          reply: t(
+            "That is your own number — send the CUSTOMER's WhatsApp number (10 digits).",
+            'Ye aapka apna number hai — CUSTOMER ka WhatsApp number bhejiye (10 digit).',
+          ),
+          done: false,
+          form,
+        };
+      }
       const taken = await refuseIfTaken(form, 'phone', norm, t);
       if (taken) return taken;
       form.answers.phone = norm;
@@ -977,7 +993,7 @@ function reviewSummary(form, t) {
   }[a.gstProblem] || `registration is ${String(a.gstProblem || '').replace(/^status:/, '')}, not Active`;
   return [
     `*GST not verified* — ${a.requestId}`,
-    form.byName ? `Bheja: ${form.byName}` : `Customer: ${a.phone}`,
+    form.byName ? `Bheja: ${form.byName}` : form.forSomeoneElse ? `Bheja: ${form.phone} (kisi aur ke liye)` : `Customer: ${a.phone}`,
     '',
     `Problem: ${why}`,
     a.gstTried && a.gstTried.length ? `Tried: ${a.gstTried.join(', ')}` : null,
@@ -1019,7 +1035,7 @@ function summary(form, t) {
   const line = (label, v) => (v === undefined || v === null || v === '' ? null : `${label}: ${v}`);
   return [
     `*New customer* — ${a.requestId}`,
-    form.byName ? `Bheja: ${form.byName}` : `Bheja: customer khud (${a.phone})`,
+    form.byName ? `Bheja: ${form.byName}` : form.forSomeoneElse ? `Bheja: ${form.phone} (kisi aur ke liye)` : `Bheja: customer khud (${a.phone})`,
     '',
     line('Firm', a.name),
     line('Business type', a.businessType),

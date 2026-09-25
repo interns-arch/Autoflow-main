@@ -164,6 +164,74 @@ async function findCustomers(query) {
   return { total: all.length, top: all.slice(0, MAX_CANDIDATES) };
 }
 
+// THE CUSTOMER BY PHONE OR GST NUMBER (founder, 25 Sep): "first he needs
+// the customer's phone number or GST number, so the bot, the portal and Odoo
+// know who the order is for and where to ship it". A name finds several
+// Anujs; a number finds one account.
+//
+// "9812345678", "+91 98123 45678", "customer 9812345678", "gst 07ABCDE1234F1Z5"
+// -> { phone } | { gst } | null. Only when the message IS that — a part
+// number with digits in it is not a phone number.
+const GSTIN_IN = /^(?:gst(?:in)?(?:\s*(?:no|number))?\s*[:\-]?\s*)?([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9A-Z]Z[0-9A-Z])$/i;
+const PHONE_IN = /^(?:(?:customer|cust|party|mobile|mob|phone|number|no)\.?\s*(?:no\.?|number)?\s*[:\-]?\s*)?(?:\+?91[\s-]?)?([6-9]\d{4}[\s-]?\d{5})$/i;
+function readCustomerKey(text) {
+  const t = String(text || '').trim();
+  const g = t.replace(/\s+/g, ' ').match(GSTIN_IN);
+  if (g) return { gst: g[1].toUpperCase() };
+  const p = t.match(PHONE_IN);
+  if (p) return { phone: '91' + p[1].replace(/\D/g, '') };
+  return null;
+}
+
+// The portal accounts for that phone or GSTIN. For a GSTIN the portal has no
+// search, so the GST register gives the firm's name, the name search finds
+// the candidates, and only the one carrying this GSTIN is kept.
+async function findByKey(key) {
+  const portal = require('../integrations/dealerPortal');
+  if (key.phone) return portal.searchAccountsByMobile(key.phone);
+  if (key.gst) {
+    const firm = await require('../integrations/gst').lookup(key.gst).catch(() => null);
+    const names = [firm && firm.name, firm && firm.tradeName, firm && firm.legalName].filter(Boolean);
+    for (const n of names) {
+      const found = await findCustomers(n).catch(() => ({ top: [] }));
+      const rows = (found.top || []).filter((r) => String(r.gst_no || '').toUpperCase() === key.gst);
+      if (rows.length) return rows;
+      // A first word alone brings back more; the GSTIN still decides.
+      const wide = await portal.searchAccounts(String(n).split(/\s+/)[0]).catch(() => []);
+      const hit = wide.filter((r) => String(r.gst_no || '').toUpperCase() === key.gst);
+      if (hit.length) return hit;
+    }
+    return [];
+  }
+  return [];
+}
+
+// PARTS SENT BEFORE THE CUSTOMER. A salesman sends the parts and is asked
+// whose order it is; the parts are kept here (as the lines he would have
+// typed) and become that customer's draft the moment he answers.
+const heldItems = chatState.slot('salesOrder.heldItems'); // chatId -> { text, at }
+const HELD_TTL_MS = 60 * 60 * 1000;
+function holdItems(chatId, lines) {
+  const add = (lines || [])
+    .map((l) => ((l.partNo || l.item) ? (l.partNo || l.item) + ' ' + (Number(l.qty) || 1) : null))
+    .filter(Boolean);
+  if (!add.length) return;
+  const was = heldItems.get(chatId);
+  const keep = was && Date.now() - was.at < HELD_TTL_MS ? String(was.text).split('\n').filter(Boolean) : [];
+  const parts = new Map(keep.map((x) => [x.split(' ')[0].toUpperCase(), x]));
+  for (const x of add) parts.set(x.split(' ')[0].toUpperCase(), x);
+  heldItems.set(chatId, { text: [...parts.values()].join('\n'), at: Date.now() });
+}
+function takeItems(chatId) {
+  const h = heldItems.get(chatId);
+  heldItems.delete(chatId);
+  return h && Date.now() - h.at < HELD_TTL_MS ? h.text : null;
+}
+function heldCount(chatId) {
+  const h = heldItems.get(chatId);
+  return h && Date.now() - h.at < HELD_TTL_MS ? String(h.text).split('\n').filter(Boolean).length : 0;
+}
+
 // Enough to tell two "Anuj"s apart: where they are, and whose customer.
 // "M/S Maan Motors (Babarpur, Haryana · agent Seema)".
 function place(row) {
@@ -1089,6 +1157,34 @@ async function handle(bot, m, text, reply, t) {
   // 1b. The customer's name for parts sent in a file, sent on its own.
   if (await fileAnalysisName(bot, m, text, reply, t)) return true;
 
+  // 1c. THE CUSTOMER BY PHONE OR GSTIN. Not while a list is open: "2" there is
+  // a pick, and a list answer never looks like a phone number anyway.
+  const key = !(s && s.stage === 'choose' && readChoice(text, s.candidates.length) !== null) ? readCustomerKey(text) : null;
+  if (key) {
+    let rows = [];
+    try {
+      rows = await findByKey(key);
+    } catch (e) {
+      store.log('sales', 'customer by ' + (key.phone ? 'phone' : 'GST') + ' failed: ' + String((e && e.message) || e).slice(0, 120));
+      return reply(t("I can't reach the customer list right now - try again in a minute?", 'Customer list abhi khul nahi rahi - ek minute mein phir bhejiye?'));
+    }
+    const what = key.phone ? key.phone.slice(-10) : key.gst;
+    if (!rows.length) {
+      return reply(
+        t(
+          'No customer on the portal with ' + what + '. To open a new account for them, write "customer bana do".',
+          what + ' pe portal mein koi customer nahi mila. Naya account kholna hai to "customer bana do" likhiye.',
+        ),
+      );
+    }
+    const items = takeItems(m.chatId);
+    start(m.chatId, rows.slice(0, MAX_CANDIDATES), items);
+    store.log('sales', m.from + ' picked the customer by ' + (key.phone ? 'phone' : 'GST') + ' ' + what + ': ' + rows.length + ' account(s)' + (items ? ', with held parts' : ''));
+    if (rows.length === 1) return reply(t(label(rows[0]) + ' - this one?', label(rows[0]) + ' - yahi wale?'));
+    const listed = rows.slice(0, MAX_CANDIDATES).map((r, i) => i + 1 + '. ' + label(r)).join('\n');
+    return reply(t('Which one?\n' + listed, 'Kaunsa wala?\n' + listed));
+  }
+
   // 2. Picking the customer.
   if (s && s.stage === 'choose') {
     const pick = readChoice(text, s.candidates.length);
@@ -1512,7 +1608,7 @@ async function handle(bot, m, text, reply, t) {
     if (same) return punchAnalysed(bot, m, d, reply, t);
   }
 
-  start(m.chatId, found.top, req.items);
+  start(m.chatId, found.top, req.items || takeItems(m.chatId));
   store.log('sales', m.from + ' asked to order for "' + req.customer + '": ' + found.total + ' match(es)');
   if (found.top.length === 1) {
     return reply(t(label(found.top[0]) + ' - this one?', label(found.top[0]) + ' - yahi wale?'));
@@ -1533,6 +1629,11 @@ function _resetDirectory() {
 }
 
 module.exports = {
+  readCustomerKey,
+  findByKey,
+  holdItems,
+  takeItems,
+  heldCount,
   isSalesPerson,
   parseOrderFor,
   findCustomers,

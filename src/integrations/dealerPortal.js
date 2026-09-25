@@ -1254,6 +1254,24 @@ module.exports = {
     return Array.isArray(data) ? data : (data && (data.items || data.data || data.results)) || [];
   },
 
+  // The same search, by the customer's MOBILE: a salesman ordering for a
+  // customer names them by their phone as often as by their name.
+  async searchAccountsByMobile(mobile) {
+    const ten = String(mobile || '').replace(/\D/g, '').slice(-10);
+    if (ten.length !== 10) return [];
+    if (isMock()) return mockCustomers.filter((r) => String(r.phone || r.mobile || '').replace(/\D/g, '').slice(-10) === ten);
+    let data;
+    try {
+      data = await api('GET', '/accounts/search?customer_mobile=' + encodeURIComponent(ten), null, true, 'sales', ACCOUNT_SEARCH_MS);
+    } catch (e) {
+      if (e && (e.status === 404 || /abort|timeout/i.test(String(e.message || e.name || '')))) return [];
+      throw e;
+    }
+    const rows = Array.isArray(data) ? data : (data && (data.items || data.data || data.results)) || [];
+    // The portal's filter is a "contains"; only the account with this number.
+    return rows.filter((r) => [r.phone, r.mobile].some((p) => String(p || '').replace(/\D/g, '').slice(-10) === ten));
+  },
+
   // "Confirm SO": the step after the punch. The punch creates the SO with
   // do_status "pending"; this makes it "confirmed", which starts allocation
   // (live orders 11 Sep carry do_confirmed_by / do_confirmed_at). NOT yet
