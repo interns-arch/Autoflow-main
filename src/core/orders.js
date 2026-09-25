@@ -300,6 +300,20 @@ async function punch(order, opts = {}) {
   // Refused BEFORE the portal is touched, so no stray "yes" during testing can
   // create an order a person then has to cancel by hand. Checked here rather
   // than at the call site because this is the only door to the confirm API.
+  // AN ORDER IS FOR SOMEBODY. The customer the portal bills is
+  // order.portalCustomer; a cart that only carries order.customer (the
+  // agent's, before 25 Sep) takes it from there. Without one, the portal
+  // makes an order with no buyer — no customer on it, no Odoo SO (portal order
+  // 1214) — so nothing is sent at all.
+  if (!(order.portalCustomer && order.portalCustomer.buyerId) && order.customer && typeof order.customer === 'object' && order.customer.buyerId) {
+    order.portalCustomer = order.customer;
+    store.save();
+  }
+  if (!(order.portalCustomer && order.portalCustomer.buyerId)) {
+    store.log('orders', `${order.id} confirm REFUSED — no portal customer on the order`);
+    return { noCustomer: true };
+  }
+
   if (!config.dealerPortal.confirmEnabled && !opts.approvedBy) {
     store.log('orders', `${order.id} confirm BLOCKED — ORDER_CONFIRM_ENABLED is not true (testing mode)`);
     return { blocked: true, lines: order.lines.length };

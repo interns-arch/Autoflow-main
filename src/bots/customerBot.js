@@ -1695,6 +1695,10 @@ class CustomerBot {
           if (result.busy) {
             return reply(t('One moment — I am placing it now.', 'Ek minute — laga raha hoon.'));
           }
+          // No customer on the order: the portal would bill nobody.
+          if (result.noCustomer) {
+            return reply(t('Which customer is this order for? Send their name first.', 'Ye order kis customer ka hai? Pehle customer ka naam bhejiye.'));
+          }
 
           // Testing mode: the draft is kept exactly as it is, so the same YES
           // will place it the moment ORDER_CONFIRM_ENABLED is turned on.
@@ -2440,6 +2444,27 @@ class CustomerBot {
   }
 
 
+  // The Odoo partner the portal linked to this number's account. The portal
+  // links it within seconds of creating the account, so it is asked a few
+  // times before being reported missing.
+  // -> { partnerId } or { partnerId: null, why }
+  async odooLinkOf(phone, { tries = 4, waitMs = 5000 } = {}) {
+    let why = null;
+    for (let i = 0; i < tries; i++) {
+      if (i) await new Promise((r) => setTimeout(r, waitMs));
+      try {
+        customers.forget(phone);
+        const c = await portal.lookupCustomer(phone);
+        const id = c && c.raw && Number(c.raw.odoo_partner_id);
+        if (id > 0) return { partnerId: id };
+        why = c && c.found ? 'no odoo_partner_id on the account' : 'the account is not found by its number yet';
+      } catch (e) {
+        why = String((e && e.message) || e).slice(0, 80);
+      }
+    }
+    return { partnerId: null, why };
+  }
+
   // A GSTIN that would not verify. Nothing is created and the customer is
   // not left arguing with a form — the Sales Heads are told what was tried
   // and decide whether this firm is opened by hand.
@@ -2560,7 +2585,20 @@ class CustomerBot {
           /* a notification nobody received must not fail the creation */
         }
       }
-      return reply(t(`Done — ${req.answers.name} is open (${account.username}).`, `Ho gaya — ${req.answers.name} ka account khul gaya (${account.username}).`));
+      // ON ODOO TOO. The portal creates the Odoo partner itself when it opens
+      // an account (MIYA JI MOTORS: partner 51815, six seconds before the
+      // account; SHREE SHYAM ENTERPRISES: 51818). An account with no partner
+      // can take orders that never become an Odoo SO, so it is checked here
+      // and the Sales Head is told plainly if it is missing.
+      const odoo = await this.odooLinkOf(req.answers.phone);
+      const odooNote = odoo.partnerId
+        ? t(` On Odoo as partner ${odoo.partnerId}.`, ` Odoo pe bhi hai (partner ${odoo.partnerId}).`)
+        : t(
+            `\n⚠️ Not on Odoo yet — the portal has not linked an Odoo customer to it${odoo.why ? ` (${odoo.why})` : ''}. Orders will not reach Odoo until it is linked.`,
+            `\n⚠️ Odoo pe abhi nahi hai — portal ne Odoo customer link nahi kiya${odoo.why ? ` (${odoo.why})` : ''}. Link hone tak order Odoo tak nahi jayenge.`,
+          );
+      store.log(this.key, `${decision.requestId}: Odoo ${odoo.partnerId ? 'partner ' + odoo.partnerId : 'NOT linked' + (odoo.why ? ' — ' + odoo.why : '')}`);
+      return reply(t(`Done — ${req.answers.name} is open (${account.username}).`, `Ho gaya — ${req.answers.name} ka account khul gaya (${account.username}).`) + odooNote);
     } catch (e) {
       // The request STAYS parked: a failed create is worth another try, and
       // losing the form would mean asking the customer everything again.
@@ -3497,6 +3535,7 @@ class CustomerBot {
       return reply(t(`The portal did not take it: ${why}\nNothing was placed — send *OK ${order.id}* again to retry.`, `Portal ne nahi liya: ${why}\nKuch place nahi hua — dobara *OK ${order.id}* bhejiye.`));
     }
     if (res && res.busy) return reply(t(`${order.id} is being placed right now.`, `${order.id} abhi place ho raha hai.`));
+    if (res && res.noCustomer) return reply(t(`${order.id} has no customer account attached, so the portal cannot bill it. Nothing was placed.`, `${order.id} pe customer account nahi hai, portal bill nahi kar sakta. Kuch place nahi hua.`));
     if (res && res.nothingInStock) {
       store.log(this.key, `${order.id} approved by ${who} — nothing in stock, nothing placed`);
       return reply(t(`Nothing in ${order.id} is in stock now, so nothing was placed on the portal. It stays waiting — *OK ${order.id}* again once stock is in.`, `${order.id} mein abhi kuch stock mein nahi hai, isliye portal pe kuch place nahi hua. Stock aane pe dobara *OK ${order.id}* bhejiye.`));

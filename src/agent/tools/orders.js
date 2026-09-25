@@ -21,7 +21,17 @@ const NO_CART = JSON.stringify({ cart: 'empty', note: 'nothing has been added ye
 
 function draftFor(ctx, create) {
   if (!ctx.chatId) return null;
-  return create ? orders.getOrCreateDraft(ctx.chatId, ctx.customer) : orders.findDraft(ctx.chatId);
+  const order = create ? orders.getOrCreateDraft(ctx.chatId, ctx.customer) : orders.findDraft(ctx.chatId);
+  // THE CUSTOMER THE PORTAL PRICES AND BILLS. core/orders reads
+  // order.portalCustomer — for the rate (their discount) and for
+  // selected_buyer_id on confirm. The agent's carts only ever set
+  // order.customer, so 25 Sep, live, portal order 1214 went in with no buyer:
+  // no customer on the order, no Odoo SO, and Disc 0% on the line.
+  if (order && ctx.customer && ctx.customer.buyerId && !(order.portalCustomer && order.portalCustomer.buyerId)) {
+    order.portalCustomer = ctx.customer;
+    store.save();
+  }
+  return order;
 }
 
 function cartState(order) {
@@ -137,6 +147,10 @@ const confirmOrder = tool(
     }
 
     if (res && res.busy) return JSON.stringify({ placed: false, why: 'this order is already being placed — say nothing further about it' });
+    // A number the portal has no account for: there is nobody to bill.
+    if (res && res.noCustomer) {
+      return JSON.stringify({ placed: false, why: 'this number has no account on our system, so the order cannot be placed yet — offer to open an account (account_form), or ask_a_person' });
+    }
     // Placing is switched off: the order goes to the Sales Head, and his
     // "OK ORD-…" places it on the portal (customerBot.decideOrder). 25 Sep,
     // live: this used to be handed to a person as a question, he answered
