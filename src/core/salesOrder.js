@@ -260,6 +260,68 @@ function findKeyIn(text) {
   return p ? { phone: '91' + p[1] } : null;
 }
 
+// SEARCHING A CUSTOMER BY NAME / SHOP NAME (founder, 25 Sep): "search Vinod
+// automobiles", "customer Kalra Motors", "shop name Miya ji motors", "Kalra
+// Motors ki detail", "Kalra Motors ka due kitna hai". -> the name, or null.
+const SEARCH_LEAD = /^(?:please\s+|pls\s+)?(?:search|find|dhundh\w*|dhoondh\w*|dhundo|check|lookup|look\s+up|show)\s+(?:(?:the|a|this)\s+)?(?:(?:customer|party|shop|dukan|dukaan|dealer|account|client)\s*)?(?:name\s*)?[:\-]?\s*(.+)$/i;
+const TYPE_LEAD = /^(?:customer|party|shop|dukan|dukaan|dealer|client|firm)\s*(?:name|ka\s+naam|ka\s+name)?\s*[:\-]?\s*(.+)$/i;
+const NAME_THEN = /^(.+?)\s+(?:ki|ka|ke)\s+(?:detail|details|info|information|jankari|jaankari|account|profile|due|balance|baaki|baki|outstanding)\b[\s\S]*$/i;
+function nameAsked(text) {
+  const t = String(text || '').trim().replace(/[?.!]+$/, '');
+  const m = t.match(SEARCH_LEAD) || t.match(TYPE_LEAD) || t.match(NAME_THEN);
+  if (!m) return null;
+  const name = m[1].replace(/\b(ki|ka|ke|details?|info|please|pls|bhejo|batao|dikhao|chahiye)\b/gi, ' ').replace(/\s+/g, ' ').trim();
+  if (!name || isGenericName(name) || findKeyIn(name) || PART_LIKE.test(name) || name.length < 3) return null;
+  // "show cart", "check stock", "search order status" are not names.
+  if (/\b(order|orders|cart|stock|rate|price|mrp|list|report|ledger|discount|bill|bills|invoice|status|part|parts|payment|dispatch|challan)\b/i.test(name)) return null;
+  return name;
+}
+
+// A customer found by name, shown to the agent: one -> the card; several ->
+// the list, and picking one shows its card; none exactly -> the near misses
+// ("kalara" -> Kalra Motors). `quiet`: say nothing when there is no match
+// (a bare name that might be something else).
+async function showByName(m, name, reply, t, { quiet = false } = {}) {
+  let found;
+  try {
+    found = await findCustomers(name);
+    if (!found.total) found = await findCustomersFuzzy(name);
+  } catch (e) {
+    store.log('sales', 'customer search failed: ' + String((e && e.message) || e).slice(0, 140));
+    if (quiet) return false;
+    return reply(t("I can't open the customer list right now - try again in a minute?", 'Customer list abhi khul nahi rahi - ek minute mein phir bhejiye?'));
+  }
+  if (!found.total) {
+    if (quiet) return false;
+    return reply(
+      t(
+        'No customer or shop called "' + name + '". Try their phone number or GST number, or another part of the name.',
+        '"' + name + '" naam se koi customer / shop nahi mila. Phone number ya GST number bhejiye, ya naam ka dusra hissa.',
+      ),
+    );
+  }
+  store.log('sales', m.from + ' searched the customer "' + name + '": ' + found.total + ' match(es)');
+  if (found.top.length === 1) {
+    start(m.chatId, found.top, null);
+    const card = await customerCard(found.top[0], t);
+    return reply(card + '\n\n' + t('Is the order for this customer? (yes / no)', 'Order isi customer ke liye hai? (haan / nahi)'));
+  }
+  start(m.chatId, found.top, null, 'card');
+  const listed = found.top.map((r, i) => i + 1 + '. ' + label(r)).join('\n');
+  const more = found.total > found.top.length ? t('\n...and more - send more of the name.', '\n...aur bhi hain - naam thoda aur bataiye.') : '';
+  return reply(t('Which one? Send the number.\n', 'Kaunsa wala? Number bhejiye.\n') + listed + more);
+}
+// A bare name counts only when every word IS a word of a customer's name —
+// "Kalra Motors" yes, "swift headlight" (a part) no.
+async function bareName(text) {
+  const tt = String(text || '').trim();
+  if (!looksLikeName(tt) || tt.split(/\s+/).length < 2) return null;
+  const found = await findCustomers(tt).catch(() => ({ top: [] }));
+  const q = words(tt);
+  const exact = (found.top || []).filter((r) => q.every((w) => words(r.name).includes(w)));
+  return exact.length ? tt : null;
+}
+
 // PARTS SENT BEFORE THE CUSTOMER. A salesman sends the parts and is asked
 // whose order it is; the parts are kept here (as the lines he would have
 // typed) and become that customer's draft the moment he answers.
@@ -1353,6 +1415,17 @@ async function handle(bot, m, text, reply, t) {
     return reply(t("Whose ledger? Send the customer's phone number or GST number (or name).", 'Kiska ledger? Customer ka phone number ya GST number bhejiye (ya naam).'));
   }
 
+  // 1b3. A CUSTOMER BY NAME / SHOP NAME: "search Vinod automobiles", "Kalra
+  //      Motors ki detail", "customer Miya ji motors" — or just the name.
+  if (!(s && s.stage === 'choose' && readChoice(text, s.candidates.length) !== null) && !parseOrderFor(text)) {
+    const asked = nameAsked(text);
+    if (asked) return showByName(m, asked, reply, t);
+    if (!(s && s.stage === 'askCustomer') && !lookup.parse(text)) {
+      const bare = await bareName(text);
+      if (bare) return showByName(m, bare, reply, t, { quiet: true });
+    }
+  }
+
   // 1c0. ASKING ABOUT A CUSTOMER — "customer ki detail", "check customer
   // 9654078241", "mere number pe koi account hai". The phone or GSTIN in it is
   // looked up below; without one, whose is asked.
@@ -1442,6 +1515,12 @@ async function handle(bot, m, text, reply, t) {
     if (typeof pick === 'number') {
       // The desk asked ABOUT this customer (orders, ledger, credit notes)
       // rather than ordering for them: answer, and close the picker.
+      if (s.intent === 'card') {
+        const row = s.candidates[pick];
+        start(m.chatId, [row], null);
+        const card = await customerCard(row, t);
+        return reply(card + '\n\n' + t('Is the order for this customer? (yes / no)', 'Order isi customer ke liye hai? (haan / nahi)'));
+      }
       if (s.intent && s.intent !== 'order') {
         const row = s.candidates[pick];
         const about = s.about || null;
@@ -1480,11 +1559,18 @@ async function handle(bot, m, text, reply, t) {
     // question again. Never a fall-through: a stray "haan" here would reach
     // the order confirm and punch whatever cart was open.
     // A different name typed instead of a number: search that one.
-    if (!parseOrderFor(text) && !lookup.parse(text) && looksLikeName(text)) {
-      return searchByName(m, text, s.items || null, reply, t);
+    // With a real list open, a name-like reply is a new search; with one card
+    // shown, only a customer's exact name is ("swift headlight" after a card
+    // is not a customer).
+    if (!parseOrderFor(text) && !lookup.parse(text)) {
+      const nm = nameAsked(text) || (s.candidates.length > 1 && looksLikeName(text) ? text : await bareName(text));
+      if (nm) return searchByName(m, nm, s.items || null, reply, t);
     }
     if (!parseOrderFor(text) && !lookup.parse(text)) {
       const n = s.candidates.length;
+      if (n === 1) {
+        return reply(t(s.candidates[0].name + ' — is the order for this customer? (yes / no)', s.candidates[0].name + ' — order isi customer ke liye hai? (haan / nahi)'));
+      }
       return reply(t('Which customer first - ' + oneOf(n, 'or') + '?', 'Pehle ye bata dijiye kaunsa customer - ' + oneOf(n, 'ya') + '?'));
     }
   }
