@@ -154,6 +154,32 @@ async function statement(partnerId, { from, to } = {}) {
   };
 }
 
+// A customer's latest posted invoices. `ref` on a sales invoice is the PORTAL
+// order id (CT-DL-26-27/3482 -> ref 1185 -> portal order 1185, verified 25
+// Sep), so the bill PDF comes from the portal: portal.invoicePdf(ref).
+async function invoices(partnerId, { limit = 5 } = {}) {
+  const id = Number(partnerId);
+  if (!id) return [];
+  const rows = await call(
+    'account.move',
+    'search_read',
+    [[['partner_id', '=', id], ['state', '=', 'posted'], ['move_type', '=', 'out_invoice']]],
+    { fields: ['name', 'ref', 'invoice_origin', 'invoice_date', 'amount_total', 'amount_residual', 'payment_state'], limit, order: 'invoice_date desc, id desc' },
+  );
+  return rows.map((m) => {
+    const orderId = (String(m.ref || '').match(/^\s*(\d{3,7})\s*$/) || String(m.invoice_origin || '').match(/\b(\d{3,7})\b/) || [])[1] || null;
+    return {
+      id: m.id,
+      name: m.name,
+      date: m.invoice_date || null,
+      total: num(m.amount_total),
+      pending: num(m.amount_residual),
+      paid: m.payment_state === 'paid',
+      orderId,
+    };
+  });
+}
+
 // Posted credit notes only: a draft one is not money the customer has.
 async function creditNotes(partnerId, { limit = 6 } = {}) {
   const id = Number(partnerId);
@@ -222,4 +248,4 @@ async function ensurePartner({ name, phone, gstNo, email, address, city, state, 
   return { id, created: true, matchedBy: null };
 }
 
-module.exports = { enabled, ledger, statement, creditNotes, ensurePartner, _call: call, _login: login };
+module.exports = { enabled, ledger, statement, invoices, creditNotes, ensurePartner, _call: call, _login: login };

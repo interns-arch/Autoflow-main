@@ -806,6 +806,84 @@ async function sendLedgerPdf(bot, m, row, t) {
 }
 const LEDGER_RE = /\b(ledger|khata|statement|hisab|hisaab|account\s*statement)\b/i;
 
+// THE CUSTOMER'S INVOICES AS PDFs (founder, 25 Sep). Odoo lists them; each is
+// sent as the portal's own bill PDF — the file the desk downloads — found
+// through the portal order carrying that invoice number (CT-DL-26-27/3234 ->
+// order 44900001), else the Odoo SO number, else the invoice's ref, which on
+// newer invoices IS the portal order id.
+const INVOICE_RE = /\b(invoice|invoices|bill|bills)\b/i;
+const INVOICE_OF = /^(.+?)\s+(?:ka|ki|ke)\s+(?:(?:latest|last|pichla|pichhla|sab|saare|all)\s+)?(?:invoice|invoices|bill|bills)\b/i;
+
+async function withOdooPartner(row) {
+  if (row.odoo_partner_id || !row.name) return row;
+  const rows = await require('../integrations/dealerPortal').searchAccounts(row.name).catch(() => []);
+  return { ...row, ...(rows.find((r) => Number(r.id) === Number(row.id)) || {}) };
+}
+
+async function sendInvoicePdf(bot, m, row, inv, t) {
+  const portal = require('../integrations/dealerPortal');
+  const orders = await portal.recentOrders(row.name, { limit: 60 }).catch(() => []);
+  const hit =
+    orders.find((o) => String(o.invoice_no || '') === inv.name) ||
+    orders.find((o) => inv.orderId && String(o.odoo_so_name || '') === String(inv.orderId)) ||
+    null;
+  const orderId = hit ? hit.order_id : inv.orderId;
+  let pdf = null;
+  if (orderId) pdf = await portal.invoicePdf(orderId).catch(() => null);
+  if (!pdf) {
+    store.log('sales', 'no bill PDF for ' + inv.name + ' (' + row.name + ', order ' + orderId + ')');
+    return false;
+  }
+  const clean = (x) => String(x || '').replace(/[\\/:*?"<>|]+/g, '-').replace(/\s+/g, ' ').trim();
+  const pdfLib = require('./pdf');
+  await bot.transport.sendDocument(
+    m.chatId,
+    pdf,
+    ('Invoice ' + clean(inv.name) + ' - ' + clean(row.name)).slice(0, 80) + '.pdf',
+    'application/pdf',
+    row.name + ' · ' + inv.name + ' · ' + (inv.date || '') + ' · ' + pdfLib.rs(inv.total) + (inv.paid ? ' · paid' : ' · pending ' + pdfLib.rs(inv.pending)),
+  );
+  store.log('sales', m.from + ' was sent invoice ' + inv.name + ' of ' + row.name + ' (portal order ' + orderId + ')');
+  return true;
+}
+
+// The customer's latest invoices: one is sent; several are listed to pick.
+async function invoicesFor(bot, m, row, reply, t) {
+  const odoo = require('../integrations/odoo');
+  const full = await withOdooPartner(row);
+  if (!odoo.enabled() || !full.odoo_partner_id) {
+    return reply(t(full.name + ' is not linked to Odoo, so their invoices cannot be read.', full.name + ' Odoo se linked nahi hai, isliye invoice nahi mil rahe.'));
+  }
+  let list = [];
+  try {
+    list = await odoo.invoices(full.odoo_partner_id, { limit: 5 });
+  } catch (e) {
+    store.log('sales', 'invoices of ' + full.name + ' failed: ' + String((e && e.message) || e).slice(0, 120));
+    return reply(t('The invoices could not be read right now — try again in a minute.', 'Invoice abhi nahi mil rahe — ek minute mein dobara bhejiye.'));
+  }
+  if (!list.length) return reply(t(full.name + ' has no invoice yet.', full.name + ' ka abhi koi invoice nahi hai.'));
+  if (list.length === 1) {
+    await reply(t('Sending invoice ' + list[0].name + ' of ' + full.name + '…', full.name + ' ka invoice ' + list[0].name + ' bhej raha hoon…'));
+    if (!(await sendInvoicePdf(bot, m, full, list[0], t))) return reply(t('The PDF of ' + list[0].name + ' is not available on the portal yet.', list[0].name + ' ka PDF portal pe abhi nahi hai.'));
+    return true;
+  }
+  const pdfLib = require('./pdf');
+  sessions.set(m.chatId, { stage: 'pickInvoice', customer: { id: full.id, name: full.name, odoo_partner_id: full.odoo_partner_id }, invoices: list, at: Date.now() });
+  const NL = String.fromCharCode(10);
+  const rows = list.map((v, i) => (i + 1) + '. ' + v.name + ' · ' + (v.date || '') + ' · ' + pdfLib.rs(v.total) + (v.paid ? ' · paid' : ' · pending ' + pdfLib.rs(v.pending)));
+  return reply(
+    t(full.name + ' — latest invoices:' + NL + rows.join(NL) + NL + NL + 'Which one? Send the number (e.g. 1 or 1,3) — or "all".', full.name + ' ke latest invoice:' + NL + rows.join(NL) + NL + NL + 'Kaunsa bhejun? Number bhejiye (jaise 1 ya 1,3) — ya "sab".'),
+  );
+}
+
+// What an agent asked for, once the customer is known.
+async function deliverFor(bot, m, row, intent, reply, t) {
+  if (intent === 'invoice') return invoicesFor(bot, m, row, reply, t);
+  await reply(t('Sending the ledger of ' + row.name + '…', row.name + ' ka ledger bhej raha hoon…'));
+  if (!(await sendLedgerPdf(bot, m, row, t))) return reply(await lookup.answer(row, 'ledger', t).catch(() => t('The ledger could not be made right now.', 'Ledger abhi nahi ban paya.')));
+  return true;
+}
+
 async function answerAbout(bot, m, row, about, reply, t) {
   const portal = require('../integrations/dealerPortal');
   store.log('sales', m.from + ' asked about ' + row.name + ' (' + about.intent + (about.part ? ' ' + about.part : '') + ')');
@@ -1382,37 +1460,64 @@ async function handle(bot, m, text, reply, t) {
   const orders = require('./orders');
   const s = session(m.chatId);
 
+  // 0. WHICH INVOICE, from the list just shown: "2", "1,3", "1 2", "sab".
+  if (s && s.stage === 'pickInvoice') {
+    const said = String(text || '').trim().toLowerCase();
+    const all = /^(sab|saare|sare|all|sabhi|every)/.test(said);
+    const nums = all ? s.invoices.map((_, i) => i + 1) : (said.match(/\d{1,2}/g) || []).map(Number).filter((n) => n >= 1 && n <= s.invoices.length);
+    if (nums.length && (all || /^[\d\s,&and]+$/.test(said.replace(/aur/g, '')))) {
+      clear(m.chatId);
+      const row = s.customer;
+      let sent = 0;
+      for (const n of [...new Set(nums)]) if (await sendInvoicePdf(bot, m, row, s.invoices[n - 1], t)) sent++;
+      if (!sent) return reply(t('Those PDFs are not available on the portal yet.', 'Inke PDF portal pe abhi nahi hain.'));
+      if (sent < nums.length) return reply(t('The others are not available as PDF on the portal yet.', 'Baaki ke PDF portal pe abhi nahi hain.'));
+      return true;
+    }
+  }
+
   // The second OK - "Sahi hai?" on the draft SO - is answered in
   // core/soReview, which confirms it and sends the confirmed document.
 
   // 1b. The customer's name for parts sent in a file, sent on its own.
   if (await fileAnalysisName(bot, m, text, reply, t)) return true;
 
-  // 1b2. A LEDGER by phone / GST number, or for the customer just shown:
-  //      "9654078241 ka ledger", "ledger bhejo", "is customer ka khata".
-  if (LEDGER_RE.test(text) && (findKeyIn(text) || !lookup.parse(text))) {
+  // 1b2. A LEDGER or an INVOICE, by phone / GST number, by name, or for the
+  //      customer just shown: "9654078241 ka ledger", "Kalra Motors ka
+  //      invoice", "invoice bhejo", "is customer ka khata". ("486 ka bill" —
+  //      a portal order number — is answered further down, as before.)
+  const want = LEDGER_RE.test(text) ? 'ledger' : INVOICE_RE.test(text) && !lookup.parseBill(text) ? 'invoice' : null;
+  if (want && (findKeyIn(text) || want === 'invoice' || !lookup.parse(text))) {
     const k = findKeyIn(text);
     let rows = k ? await findByKey(k).catch(() => []) : [];
-    if (!k) {
+    if (!k && want === 'invoice') {
+      const nm = (String(text).trim().match(INVOICE_OF) || [])[1];
+      if (nm && !isGenericName(nm) && looksLikeName(nm.replace(/\b(is|us|mere|mera)\b/gi, '').trim() || 'x')) {
+        const found = await findCustomers(nm).catch(() => ({ top: [] }));
+        rows = found.top && found.top.length ? found.top : (await findCustomersFuzzy(nm).catch(() => ({ top: [] }))).top || [];
+      }
+    }
+    if (!k && !rows.length) {
       const shown = s && s.stage === 'choose' && s.candidates && s.candidates.length === 1 ? s.candidates[0] : null;
       const active = !shown && activeCustomer(m.chatId);
       if (shown) rows = [shown];
       else if (active) rows = [{ ...(active.raw || {}), id: active.buyerId, name: active.name }];
     }
     if (rows.length === 1) {
-      await reply(t('Sending the ledger of ' + rows[0].name + '…', rows[0].name + ' ka ledger bhej raha hoon…'));
-      if (!(await sendLedgerPdf(bot, m, rows[0], t))) {
-        return reply(await lookup.answer(rows[0], 'ledger', t).catch(() => t('The ledger could not be made right now.', 'Ledger abhi nahi ban paya.')));
-      }
-      return true;
+      if (s && s.stage === 'choose') clear(m.chatId);
+      return deliverFor(bot, m, rows[0], want, reply, t);
     }
     if (rows.length > 1) {
-      start(m.chatId, rows.slice(0, MAX_CANDIDATES), null, 'ledger');
+      start(m.chatId, rows.slice(0, MAX_CANDIDATES), null, want);
       return reply(t('Which one?' + String.fromCharCode(10), 'Kaunsa wala?' + String.fromCharCode(10)) + rows.slice(0, MAX_CANDIDATES).map((r, i) => i + 1 + '. ' + label(r)).join(String.fromCharCode(10)));
     }
     if (k) return reply(t('No customer on the portal with that number.', 'Is number pe portal mein koi customer nahi mila.'));
-    sessions.set(m.chatId, { stage: 'askCustomer', intent: 'ledger', items: null, at: Date.now() });
-    return reply(t("Whose ledger? Send the customer's phone number or GST number (or name).", 'Kiska ledger? Customer ka phone number ya GST number bhejiye (ya naam).'));
+    sessions.set(m.chatId, { stage: 'askCustomer', intent: want, items: null, at: Date.now() });
+    return reply(
+      want === 'invoice'
+        ? t("Whose invoice? Send the customer's phone number or GST number (or name).", 'Kiska invoice? Customer ka phone number ya GST number bhejiye (ya naam).')
+        : t("Whose ledger? Send the customer's phone number or GST number (or name).", 'Kiska ledger? Customer ka phone number ya GST number bhejiye (ya naam).'),
+    );
   }
 
   // 1b3. A CUSTOMER BY NAME / SHOP NAME: "search Vinod automobiles", "Kalra
@@ -1445,16 +1550,14 @@ async function handle(bot, m, text, reply, t) {
 
   // 1c1. The customer's NAME, after "kis customer ke liye?".
   if (s && s.stage === 'askCustomer' && !readCustomerKey(text) && !findKeyIn(text) && looksLikeName(text)) {
-    if (s.intent === 'ledger') {
+    if (s.intent === 'ledger' || s.intent === 'invoice') {
       const found = await findCustomers(text).catch(() => ({ top: [] }));
       if (found.top.length === 1) {
         clear(m.chatId);
-        await reply(t('Sending the ledger of ' + found.top[0].name + '…', found.top[0].name + ' ka ledger bhej raha hoon…'));
-        if (!(await sendLedgerPdf(bot, m, found.top[0], t))) return reply(await lookup.answer(found.top[0], 'ledger', t));
-        return true;
+        return deliverFor(bot, m, found.top[0], s.intent, reply, t);
       }
       if (found.top.length > 1) {
-        start(m.chatId, found.top, null, 'ledger');
+        start(m.chatId, found.top, null, s.intent);
         return reply(t('Which one?\n', 'Kaunsa wala?\n') + found.top.map((r, i) => i + 1 + '. ' + label(r)).join('\n'));
       }
       return reply(t('No customer called "' + text + '". Send the phone number or GST number.', '"' + text + '" naam ka customer nahi mila. Phone number ya GST number bhejiye.'));
@@ -1482,14 +1585,12 @@ async function handle(bot, m, text, reply, t) {
         ),
       );
     }
-    if (s && s.stage === 'askCustomer' && s.intent === 'ledger') {
+    if (s && s.stage === 'askCustomer' && (s.intent === 'ledger' || s.intent === 'invoice')) {
       if (rows.length === 1) {
         clear(m.chatId);
-        await reply(t('Sending the ledger of ' + rows[0].name + '…', rows[0].name + ' ka ledger bhej raha hoon…'));
-        if (!(await sendLedgerPdf(bot, m, rows[0], t))) return reply(await lookup.answer(rows[0], 'ledger', t));
-        return true;
+        return deliverFor(bot, m, rows[0], s.intent, reply, t);
       }
-      start(m.chatId, rows.slice(0, MAX_CANDIDATES), null, 'ledger');
+      start(m.chatId, rows.slice(0, MAX_CANDIDATES), null, s.intent);
       return reply(t('Which one?' + String.fromCharCode(10), 'Kaunsa wala?' + String.fromCharCode(10)) + rows.slice(0, MAX_CANDIDATES).map((r, i) => i + 1 + '. ' + label(r)).join(String.fromCharCode(10)));
     }
     const items = takeItems(m.chatId);
@@ -1515,6 +1616,13 @@ async function handle(bot, m, text, reply, t) {
     if (typeof pick === 'number') {
       // The desk asked ABOUT this customer (orders, ledger, credit notes)
       // rather than ordering for them: answer, and close the picker.
+      // (A ledger is answered by the path below, which keeps the list for
+      // "2", a swiped "3." or the list's own label next.)
+      if (s.intent === 'invoice') {
+        const row = s.candidates[pick];
+        clear(m.chatId);
+        return deliverFor(bot, m, row, 'invoice', reply, t);
+      }
       if (s.intent === 'card') {
         const row = s.candidates[pick];
         start(m.chatId, [row], null);
