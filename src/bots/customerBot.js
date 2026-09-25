@@ -2612,8 +2612,26 @@ class CustomerBot {
             `\n⚠️ Odoo pe abhi nahi hai — portal ne Odoo customer link nahi kiya${odoo.why ? ` (${odoo.why})` : ''}. Link hone tak order Odoo tak nahi jayenge.`,
           );
       store.log(this.key, `${decision.requestId}: Odoo ${odoo.partnerId ? 'partner ' + odoo.partnerId : 'NOT linked' + (odoo.why ? ' — ' + odoo.why : '')}`);
+      // HOME BRANCH, from the location (founder, 25 Sep): Rajasthan ->
+      // Mansarovar, anywhere else -> Bijwasan. The account was opened with it;
+      // checked on the portal and set there if it did not take.
+      let branchNote = '';
+      try {
+        const want = account.branchId || dataEntry.branchFor(req.answers);
+        const created = (await portal.searchAccounts(req.answers.name).catch(() => [])).find((r) => String(r.phone || '').slice(-10) === String(req.answers.phone || '').slice(-10));
+        if (created && want) {
+          let now = await portal.homeBranchOf(created.id, created.name).catch(() => null);
+          if (now && now.id !== Number(want)) {
+            const fixed = await portal.setHomeBranch(created.id, created.name, want).catch(() => null);
+            now = (fixed && fixed.now) || now;
+          }
+          branchNote = t(` Home branch: ${dataEntry.branchName(now ? now.id : want)}.`, ` Home branch: ${dataEntry.branchName(now ? now.id : want)}.`);
+        }
+      } catch (e) {
+        store.log(this.key, `${decision.requestId}: home branch not checked: ${String((e && e.message) || e).slice(0, 80)}`);
+      }
       approvalLog.record({ kind: 'account', id: decision.requestId, event: 'approved', by: who, username: account.username, odooPartner: odoo.partnerId || null, ...approvalLog.accountFacts(req.answers) });
-      return reply(t(`Done — ${req.answers.name} is open (${account.username}).`, `Ho gaya — ${req.answers.name} ka account khul gaya (${account.username}).`) + odooNote);
+      return reply(t(`Done — ${req.answers.name} is open (${account.username}).`, `Ho gaya — ${req.answers.name} ka account khul gaya (${account.username}).`) + branchNote + odooNote);
     } catch (e) {
       // The request STAYS parked: a failed create is worth another try, and
       // losing the form would mean asking the customer everything again.

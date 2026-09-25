@@ -66,6 +66,10 @@ function accountFacts(a) {
     dob: a.dob || null,
     bank: a.bankDetails || null,
     location: a.lat != null ? `${a.lat}, ${a.lng}` : null,
+    homeBranch: (() => {
+      const de = require('./dataEntryRequests');
+      return de.branchName(de.branchFor(a));
+    })(),
     openedBy: a.createdByName || null,
     openedFor: a.openedFor || null,
   };

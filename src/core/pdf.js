@@ -132,7 +132,7 @@ async function reportPdf(r) {
       { label: 'Email', width: 88 },
       { label: 'Address', width: 105 },
       { label: 'DOB / bank', width: 75 },
-      { label: 'Login / Odoo', width: 65 },
+      { label: 'Branch / login / Odoo', width: 65 },
       { label: 'Opened / approved by', width: 95 },
     ],
     r.created.length
@@ -145,7 +145,7 @@ async function reportPdf(r) {
           e.email,
           e.address,
           [e.dob, e.bank].filter(Boolean).join(' · '),
-          [e.username, e.odooPartner ? 'Odoo ' + e.odooPartner : null].filter(Boolean).join(' · '),
+          [r.branchOf ? r.branchOf(e) : e.homeBranch, e.username, e.odooPartner ? 'Odoo ' + e.odooPartner : null].filter(Boolean).join(' · '),
           [e.openedBy || r.askedBy?.[e.id], e.by].filter(Boolean).join(' / '),
         ])
       : [['', 'None today']],

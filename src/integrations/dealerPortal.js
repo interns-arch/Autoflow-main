@@ -1254,6 +1254,38 @@ module.exports = {
     return Array.isArray(data) ? data : (data && (data.items || data.data || data.results)) || [];
   },
 
+  // A customer's HOME BRANCH (Bijwasan 23 / Mansarovar 1078), which decides
+  // the warehouse their orders are allocated from. It lives on the ACCOUNT,
+  // and the portal's own way to change it is the customer-branch mapping —
+  // keyed by AccountId. (/dealers/{id} is a different table: /dealers/8328
+  // is another company, not account 8328. Never used for this.)
+  // -> { id, name } as the portal has it now, or null.
+  async homeBranchOf(accountId, customerName) {
+    if (isMock()) return { id: 23, name: 'BIJWASAN WAREHOUSE' };
+    const data = await api('GET', '/account/update/customer-branch-mapping?limit=25&q=' + encodeURIComponent(customerName || ''), null, true, 'admin');
+    const row = ((data && data.items) || []).find((x) => Number(x.AccountId) === Number(accountId));
+    return row ? { id: Number(row.HomeBranchDealerId), name: row.HomeBranchDealerName || null } : null;
+  },
+  async setHomeBranch(accountId, customerName, branchId) {
+    if (isMock()) return { ok: true, mock: true };
+    const names = { 23: 'BIJWASAN WAREHOUSE', 1078: 'MAANSAROVAR WAREHOUSE' };
+    const q = (v) => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
+    const csv = 'AccountId,CustomerName,HomeBranchDealerId,HomeBranchDealerName\r\n' + [accountId, q(customerName), branchId, q(names[branchId] || '')].join(',') + '\r\n';
+    await ensureToken('admin');
+    const form = new FormData();
+    form.append('file', new Blob([csv], { type: 'text/csv' }), 'home-branch-' + accountId + '.csv');
+    const res = await fetch(dp.baseUrl + '/account/update/customer-branch-mapping/upload', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + sessions.admin.token },
+      body: form,
+    });
+    const text = await res.text().catch(() => '');
+    if (!res.ok) throw Object.assign(new Error('home branch upload HTTP ' + res.status + ' ' + text.slice(0, 200)), { status: res.status });
+    const now = await this.homeBranchOf(accountId, customerName).catch(() => null);
+    store.log('portal', 'account ' + accountId + ' home branch set to ' + branchId + ' (portal now ' + (now && now.id) + '): ' + text.slice(0, 120));
+    return { ok: Boolean(now && now.id === Number(branchId)), now, response: text.slice(0, 300) };
+  },
+
   // A customer's details changed on the portal: only the fields sent (name,
   // phone, email, gst_no, address, credit_days, credit_limit, dealer_category).
   async updateCustomer(accountId, fields) {

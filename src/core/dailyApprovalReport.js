@@ -32,6 +32,14 @@ function cell(v) {
 }
 const row = (cols) => cols.map(cell).join(',');
 
+// The account's home branch — recorded with it, or (older lines) worked out
+// from its address the way the account itself was given one.
+function branchOf(e) {
+  if (e.homeBranch) return e.homeBranch;
+  const de = require('./dataEntryRequests');
+  return e.address ? de.branchName(de.branchFor({ address: e.address })) : '';
+}
+
 // The orders the bot placed on the portal today.
 function salesToday(start, end) {
   const a = start.getTime();
@@ -81,11 +89,11 @@ function build(now = new Date()) {
   lines.push('');
   lines.push(row(['1. CUSTOMERS CREATED TODAY', created.length]));
   lines.push(
-    row(['Time', 'Request', 'Customer', 'WhatsApp', 'GSTIN', 'Business type', 'Contact person', 'Contact phone', 'Email', 'Address', 'Owner DOB', 'Bank', 'Location', 'Portal login', 'Odoo partner', 'Opened by', 'Approved by']),
+    row(['Time', 'Request', 'Customer', 'WhatsApp', 'GSTIN', 'Business type', 'Contact person', 'Contact phone', 'Email', 'Address', 'Owner DOB', 'Bank', 'Location', 'Home branch', 'Portal login', 'Odoo partner', 'Opened by', 'Approved by']),
   );
   for (const e of created) {
     lines.push(
-      row([time(e.at), e.id, e.customer, e.phone, e.gst, e.businessType, e.contactPerson, e.contactPhone, e.email, e.address, e.dob, e.bank, e.location, e.username, e.odooPartner, e.openedBy || asked.get(e.id) || e.openedFor, e.by]),
+      row([time(e.at), e.id, e.customer, e.phone, e.gst, e.businessType, e.contactPerson, e.contactPhone, e.email, e.address, e.dob, e.bank, e.location, branchOf(e), e.username, e.odooPartner, e.openedBy || asked.get(e.id) || e.openedFor, e.by]),
     );
   }
   lines.push('');
@@ -133,7 +141,7 @@ function build(now = new Date()) {
     .join('\n');
 
   // With a byte-order mark, so Excel opens the ₹ and the names correctly.
-  return { ymd, csv: '﻿' + lines.join('\r\n') + '\r\n', summary, created, sales, events, pending, askedBy: Object.fromEntries(asked) };
+  return { ymd, branchOf, csv: '﻿' + lines.join('\r\n') + '\r\n', summary, created, sales, events, pending, askedBy: Object.fromEntries(asked) };
 }
 
 // To every Sales Head. The report goes as a document; if a phone cannot be

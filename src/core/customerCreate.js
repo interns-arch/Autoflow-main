@@ -1054,6 +1054,12 @@ function summary(form, t) {
     line('City', a.city),
     line('State', a.state),
     line('PIN', a.pin),
+    // HOME BRANCH, from the location (founder, 25 Sep): Rajasthan -> Mansarovar,
+    // anywhere else -> Bijwasan. The account is opened with it (dataEntryRequests.branchFor).
+    (() => {
+      const de = require('./dataEntryRequests');
+      return 'Home branch: ' + de.branchName(de.branchFor(a)) + ' (from location)';
+    })(),
     a.lat ? `Location: ${a.lat}, ${a.lng}` : a.locationNote ? 'Location: ' + a.locationNote : null,
     '',
     a.bannerText ? 'Board reads: ' + a.bannerText : null,

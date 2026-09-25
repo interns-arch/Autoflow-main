@@ -395,6 +395,9 @@ async function customerCard(row, t) {
         ? t('Due balance: ', 'Due balance: ') + money(full.balance) + t(' (to be settled before a new order)', ' (naye order se pehle settle karna hai)')
         : t('Due balance: nil (settled)', 'Due balance: nil (settle hai)')
       : null,
+    full.home_branch_dealer_id || full.home_branch_dealer
+      ? 'Home branch: ' + require('./dataEntryRequests').branchName(full.home_branch_dealer_id || full.home_branch_dealer)
+      : null,
     'Portal id: ' + full.id,
     discounts.length
       ? t('Discounts now: ', 'Abhi discount: ') + discounts.map((d) => `${d.on} ${d.percent}%${d.validTill ? ' (till ' + d.validTill + ')' : ''}`).join('; ')

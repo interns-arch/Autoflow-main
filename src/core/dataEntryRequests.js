@@ -273,6 +273,11 @@ const RAJASTHAN_STATE = /\braj(asthan)?\b/i;
 const RAJASTHAN_CITY =
   /\b(jaipur|jodhpur|udaipur|kota|ajmer|bikaner|alwar|sikar|bhilwara|bharatpur|pali|sriganganagar|chittorgarh|mansarovar|sanganer)\b/i;
 
+// 23 -> "Bijwasan", 1078 -> "Mansarovar": for the summary, the card, the report.
+function branchName(id) {
+  return Number(id) === BRANCH_MANSAROVAR ? 'Mansarovar' : Number(id) === BRANCH_BIJWASAN ? 'Bijwasan' : id ? 'branch ' + id : null;
+}
+
 function branchFor(fields) {
   const state = clean(fields.state);
   const city = clean(fields.city);
@@ -334,6 +339,7 @@ module.exports = {
   buildAccount,
   readPairs,
   branchFor,
+  branchName,
   userTypeFor,
   isBoth,
   BRANCH_BIJWASAN,
