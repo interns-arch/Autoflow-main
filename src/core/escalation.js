@@ -1332,6 +1332,11 @@ async function handleReply(m) {
   // Record that this helper messaged us — the 24h Cloud API window is now open.
   helperLastInbound.set(store.normPhone(m.from), Date.now());
 
+  // "OK ORD-12", "NO DSC-7F3K", "OK WA-…" are decisions on a request, not an
+  // answer to a question — Prateek sir is both the helper and a Sales Head,
+  // and with one question open, "OK …" would otherwise be read as its answer.
+  if (require('./customerCreate').readDecision(String(m.body || '').trim())) return false;
+
   const text = (m.body || '').trim();
 
   // "pending" / "?" — what is still open. Answered even when nothing is, so a

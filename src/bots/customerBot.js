@@ -530,6 +530,7 @@ class CustomerBot {
       const decision = customerCreate.readDecision(text);
       if (decision && customerCreate.isApprover(m.from)) {
         if (/^DSC-/.test(decision.requestId)) return this.decideDiscount(m, decision, reply, t);
+        if (/^ORD-/.test(decision.requestId)) return this.decideOrder(m, decision, reply, t);
         return this.decideNewCustomer(m, decision, reply, t);
       }
       if (decision) {
@@ -2972,6 +2973,10 @@ class CustomerBot {
       partNo: r.part_no,
       value: Number(r.discount_value),
       mode: r.discount_mode,
+      minQty: r.min_qty || null,
+      maxQty: r.max_qty || null,
+      validFrom: r.valid_from || null,
+      validTo: r.valid_to || null,
     }));
     if (!st.rules.length) {
       st.step = 'type';
@@ -2992,6 +2997,31 @@ class CustomerBot {
       t(
         `${st.customer}'s discount rules:\n${list}\n\nWhich one to change? Send its number — or "new" for a new rule.`,
         `${st.customer} ke discount rules:\n${list}\n\nKaunsa change karna hai? Number bhejiye — ya naye rule ke liye "naya".`,
+      ),
+    );
+  }
+
+  // A CHANGE TO A RULE THAT EXISTS, sent as soon as the new figure is known.
+  // There used to be one more "Send for approval?" first, and a customer who
+  // wrote anything else next — "Maruti part btao" — had it read as a no: the
+  // change was dropped and the Sales Head never heard of it (25 Sep, live).
+  // The Sales Head's OK is the check; this one only lost requests.
+  async sendDiscountChange(m, st, submit, reply, t) {
+    const r = st.rule;
+    const d = st.draft;
+    discountSetup.cancel(m.chatId);
+    const askedByCustomer = /^customer/.test(String(st.setBy || ''));
+    const req = await submit('change', {
+      ruleId: r.id,
+      oldValue: r.value,
+      oldName: r.name,
+      oldRule: { minQty: r.minQty, maxQty: r.maxQty, validFrom: r.validFrom, validTo: r.validTo },
+      customerPhone: askedByCustomer ? m.from : null,
+    });
+    return reply(
+      t(
+        `${r.name || d.target}: ${r.value}% → ${d.value}%. Sent to the Sales Head for approval (${req.id}); the discount changes on the portal once it is approved.`,
+        `${r.name || d.target}: ${r.value}% → ${d.value}%. Sales Head ko approval ke liye bhej diya (${req.id}); approve hote hi portal pe discount update ho jayega.`,
       ),
     );
   }
@@ -3104,37 +3134,25 @@ class CustomerBot {
         if (pct === null) return next('changePrice', t(`A price below the MRP (${money(d.mrp)}), in ₹.`, `MRP (${money(d.mrp)}) se kam price, ₹ mein.`));
         d.value = pct;
         d.minPrice = price;
-        return next(
-          'confirmChange',
-          t(
-            `${st.rule.name || d.target}: ${st.rule.value}% → ${pct}% (sells at ${money(price)} against MRP ${money(d.mrp)}). Send for approval?`,
-            `${st.rule.name || d.target}: ${st.rule.value}% → ${pct}% (${money(price)} mein, MRP ${money(d.mrp)}). Approval ke liye bhejun?`,
-          ),
-          [{ id: 'DSC_YES', title: t('Yes', 'Haan') }, { id: 'DSC_NO', title: t('No', 'Nahi') }],
-        );
+        return this.sendDiscountChange(m, st, submit, reply, t);
       }
       case 'changeValue': {
         const v = discountSetup.readNumber(said);
         if (v === null || v <= 0 || v >= 100) return next('changeValue', t('Send the discount as a percentage, like 12.', 'Discount % mein bhejiye, jaise 12.'));
         d.value = v;
-        return next(
-          'confirmChange',
-          t(`${st.rule.name || d.target}: ${st.rule.value}% → ${v}%. Send for approval?`, `${st.rule.name || d.target}: ${st.rule.value}% → ${v}%. Approval ke liye bhejun?`),
-          [{ id: 'DSC_YES', title: t('Yes', 'Haan') }, { id: 'DSC_NO', title: t('No', 'Nahi') }],
-        );
+        return this.sendDiscountChange(m, st, submit, reply, t);
       }
+      // Only a setup left open by the build before this one still stops here.
+      // A yes sends it and a no drops it; anything else — "Maruti part btao"
+      // — is not an answer, goes on to be answered, and the change waits.
+      // (25 Sep, live: that message was read as a no and the change died.)
       case 'confirmChange': {
-        discountSetup.cancel(m.chatId);
-        if (!discountSetup.YES.test(said) && m.buttonId !== 'DSC_YES') {
+        if (discountSetup.NO.test(said) || m.buttonId === 'DSC_NO') {
+          discountSetup.cancel(m.chatId);
           return reply(t('Not sent. Nothing was changed.', 'Theek hai, nahi bheja. Kuch change nahi hua.'));
         }
-        const req = await submit('change', { ruleId: st.rule.id, oldValue: st.rule.value, oldName: st.rule.name });
-        return reply(
-          t(
-            `Sent to the Sales Head for approval (${req.id}). The discount changes on the portal only once it is approved.`,
-            `Approval ke liye bhej diya (${req.id}). Approve hote hi portal pe discount update ho jayega.`,
-          ),
-        );
+        if (!discountSetup.YES.test(said) && m.buttonId !== 'DSC_YES') return null;
+        return this.sendDiscountChange(m, st, submit, reply, t);
       }
 
       // ---- a new rule ----
@@ -3236,6 +3254,9 @@ class CustomerBot {
           st.draft = {};
           return next('type', t('Again, then — brand-wise or part-wise?', 'Theek hai, dobara — Brand wise ya Part wise?'), this.discountTypeButtons(t));
         }
+        // Anything longer than a word or two is a message of its own, not an
+        // answer: it goes on, and the rule waits for its yes.
+        if (!discountSetup.YES.test(said) && m.buttonId !== 'DSC_YES' && said.split(/\s+/).length > 2) return null;
         if (!discountSetup.YES.test(said) && m.buttonId !== 'DSC_YES') {
           return next('confirm', t('Send this rule for approval? Yes or no.', 'Ye rule approval ke liye bhejun? Haan ya Nahi.'), [
             { id: 'DSC_YES', title: t('Yes', 'Haan') },
@@ -3259,6 +3280,10 @@ class CustomerBot {
           return next('type', t('Brand-wise or part-wise?', 'Brand wise ya Part wise?'), this.discountTypeButtons(t));
         }
         discountSetup.cancel(m.chatId);
+        // "Maruti ka right headlight chahiye" is not an answer to "another
+        // rule?" (25 Sep, live: it was swallowed and answered "Ho gaya — 1
+        // discount rule…"). The setup is over; the message goes on.
+        if (!finished && !discountSetup.NO.test(said)) return null;
         return reply(
           t(
             `Done — ${st.count} discount rule(s) sent to the Sales Head. Each is created on the portal once approved${st.accountRequestId ? ' and the account is open' : ''}.`,
@@ -3328,10 +3353,22 @@ class CustomerBot {
 
     if (req.type === 'change') {
       try {
-        const updated = await portal.updateDiscountRule(req.ruleId, {
-          discount_value: req.rule.value,
-          rule_name: discountSetup.ruleName(req.customer, req.rule.target, req.rule.value),
-        });
+        // THE SAME RULE, only its % changed — never a new rule. The rule as the
+        // portal has it now is sent back whole with the new value, so a PUT that
+        // treats a missing field as "clear it" cannot blank its brand, dates or
+        // limits.
+        const now = (await portal.listDiscountRules()).find((x) => String(x.rule_id || x.id) === String(req.ruleId));
+        if (!now) {
+          discountSetup.drop(req.id);
+          return reply(t(`Rule #${req.ruleId} is no longer on the portal — nothing was changed.`, `Rule #${req.ruleId} ab portal pe nahi hai — kuch change nahi kiya.`));
+        }
+        const keep = ['rule_type', 'part_no', 'brand', 'dealer_id', 'discount_mode', 'min_qty', 'max_qty', 'min_amount', 'max_amount', 'is_active', 'valid_from', 'valid_to', 'priority', 'rule_metadata'];
+        const body = {};
+        for (const k of keep) if (now[k] !== undefined) body[k] = now[k];
+        body.discount_value = req.rule.value;
+        body.rule_name = discountSetup.ruleName(req.customer, req.rule.target, req.rule.value);
+        body.rule_metadata = { ...(now.rule_metadata || {}), source: 'whatsapp-bot', requestId: req.id, changedFrom: req.oldValue, approvedBy: who };
+        const updated = await portal.updateDiscountRule(req.ruleId, body);
         if (updated && updated.approval_status && String(updated.approval_status).toUpperCase() !== 'APPROVED') {
           await portal.reviewDiscountRule(req.ruleId, 'approve').catch((e) => store.log(this.key, `rule ${req.ruleId} updated but left ${updated.approval_status}: ${String((e && e.message) || e).slice(0, 80)}`));
         }
@@ -3363,6 +3400,121 @@ class CustomerBot {
     store.log(this.key, `${req.id} approved by ${who} — created ${made.name}`);
     await tell(t(`✅ Discount rule approved and created: ${made.name}`, `✅ Discount rule approve ho gaya, portal pe ban gaya: ${made.name}`));
     return reply(t(`Done — ${made.name}.`, `Ho gaya — ${made.name}.`));
+  }
+
+  // ---- orders approved by the Sales Head ----
+  //
+  // While ORDER_CONFIRM_ENABLED is off, a customer's "yes" to their cart does
+  // not place it: the cart goes to the Sales Heads as "Order approval —
+  // ORD-…", and "OK ORD-…" places it on the dealer portal (core/orders.confirm
+  // with approvedBy). 25 Sep, live: the order was handed to a person as a
+  // question instead, he answered "Allow", nothing reached the portal, and the
+  // customer was told "Order place ho gaya".
+
+  // -> how many approvers it reached. The cart is taken out of the draft
+  // state while it waits, so what the customer adds next starts a new cart.
+  async requestOrderApproval(order) {
+    const inStock = (l) => l.source !== 'unidentified' && l.source !== 'unknown' && l.source !== 'unavailable' && (Number(l.available) || 0) > 0;
+    const pc = order.portalCustomer || {};
+    const phone = String(order.chatId || '').split('@')[0];
+    const rows = order.lines.map((l, i) => {
+      const got = Math.min(Number(l.qty) || 0, Number(l.available) || 0);
+      const stock = inStock(l) ? (got < l.qty ? `${got} in stock, rest on order` : 'in stock') : 'on order — not punched';
+      return `${i + 1}. ${l.partNo || l.item} × ${l.qty}${availability.priceOf(l)} — ${stock}`;
+    });
+    const punchable = order.lines.filter(inStock);
+    const total = punchable.reduce((s, l) => s + (Number(l.rate) || Number(l.mrp) || 0) * Math.min(Number(l.qty) || 0, Number(l.available) || 0), 0);
+    const text = [
+      `*Order approval* — ${order.id}`,
+      `Customer: ${pc.name || order.customer || phone}${phone ? ` (+${phone})` : ''}`,
+      '',
+      ...rows,
+      '',
+      punchable.length
+        ? `In-stock lines go to the portal: ₹${Math.round(total).toLocaleString('en-IN')} incl. GST.`
+        : 'Nothing in this cart is in stock — an OK will not place anything yet.',
+      `Reply *OK ${order.id}* to place it on the portal, or *NO ${order.id}* to reject.`,
+    ].join('\n');
+    const was = order.status;
+    order.status = 'approval';
+    order.approvalAskedAt = new Date().toISOString();
+    store.save();
+    const sent = await this.toApprovers(text);
+    if (!sent) {
+      order.status = was;
+      store.save();
+    }
+    store.log(this.key, `${order.id} sent to ${sent} approver(s) for approval`);
+    return sent;
+  }
+
+  // "OK ORD-12" / "NO ORD-12" from a Sales Head.
+  async decideOrder(m, decision, reply, t) {
+    const order = store.orders().find((o) => String(o.id).toUpperCase() === decision.requestId);
+    if (!order) return reply(t(`${decision.requestId} not found.`, `${decision.requestId} nahi mila.`));
+    if (order.status === 'confirmed') return reply(t(`${order.id} is already placed — portal order ${order.soNumber}.`, `${order.id} pehle hi place ho chuka hai — portal order ${order.soNumber}.`));
+    if (order.status !== 'approval') return reply(t(`${order.id} is not waiting for approval (${order.status}).`, `${order.id} approval ke liye nahi ruka hai (${order.status}).`));
+    const who = customerCreate.approverName(m.from);
+    const ct = lang.for(order.chatId);
+    const tell = async (text) => {
+      try {
+        const id = await this.transport.sendToChat(order.chatId, text);
+        this.recordOutgoing(order.chatId, id, text);
+      } catch (e) {
+        store.log(this.key, `${order.id}: could not tell the customer: ${String((e && e.message) || e).slice(0, 80)}`);
+      }
+    };
+
+    if (!decision.yes) {
+      order.status = 'rejected';
+      order.rejectedBy = who;
+      store.save();
+      store.log(this.key, `${order.id} rejected by ${who}`);
+      await tell(ct(`Your order ${order.id} was not approved. Please call us if you want to talk about it.`, `Aapka order ${order.id} approve nahi hua. Baat karni ho to humein call kijiye.`));
+      return reply(t(`Rejected ${order.id}. The customer was told.`, `${order.id} reject kar diya. Customer ko bata diya.`));
+    }
+
+    let res;
+    try {
+      res = await orders.confirm(order, { approvedBy: who });
+    } catch (e) {
+      const full = String((e && e.message) || e);
+      store.log(this.key, `${order.id} approved by ${who} but the portal refused it: ${full.slice(0, 600)}`);
+      // 25 Sep: MIYA JI MOTORS's order came back 409 "Customer credit control
+      // blocked order confirmation" — a credit limit or overdue bills. That
+      // is for the Sales Head to clear on the portal, so it is named as such.
+      if (/credit control/i.test(full)) {
+        const cc = (full.match(/"credit_control":\s*(\{[\s\S]*?\})\s*\}/) || [])[1] || '';
+        const reason = (cc.match(/"(?:reason|message)":\s*"([^"]+)"/) || [])[1] || '';
+        return reply(
+          t(
+            `The portal blocked ${order.id}: this customer is on *credit control*${reason ? ` (${reason})` : ''} — credit limit or overdue bills. Nothing was placed. Clear it on the portal, then send *OK ${order.id}* again.`,
+            `Portal ne ${order.id} rok diya: customer *credit control* pe hai${reason ? ` (${reason})` : ''} — credit limit ya overdue. Kuch place nahi hua. Portal pe clear karke dobara *OK ${order.id}* bhejiye.`,
+          ),
+        );
+      }
+      const why = full.slice(0, 300);
+      return reply(t(`The portal did not take it: ${why}\nNothing was placed — send *OK ${order.id}* again to retry.`, `Portal ne nahi liya: ${why}\nKuch place nahi hua — dobara *OK ${order.id}* bhejiye.`));
+    }
+    if (res && res.busy) return reply(t(`${order.id} is being placed right now.`, `${order.id} abhi place ho raha hai.`));
+    if (res && res.nothingInStock) {
+      store.log(this.key, `${order.id} approved by ${who} — nothing in stock, nothing placed`);
+      return reply(t(`Nothing in ${order.id} is in stock now, so nothing was placed on the portal. It stays waiting — *OK ${order.id}* again once stock is in.`, `${order.id} mein abhi kuch stock mein nahi hai, isliye portal pe kuch place nahi hua. Stock aane pe dobara *OK ${order.id}* bhejiye.`));
+    }
+
+    order.approvedBy = who;
+    store.save();
+    const so = (res.placed || []).map((p) => p.soNumber).filter(Boolean).join(', ') || res.soNumber;
+    const punched = (res.punchedLines || []).map((l) => `${l.partNo} × ${l.qty}`).join('\n');
+    const later = [...(res.skipped || []).map((l) => l.partNo || l.item), ...(res.short || []).map((l) => `${l.partNo} (${l.asked - l.punched} more)`)];
+    store.log(this.key, `${order.id} approved by ${who} — placed on the portal as ${so}`);
+    await tell(
+      ct(
+        `✅ Your order is placed — order no. ${so}.\n${punched}${later.length ? `\n\nOn order, not in this one yet: ${later.join(', ')}` : ''}`,
+        `✅ Aapka order place ho gaya — order no. ${so}.\n${punched}${later.length ? `\n\nYe abhi order pe hain, is order mein nahi: ${later.join(', ')}` : ''}`,
+      ),
+    );
+    return reply(t(`Placed — ${order.id} is portal order ${so}.\n${punched}`, `Place ho gaya — ${order.id} portal order ${so} hai.\n${punched}`));
   }
 
   whereWeAre(m, t, { unclear = false } = {}) {

@@ -560,6 +560,62 @@ function invalidPartsFrom(err) {
   return details.map((d) => String(d.part_no || '')).filter(Boolean);
 }
 
+// THE CUSTOMER'S DISCOUNT, on the price. commercial-analyze answers at MRP
+// with discount_percent 0 even where the customer has an approved rule
+// (core/discountSetup.ruleFor says which rule counts). The row is rewritten
+// the way the portal writes a discounted one — discount_percent, the price
+// after it, and the same on every allocation — so the quote, the cart and the
+// order the portal is sent (buildConfirmRequest echoes the row) all carry it.
+// MRP includes GST (18% on these rows), so the discounted price does too.
+const RULES_TTL_MS = 5 * 60 * 1000;
+let rulesCache = { at: 0, rows: null };
+async function discountRules() {
+  if (rulesCache.rows && Date.now() - rulesCache.at < RULES_TTL_MS) return rulesCache.rows;
+  const rows = await module.exports.listDiscountRules();
+  rulesCache = { at: Date.now(), rows };
+  return rows;
+}
+function forgetDiscountRules() {
+  rulesCache = { at: 0, rows: null };
+}
+async function withDiscountRules(rows, accountId, lines) {
+  let rules;
+  try {
+    rules = await discountRules();
+  } catch (e) {
+    store.log('portal', 'discount rules could not be read — prices left as the portal gave them: ' + String((e && e.message) || e).slice(0, 80));
+    return rows;
+  }
+  const { ruleFor } = require('../core/discountSetup');
+  const round2 = (v) => Math.round(v * 100) / 100;
+  for (const row of rows) {
+    const mrp = Number(row.mrp);
+    if (!(mrp > 0) || Number(row.discount_percent) > 0) continue; // the portal already priced it
+    const line = (lines || []).find((l) => norm(l.partNo || l.item) === norm(row.part_no));
+    const rule = ruleFor(rules, { dealerId: accountId, partNo: row.part_no, brand: row.brand, qty: Number(row.requested_qty) || (line && Number(line.qty)) || 1 });
+    if (!rule) continue;
+    const pct = Number(rule.discount_value);
+    const price = round2(mrp * (1 - pct / 100));
+    row.discount_percent = pct;
+    row.discount_amount = round2(mrp - price);
+    row.price = price;
+    row.discount_rule = { id: rule.rule_id || rule.id || null, name: rule.rule_name || null };
+    const qty = Number(row.requested_qty) || 1;
+    if (row.requested_billing_amount != null) row.requested_billing_amount = round2(price * qty);
+    if (row.available_billing_amount != null) {
+      const got = (row.allocations || []).reduce((s, a) => s + (Number(a.qty) || 0), 0);
+      row.available_billing_amount = round2(price * got);
+    }
+    for (const a of row.allocations || []) {
+      const am = Number(a.mrp) || mrp;
+      a.discount_percent = pct;
+      a.price = round2(am * (1 - pct / 100));
+      a.discount_amount = round2(am - a.price);
+    }
+  }
+  return rows;
+}
+
 // VERIFIED against the live OpenAPI spec:
 //   POST /api/v1/purchase-orders/confirm
 //   required: user_id (int), lines[]
@@ -950,6 +1006,7 @@ module.exports = {
       return rule;
     }
     const data = await api('POST', '/discount-rules/', body, true, 'admin');
+    forgetDiscountRules();
     store.log('portal', `discount rule created: "${body.rule_name || ''}" (${body.rule_type}, ${body.discount_value}${body.discount_mode === 'percent' ? '%' : ''})`);
     return data;
   },
@@ -962,6 +1019,7 @@ module.exports = {
       return r;
     }
     const data = await api('PUT', '/discount-rules/' + encodeURIComponent(ruleId), body, true, 'admin');
+    forgetDiscountRules();
     store.log('portal', `discount rule ${ruleId} updated: ${JSON.stringify(body).slice(0, 120)}`);
     return data;
   },
@@ -1562,6 +1620,7 @@ module.exports = {
     const data = await api('POST', '/PUSH_ORDER/commercial-analyze', body);
     const rows = Array.isArray(data) ? data : (data && (data.items || data.data || data.results)) || [];
     if (!rows.length) return null;
+    await withDiscountRules(rows, accountId, lines);
 
     // Matched by part number, never by position: a reordered reply must not
     // hand one customer's line another line's price.
@@ -1620,6 +1679,7 @@ module.exports = {
       out.rate = numOrNull(row.price);
       out.mrp = numOrNull(row.mrp);
       out.discountPercent = numOrNull(row.discount_percent);
+      out.discountRule = row.discount_rule ? row.discount_rule.name : null;
       out.taxPercent = numOrNull(row.tax_percent);
       out.hsn = row.hsn_code || null;
       out.partName = row.part_name || null;

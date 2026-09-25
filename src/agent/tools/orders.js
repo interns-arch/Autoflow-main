@@ -137,7 +137,29 @@ const confirmOrder = tool(
     }
 
     if (res && res.busy) return JSON.stringify({ placed: false, why: 'this order is already being placed — say nothing further about it' });
-    if (res && res.blocked) return JSON.stringify({ placed: false, why: 'order placing is switched off right now', askAPerson: true });
+    // Placing is switched off: the order goes to the Sales Head, and his
+    // "OK ORD-…" places it on the portal (customerBot.decideOrder). 25 Sep,
+    // live: this used to be handed to a person as a question, he answered
+    // "Allow", nothing was placed, and the customer was told it had been.
+    if (res && res.blocked) {
+      const bot = config && config.configurable && config.configurable.bot;
+      const sent = bot && bot.requestOrderApproval ? await bot.requestOrderApproval(order).catch(() => 0) : 0;
+      if (!sent) return JSON.stringify({ placed: false, why: 'the order could not be sent for approval', askAPerson: true });
+      return JSON.stringify({
+        placed: false,
+        sentForApproval: true,
+        requestId: order.id,
+        why: 'orders are placed once the Sales Head approves them. It has gone to him; the customer will get the portal order number when he does. Say exactly that — it is NOT placed yet.',
+      });
+    }
+    // Nothing in the cart is in stock, and only stock is punched (founder,
+    // 14 Sep). No order exists: never let this read as placed.
+    if (res && res.nothingInStock) {
+      return JSON.stringify({
+        placed: false,
+        why: 'nothing in the cart is in stock, so no order was placed on the portal. They are on order; say when they can come, and ask_a_person if they want them ordered anyway',
+      });
+    }
     // Quantities moved between the quote and the yes. NOTHING was ordered.
     if (res && res.stale) {
       return JSON.stringify({

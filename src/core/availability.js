@@ -387,7 +387,14 @@ function priceOf(line) {
   const rate = Number(line.rate);
   const mrp = Number(line.mrp);
   if (line.pricedForCustomer && Number.isFinite(rate) && rate > 0) {
-    return Number.isFinite(mrp) && mrp > rate ? ` — ${money(rate)} (MRP ${money(mrp)})` : ` — ${money(rate)}`;
+    // Their approved discount, shown as what it is: MRP, the % off, and the
+    // price after it — GST included, as MRP includes it.
+    const pct = Number(line.discountPercent);
+    const gst = Number(line.taxPercent) > 0 ? `, incl. ${Number(line.taxPercent)}% GST` : '';
+    if (Number.isFinite(mrp) && mrp > rate) {
+      return pct > 0 ? ` — ${money(rate)} (MRP ${money(mrp)} - ${pct}% discount${gst})` : ` — ${money(rate)} (MRP ${money(mrp)})`;
+    }
+    return ` — ${money(rate)}`;
   }
   if (Number.isFinite(mrp) && mrp > 0) return ` — MRP ${money(mrp)}`;
   return '';

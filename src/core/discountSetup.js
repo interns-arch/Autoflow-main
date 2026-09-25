@@ -107,6 +107,47 @@ function toPortal(r, dealerId, customerName, from = new Date()) {
   };
 }
 
+// ---- the rule that prices a line ----
+//
+// The portal's commercial-analyze answers every line at MRP with
+// discount_percent 0 — 25 Sep, live: MIYA JI MOTORS had an approved MARUTI
+// 10% rule and a MARUTI headlight came back at ₹21,310, and dealer 1002's
+// APPROVED MARUTI 12% was not applied either. So the rule is applied here.
+//
+// A rule counts when it is APPROVED on the portal, or when WE made it
+// (rule_metadata.source 'whatsapp-bot'): the bot only ever creates a rule
+// after a Sales Head said "OK DSC-…", and the portal keeps those PENDING
+// because only a Super Admin may review there.
+//
+// Most specific wins: a rule for this part, then for its brand, then one for
+// every part; between two of the same kind, the bigger discount.
+const counts = (r) =>
+  r &&
+  r.is_active !== false &&
+  String(r.discount_mode || 'PERCENT').toUpperCase() === 'PERCENT' &&
+  (String(r.approval_status || '').toUpperCase() === 'APPROVED' || (r.rule_metadata && r.rule_metadata.source === 'whatsapp-bot'));
+
+function ruleFor(rules, { dealerId, partNo, brand, qty = 1, now = new Date() } = {}) {
+  const norm = (s) => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const t = new Date(now).getTime();
+  const inDate = (r) => (!r.valid_from || new Date(r.valid_from).getTime() <= t) && (!r.valid_to || new Date(r.valid_to).getTime() >= t);
+  const inQty = (r) => (!r.min_qty || qty >= Number(r.min_qty)) && (!r.max_qty || qty <= Number(r.max_qty));
+  const kind = (r) => {
+    const type = String(r.rule_type || '').toUpperCase();
+    if (type === 'ITEM') return r.part_no && norm(r.part_no) === norm(partNo) ? 3 : 0;
+    if (type === 'BRAND') return r.brand && brand && norm(r.brand) === norm(brand) ? 2 : 0;
+    return !r.part_no && !r.brand ? 1 : 0; // every part for this customer
+  };
+  let best = null;
+  for (const r of rules || []) {
+    if (Number(r.dealer_id) !== Number(dealerId) || !counts(r) || !inDate(r) || !inQty(r)) continue;
+    const k = kind(r);
+    if (!k || !(Number(r.discount_value) > 0)) continue;
+    if (!best || k > best.k || (k === best.k && Number(r.discount_value) > Number(best.r.discount_value))) best = { r, k };
+  }
+  return best ? best.r : null;
+}
+
 // ---- approval ----
 // Every rule - a new one, or a change to one that exists - goes to the Sales
 // Head first (founder, 22 Sep), and the portal is only touched after "OK DSC-…".
@@ -152,10 +193,8 @@ function approvalText(req) {
   const money2 = r.mrp
     ? `\nMRP ${money(r.mrp)} → sells at ${money(priceAt(r.mrp, r.value))} (${r.value}% off, ${money(round2(r.mrp - priceAt(r.mrp, r.value)))} per piece)`
     : '';
-  const head =
-    req.type === 'change'
-      ? `*Discount change* — ${req.id}\nCustomer: ${req.customer}\nRule: ${req.oldName || '#' + req.ruleId}\n${target}\nNow ${req.oldValue}% → asked ${r.value}%`
-      : `*Discount rule* — ${req.id}\nCustomer: ${req.customer}${req.accountRequestId ? ` (new account ${req.accountRequestId})` : ''}\n${target} — ${r.value}%`;
+  if (req.type === 'change') return changeText(req);
+  const head = `*Discount rule* — ${req.id}\nCustomer: ${req.customer}${req.accountRequestId ? ` (new account ${req.accountRequestId})` : ''}\n${target} — ${r.value}%`;
   const limits = [
     r.minQty ? `Min qty ${r.minQty}` : null,
     r.maxQty ? `Max qty ${r.maxQty}` : null,
@@ -174,6 +213,40 @@ function approvalText(req) {
 
 // ASKING FOR A DISCOUNT TO BE SET UP.
 //
+// A CHANGE, written so the Sales Head can decide from this message alone:
+// who, which rule, what it is now, what they want instead, what that does to
+// a price, and that saying OK changes only the % on the rule that exists.
+function changeText(req) {
+  const r = req.rule;
+  const o = req.oldRule || {};
+  const phone = req.customerPhone ? ` (+${String(req.customerPhone).replace(/^\+/, '')})` : '';
+  const what = r.kind === 'brand' ? `Brand ${r.target}` : r.kind === 'part' ? `Part ${r.target}` : 'All parts';
+  const delta = round2(r.value - req.oldValue);
+  const date = (v) => (v ? new Date(v).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }) : null);
+  const limits = [
+    o.minQty ? `Min qty ${o.minQty}` : null,
+    o.maxQty ? `Max qty ${o.maxQty}` : null,
+    o.validTo ? `valid till ${date(o.validTo)}` : 'no end date',
+  ].filter(Boolean);
+  const lines = [
+    `*Discount change* — ${req.id}`,
+    `Customer: ${req.customer}${phone}`,
+    `Rule: ${req.oldName || '#' + req.ruleId}${req.ruleId ? ` (#${req.ruleId})` : ''}`,
+    `On: ${what}`,
+    `Current discount: *${req.oldValue}%*`,
+    `Customer wants: *${r.value}%* (${delta > 0 ? '+' : ''}${delta}%)`,
+    r.mrp
+      ? `MRP ${money(r.mrp)}: now ${money(priceAt(r.mrp, req.oldValue))} → would be ${money(priceAt(r.mrp, r.value))}`
+      : `On MRP ₹1,000: now ${money(priceAt(1000, req.oldValue))} → would be ${money(priceAt(1000, r.value))}`,
+    `Rule stays: ${limits.join(' · ')}`,
+    `Asked by: ${req.by || 'customer'}`,
+    '',
+    `OK changes only the % on this rule — no new rule is made.`,
+    `Reply *OK ${req.id}* to approve, or *NO ${req.id}* to reject.`,
+  ];
+  return lines.join('\n');
+}
+
 // "discount change karna hai", "mera discount badhao", "Kalra ka discount
 // update", "mera discount setup kardo".
 //
@@ -218,5 +291,5 @@ const CHANGE_RE = WANTS_RE;
 
 module.exports = {
   open, get, pending, save, cancel, STEPS, SKIP, LATER, YES, NO, readNumber, readDuration, ruleName, describe, toPortal,
-  requests, file, find, drop, forAccount, approvalText, pctFromPrice, priceAt, money, CHANGE_RE, wantsSetup,
+  requests, file, find, drop, forAccount, approvalText, pctFromPrice, priceAt, money, CHANGE_RE, wantsSetup, ruleFor,
 };

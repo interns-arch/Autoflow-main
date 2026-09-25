@@ -271,7 +271,11 @@ function summary(order) {
 // because both calls read it before either writes.
 const inFlight = new Set();
 
-async function confirm(order) {
+// `opts.approvedBy`: a Sales Head said "OK ORD-…" to this order. That is the
+// one thing that places it while ORDER_CONFIRM_ENABLED is off — the switch
+// stays off for everything else — and it is placed as it stands now: stock is
+// re-read and whatever is there is punched, without asking the customer again.
+async function confirm(order, opts = {}) {
   if (!order.lines.length) throw new Error('nothing to confirm');
 
   // Already being punched by another message this second.
@@ -281,7 +285,7 @@ async function confirm(order) {
   }
   inFlight.add(order.id);
   try {
-    return await punch(order);
+    return await punch(order, opts);
   } finally {
     inFlight.delete(order.id);
   }
@@ -289,14 +293,14 @@ async function confirm(order) {
 
 // The punch itself. Only ever called through confirm() above, which holds
 // the lock for the whole of it.
-async function punch(order) {
+async function punch(order, opts = {}) {
 
   const config = require('../config');
 
   // Refused BEFORE the portal is touched, so no stray "yes" during testing can
   // create an order a person then has to cancel by hand. Checked here rather
   // than at the call site because this is the only door to the confirm API.
-  if (!config.dealerPortal.confirmEnabled) {
+  if (!config.dealerPortal.confirmEnabled && !opts.approvedBy) {
     store.log('orders', `${order.id} confirm BLOCKED — ORDER_CONFIRM_ENABLED is not true (testing mode)`);
     return { blocked: true, lines: order.lines.length };
   }
@@ -304,7 +308,7 @@ async function punch(order) {
   const ageMin = (Date.now() - quotedAt) / 60000;
 
   // Too old to be worth refreshing — the intent is gone, not just the numbers.
-  if (ageMin > config.dealerPortal.quoteMaxAgeHours * 60) {
+  if (!opts.approvedBy && ageMin > config.dealerPortal.quoteMaxAgeHours * 60) {
     order.status = 'expired';
     store.save();
     return { stale: true, expired: true };
@@ -330,7 +334,7 @@ async function punch(order) {
 
   // Only interrupt when the change actually matters to the customer, or when
   // the quote had gone stale on time anyway.
-  if (moved.length && ageMin > config.dealerPortal.quoteTtlMinutes) {
+  if (!opts.approvedBy && moved.length && ageMin > config.dealerPortal.quoteTtlMinutes) {
     store.log('orders', `${order.id} confirm: stock moved since the quote — asking again`);
     return { stale: true, moved, ageMin: Math.round(ageMin) };
   }

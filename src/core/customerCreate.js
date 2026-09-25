@@ -982,7 +982,7 @@ function summary(form, t) {
 function readDecision(text) {
   // Stripped of WhatsApp markup FIRST — the bot asks for the format in bold,
   // and copying bold text brings the asterisks back with it. See core/waText.
-  const m = require('./waText').unformat(text).match(/^(ok|yes|haan|approve|no|nahi|reject)\s+((?:WA|DSC)-[A-Z0-9]+)$/i);
+  const m = require('./waText').unformat(text).match(/^(ok|yes|haan|approve|no|nahi|reject)\s+((?:WA|DSC|ORD)-[A-Z0-9]+)$/i);
   if (!m) return null;
   return { yes: /^(ok|yes|haan|approve)$/i.test(m[1]), requestId: m[2].toUpperCase() };
 }
