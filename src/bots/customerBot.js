@@ -548,8 +548,34 @@ class CustomerBot {
       // hai" swiped onto the summary was answered "koi order pending nahi
       // hai", and the customer was never told.
       if (customerCreate.isApprover(m.from)) {
+        // A BARE "ok" / "haan" / "no" (26 Sep, live: Shad's "ok'" on
+        // DSC-OCDJ got "koi order pending nahi hai"). Swiped onto a request,
+        // it decides that one; typed on its own, it decides the request only
+        // when exactly one is open - with several, it asks which.
+        const bare = customerCreate.readBareDecision(text);
+        if (bare) {
+          const swiped = m.contextId && customerCreate.requestForMessage(m.contextId);
+          const open = this.openApprovals();
+          const pick = swiped && open.includes(swiped) ? [swiped] : open;
+          if (pick.length === 1) {
+            store.log(this.key, `"${text}" from ${m.from}: the only open request is ${pick[0]} - taken as ${bare.yes ? 'OK' : 'NO'}`);
+            const d = { yes: bare.yes, requestId: pick[0] };
+            if (/^DSC-/.test(d.requestId)) return this.decideDiscount(m, d, reply, t);
+            if (/^ORD-/.test(d.requestId)) return this.decideOrder(m, d, reply, t);
+            return this.decideNewCustomer(m, d, reply, t);
+          }
+          if (pick.length > 1) {
+            const w = bare.yes ? 'OK' : 'NO';
+            return reply(
+              t(
+                `${pick.length} requests are waiting — which one? Reply with its number:\n${pick.map((id) => `*${w} ${id}*`).join('\n')}`,
+                `${pick.length} request pending hain — kaunsa? Number ke saath bhejiye:\n${pick.map((id) => `*${w} ${id}*`).join('\n')}`,
+              ),
+            );
+          }
+        }
         const rid = (m.contextId && customerCreate.requestForMessage(m.contextId)) || customerCreate.requestIdIn(text);
-        if (rid) return this.noteOnNewCustomer(m, rid, text, reply, t);
+        if (rid && /^WA-/.test(rid)) return this.noteOnNewCustomer(m, rid, text, reply, t);
       }
     }
 
@@ -3110,6 +3136,28 @@ class CustomerBot {
     ];
   }
 
+  // Every request waiting on a Sales Head: accounts, discounts, orders.
+  // Only the last three days: one left unanswered last week must not make
+  // every bare "ok" ambiguous.
+  openApprovals(now = Date.now()) {
+    const fresh = (at) => {
+      const ms = typeof at === 'number' ? at : Date.parse(at || '');
+      return Number.isFinite(ms) && now - ms < 3 * 86400000;
+    };
+    const ids = [];
+    for (const id of customerCreate.parkedIds()) {
+      const p = customerCreate.parked(id);
+      if (p && fresh(p.at)) ids.push(String(id).toUpperCase());
+    }
+    for (const [id, r] of discountSetup.requests) {
+      if (!r || r.status === 'approved' || r.status === 'rejected' || !fresh(r.at)) continue;
+      if (r.accountRequestId && customerCreate.parked(r.accountRequestId)) continue; // not sent yet: waits on its account
+      ids.push(String(id).toUpperCase());
+    }
+    for (const o of store.orders()) if (o.status === 'approval' && fresh(o.approvalAskedAt)) ids.push(String(o.id).toUpperCase());
+    return [...new Set(ids)];
+  }
+
   // track = { ref, requesterChat }: an approval request, watched for delivery
   // (core/deliveryWatch) - the one who asked hears if a Sales Head never got it.
   async toApprovers(text, track = null) {
@@ -3120,6 +3168,8 @@ class CustomerBot {
         await escalation.ensureWindow(this.transport, phone, 'Discount approval coming — details follow');
         const id = await this.transport.sendText(phone, text);
         if (track) deliveryWatch.track(id, { ...track, to: phone });
+        // A swipe-reply onto it names this request (customerCreate.requestForMessage).
+        if (track && track.ref) customerCreate.noteSummary(id, track.ref);
         sent++;
       } catch (e) {
         store.log(this.key, `could not reach approver ${phone}: ${String((e && e.message) || e).slice(0, 90)}`);

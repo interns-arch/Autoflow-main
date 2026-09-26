@@ -5983,10 +5983,22 @@ async function main() {
         await dw72._flushAll(customer);
         const toAgent72 = customer.transport.outbox.filter((o) => /919000000721/.test(o.to || '')).map((o) => o.text);
         const toPrateek72 = customer.transport.outbox.filter((o) => o.to === '919999492550').map((o) => o.text);
-        check('the agent who asked gets ONE warning naming both who did not get it', toAgent72.length === 1 && /DSC-T72/.test(toAgent72[0]) && /Shad/.test(toAgent72[0]) && /Arun Sir/.test(toAgent72[0]), JSON.stringify(toAgent72));
-        check('...with the reason and the fix: Meta billing, and "Hi" for the 24h window', /currency|payment method/i.test(toAgent72[0] || '') && /Hi/.test(toAgent72[0] || ''), toAgent72[0]);
-        check('the Sales Head whose copy went through is told too', toPrateek72.length === 1 && /DSC-T72/.test(toPrateek72[0]), JSON.stringify(toPrateek72));
+        check('the agent who asked gets ONE note naming both who did not get it', toAgent72.length === 1 && /DSC-T72/.test(toAgent72[0]) && /Shad/.test(toAgent72[0]) && /Arun Sir/.test(toAgent72[0]), JSON.stringify(toAgent72));
+        check('...saying Prateek sir got it and can approve it - nothing to do', /Prateek Sir/.test(toAgent72[0] || '') && /approve/i.test(toAgent72[0] || '') && /nothing to do|kuch karne ki zaroorat nahi/i.test(toAgent72[0] || ''), toAgent72[0]);
+        check('...with the reason: Meta billing, and "Hi" for the 24h window', /currency|payment method/i.test(toAgent72[0] || '') && /Hi/.test(toAgent72[0] || ''), toAgent72[0]);
+        check('the Sales Head who got it is not bothered with it', toPrateek72.length === 0, JSON.stringify(toPrateek72));
         check('...and nothing is sent to the ones it could not reach', !customer.transport.outbox.some((o) => o.to === '916388059016' || o.to === '919773900582'));
+
+        // It reached NOBODY: that is the alarm.
+        dw72._reset();
+        customer.transport.outbox.length = 0;
+        await customer.toApprovers('*Discount rule* — DSC-U72', { ref: 'DSC-U72', requesterChat: 'sim-919000000721' });
+        const idsU72 = Object.fromEntries(customer.transport.outbox.filter((o) => /DSC-U72/.test(o.text)).map((o) => [o.to, o.id]));
+        customer.transport.outbox.length = 0;
+        for (const [to, id] of Object.entries(idsU72)) await customer.transport.injectFailure({ id, to, code: 131047, why: 'Re-engagement message' });
+        await dw72._flushAll(customer);
+        const alarm72 = customer.transport.outbox.filter((o) => /919000000721/.test(o.to || '')).map((o) => o.text).join('\n');
+        check('when no Sales Head got it, the agent is warned it must be sent again', /⚠️/.test(alarm72) && /dobara|sent again/i.test(alarm72), alarm72);
         customer.transport.outbox.length = 0;
         await customer.transport.injectFailure({ id: 'wamid.unrelated', to: '919000000999', code: 131047, why: '' });
         await dw72._flushAll(customer);
@@ -5994,6 +6006,54 @@ async function main() {
       } finally {
         cr72.approvers = apprWas72;
         dw72._reset();
+      }
+
+      // 26 Sep, live: Shad answered DSC-OCDJ with just "ok'" and was told
+      // "koi order pending nahi hai"; the discount sat there.
+      console.log('\n[73] a Sales Head\'s bare "ok" decides the one request open');
+      const cr73 = require('../src/config').creation;
+      const apprWas73 = cr73.approvers;
+      cr73.approvers = { 916388059016: 'Shad' };
+      const d73 = orders.getOrCreateDraft('sim-919000000731', '919000000731');
+      orders.addLines(d73, [{ item: 'AA-1', partNo: 'AA-1', qty: 1, source: 'portal', available: 5, mrp: 100 }]);
+      d73.portalCustomer = { buyerId: 345, name: 'Bare OK Motors' };
+      d73.status = 'approval';
+      d73.approvalAskedAt = new Date().toISOString();
+      const old73 = orders.getOrCreateDraft('sim-919000000732', '919000000732');
+      old73.status = 'approval';
+      old73.approvalAskedAt = new Date(Date.now() - 5 * 86400000).toISOString();
+      const openWas73 = customer.openApprovals;
+      const opWas73 = customer.isOperator;
+      const confWas73 = orders.confirm;
+      customer.isOperator = realIsOperator;
+      try {
+        const open73 = customer.openApprovals();
+        check('open requests: a fresh order waiting is one', open73.includes(d73.id), JSON.stringify(open73));
+        check('...one left unanswered five days ago is not', !open73.includes(old73.id));
+        customer.openApprovals = () => [d73.id];
+        let punched73 = 0;
+        orders.confirm = async () => {
+          punched73++;
+          return { soNumber: 'SO-73', placed: [{ soNumber: 'SO-73' }], punchedLines: [{ partNo: 'AA-1', qty: 1 }], skipped: [], short: [] };
+        };
+        customer.transport.outbox.length = 0;
+        await customer.transport.injectIncoming({ id: 'wamid.s73', from: '916388059016', chatId: '916388059016@cloud', isGroup: false, body: "ok'", hasMedia: false, mediaType: 'chat' });
+        const said73 = customer.transport.outbox.filter((o) => /6388059016/.test(o.to || '')).map((o) => o.text).join('\n');
+        check('"ok\'" with one request open approves it', punched73 === 1 && /SO-73/.test(said73), said73);
+        check('...and is never answered "no order pending"', !/pending nahi|no order/i.test(said73), said73);
+
+        customer.openApprovals = () => ['DSC-AAAA', 'ORD-9999'];
+        customer.transport.outbox.length = 0;
+        await customer.transport.injectIncoming({ id: 'wamid.s73b', from: '916388059016', chatId: '916388059016@cloud', isGroup: false, body: 'ok', hasMedia: false, mediaType: 'chat' });
+        const ask73 = customer.transport.outbox.filter((o) => /6388059016/.test(o.to || '')).map((o) => o.text).join('\n');
+        check('with two open, a bare "ok" decides nothing and asks which', punched73 === 1 && /OK DSC-AAAA/.test(ask73) && /OK ORD-9999/.test(ask73), ask73);
+      } finally {
+        customer.openApprovals = openWas73;
+        customer.isOperator = opWas73;
+        orders.confirm = confWas73;
+        cr73.approvers = apprWas73;
+        orders.cancel(d73);
+        orders.cancel(old73);
       }
     } finally {
       config.salesTeamNumbers.splice(config.salesTeamNumbers.indexOf(S71), 1);

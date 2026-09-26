@@ -79,7 +79,10 @@ function recipientsOf(ref) {
   return out;
 }
 
-function warningText(ref, failed, t) {
+// `reached`: who did get it. When somebody did, one Sales Head's OK is all
+// it needs (founder, 26 Sep: "if arun sir did not send hi then it send other
+// approver and take approval") - so it is a note, not an alarm.
+function warningText(ref, failed, t, reached = []) {
   const rows = [...failed].map((p) => {
     const reasons = [];
     for (const f of recent.get(p) || []) {
@@ -88,6 +91,13 @@ function warningText(ref, failed, t) {
     }
     return `• ${nameOf(p)} (+${p})${reasons.length ? ' — ' + reasons.join('; ') : ''}`;
   });
+  if (reached.length) {
+    const got = reached.map(nameOf).join(', ');
+    return t(
+      `ℹ️ ${ref} reached ${got} — ${reached.length === 1 ? 'they can' : 'any one of them can'} approve it, nothing to do.\nNot delivered to:\n${rows.join('\n')}`,
+      `ℹ️ ${ref} ${got} tak pahunch gaya — ${reached.length === 1 ? 'wo' : 'inme se koi bhi'} approve kar sakte hain, kuch karne ki zaroorat nahi.\nInko nahi gaya:\n${rows.join('\n')}`,
+    );
+  }
   return t(
     `⚠️ *${ref} did not reach ${failed.size === 1 ? 'one approver' : failed.size + ' approvers'}* — WhatsApp refused it:\n${rows.join('\n')}\n\nOnce fixed, the request needs to be sent again.`,
     `⚠️ *${ref} ${failed.size === 1 ? 'ek approver' : failed.size + ' approvers'} tak nahi pahuncha* — WhatsApp ne rok diya:\n${rows.join('\n')}\n\nTheek hone ke baad request dobara bhejni padegi.`,
@@ -103,19 +113,17 @@ async function flush(bot, ref) {
   const reached = [...sentTo].filter((p) => !b.failed.has(p));
   store.log('delivery', `${ref}: not delivered to ${[...b.failed].join(', ')}; warning ${b.requesterChat || '-'} and ${reached.join(', ') || 'nobody else'}`);
   const targets = [];
-  if (b.requesterChat && !b.failed.has(norm(String(b.requesterChat).split('@')[0]))) targets.push(b.requesterChat);
-  for (const p of reached) {
-    if (b.requesterChat && norm(String(b.requesterChat).split('@')[0]) === p) continue;
-    targets.push(p);
-  }
-  // Nobody who asked and no one else it reached (a payment to the
-  // accountant): the Sales Heads hear.
-  if (!targets.length) for (const p of Object.keys(config.creation.approvers || {})) if (!b.failed.has(norm(p))) targets.push(norm(p));
+  const requester = b.requesterChat && !b.failed.has(norm(String(b.requesterChat).split('@')[0])) ? b.requesterChat : null;
+  if (requester) targets.push(requester);
+  // It reached somebody who can decide it: only the one who asked gets a
+  // note. It reached nobody: the Sales Heads it did not fail for are told
+  // too (a payment the accountant never got, say).
+  if (!reached.length) for (const p of Object.keys(config.creation.approvers || {})) if (!b.failed.has(norm(p)) && !targets.includes(norm(p))) targets.push(norm(p));
   for (const to of targets) {
     try {
       const chat = String(to).includes('@') ? to : null;
       const t = lang.for(chat || to + '@cloud');
-      const text = warningText(ref, b.failed, t);
+      const text = warningText(ref, b.failed, t, reached);
       if (chat) {
         const id = await bot.transport.sendToChat(chat, text);
         if (bot.recordOutgoing) bot.recordOutgoing(chat, id, text);

@@ -1136,6 +1136,16 @@ function readDecision(text) {
   return { yes: /^(ok|yes|haan|approve)$/i.test(m[1]), requestId: m[2].toUpperCase() };
 }
 
+// "ok", "ok'", "haan", "approved", "no" - a decision with no request id. The
+// caller decides whether it can only mean one request (26 Sep, live: Shad's
+// "ok'" on DSC-OCDJ was answered "koi order pending nahi hai").
+function readBareDecision(text) {
+  const s = require('./waText').unformat(String(text || '')).trim().replace(/[\s.!'"`’‘👍✅🙏]+$/u, '');
+  if (/^(ok+|okk+|okay|ok ji|ok sir|yes|y|haan+|han|ha|ji|ji haan|approve|approved|done|theek hai|thik hai|sahi hai|kar do|kardo)$/i.test(s)) return { yes: true };
+  if (/^(no|n|nahi+|nhi|na|reject|rejected|mat karo)$/i.test(s)) return { yes: false };
+  return null;
+}
+
 function isApprover(phone) {
   return Boolean(config.creation.approvers[store.normPhone(phone)]);
 }
@@ -1172,6 +1182,10 @@ function noteNudge(requestId) {
   return req.nudges;
 }
 
+// Every account request still waiting on a Sales Head.
+function parkedIds() {
+  return [...awaiting.keys()];
+}
 function unpark(requestId) {
   awaiting.delete(String(requestId || '').toUpperCase());
 }
@@ -1224,10 +1238,12 @@ module.exports = {
   reviewSummary,
   resumeWithoutGst,
   readDecision,
+  readBareDecision,
   isApprover,
   approverName,
   park,
   parked,
+  parkedIds,
   noteNudge,
   unpark,
   addDiscount,
