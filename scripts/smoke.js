@@ -5888,6 +5888,26 @@ async function main() {
       }
       check('the approval lists the in-stock line', /AA-1 × 4/.test(appr71), appr71);
       check('...and not the one on order, only a count of it', !/CC-3/.test(appr71) && /1 other item/.test(appr71), appr71);
+
+      // Approved: the agent AND the customer hear what was punched and what not.
+      d71b.portalCustomer.phone = '9000000799';
+      d71b.leftOut = ['EE-5 × 2'];
+      const confWas71 = orders.confirm;
+      const opWas71 = customer.isOperator;
+      customer.isOperator = realIsOperator;
+      orders.confirm = async () => ({ soNumber: 'SO-71', placed: [{ soNumber: 'SO-71' }], punchedLines: [{ partNo: 'AA-1', qty: 4 }], skipped: [{ partNo: 'CC-3', qty: 3 }], short: [] });
+      customer.transport.outbox.length = 0;
+      try {
+        await customer.decideOrder({ from: '919999492550', chatId: 'sim-919999492550' }, { requestId: d71b.id, yes: true }, async () => {}, (en) => en);
+      } finally {
+        orders.confirm = confWas71;
+        customer.isOperator = opWas71;
+      }
+      const toCust71 = customer.transport.outbox.filter((o) => /9000000799/.test(o.to || '')).map((o) => o.text || '').join('\n');
+      const toAgent71 = customer.transport.outbox.filter((o) => o.to === 'sim-919000000712').map((o) => o.text || '').join('\n');
+      check('the customer is told on their own number', /SO-71/.test(toCust71) && /AA-1 × 4/.test(toCust71), JSON.stringify(customer.transport.outbox.map((o) => o.to)));
+      check('...with the parts that could not be punched, including ones the agent took out', /CC-3 × 3/.test(toCust71) && /EE-5 × 2/.test(toCust71), toCust71);
+      check('the agent gets the same breakdown', /CC-3 × 3/.test(toAgent71) && /AA-1 × 4/.test(toAgent71), toAgent71);
       orders.cancel(d71b);
     } finally {
       config.salesTeamNumbers.splice(config.salesTeamNumbers.indexOf(S71), 1);

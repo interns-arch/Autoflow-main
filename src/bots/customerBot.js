@@ -2414,11 +2414,15 @@ class CustomerBot {
       return reply(t(`None of the ${n} items is in stock right now, so there is nothing to place.`, `Sir, ${n} mein se abhi koi bhi item stock mein nahi hai - punch karne ko kuch nahi hai.`));
     }
     const dropped = order.lines.filter((l) => !have(l));
+    // Kept for the customer's "placed" message: what could not be punched.
+    order.leftOut = order.leftOut || [];
+    for (const l of dropped) order.leftOut.push(`${l.partNo || l.item} × ${l.qty}`);
     for (const l of dropped) orders.removeItem(order, l.partNo || l.item);
     let cut = 0;
     for (const l of order.lines) {
       const a = Number(l.available) || 0;
       if (a > 0 && Number(l.qty) > a) {
+        order.leftOut.push(`${l.partNo || l.item} × ${Number(l.qty) - a} (only ${a} in stock)`);
         l.qty = a;
         cut++;
       }
@@ -3902,6 +3906,8 @@ class CustomerBot {
     const acctPhone = String(pc.phone || (pc.raw && (pc.raw.phone || pc.raw.mobile)) || '').replace(/\D/g, '');
     const phone = opts.by ? acctPhone : chatPhone;
     const custName = pc.name || oc || phone;
+    // Who asked: a salesman's order also tells the customer once it is placed.
+    order.requestedBy = opts.by || null;
     // What they still owe, for the Sales Head to weigh (Odoo's receivable).
     const due = await payments.dueOf(pc).catch(() => null);
     // Only what will be punched (founder, 26 Sep: "send only available part
@@ -4004,16 +4010,43 @@ class CustomerBot {
     order.approvedBy = who;
     store.save();
     const so = (res.placed || []).map((p) => p.soNumber).filter(Boolean).join(', ') || res.soNumber;
-    const punched = (res.punchedLines || []).map((l) => `${l.partNo} × ${l.qty}`).join('\n');
-    const later = [...(res.skipped || []).map((l) => l.partNo || l.item), ...(res.short || []).map((l) => `${l.partNo} (${l.asked - l.punched} more)`)];
+    const punched = (res.punchedLines || []).map((l) => `• ${l.partNo} × ${l.qty}`).join('\n');
+    // Everything asked for and not punched (founder, 26 Sep: "customer knows
+    // which parts order punched and which is not available"): lines with no
+    // stock, the rest of short lines, and lines an agent's "only available"
+    // took out of the cart before approval.
+    const later = [
+      ...(res.skipped || []).map((l) => `• ${l.partNo || l.item} × ${l.qty}`),
+      ...(res.short || []).map((l) => `• ${l.partNo} × ${l.asked - l.punched} (only ${l.punched} in stock)`),
+      ...(order.leftOut || []).map((x) => `• ${x}`),
+    ];
     store.log(this.key, `${order.id} approved by ${who} — placed on the portal as ${so}`);
     approvalLog.record({ kind: 'order', id: order.id, event: 'approved', by: who, customer: (order.portalCustomer && order.portalCustomer.name) || null, detail: `portal order ${so}` });
-    await tell(
-      ct(
-        `✅ Your order is placed — order no. ${so}.\n${punched}${later.length ? `\n\nOn order, not in this one yet: ${later.join(', ')}` : ''}`,
-        `✅ Aapka order place ho gaya — order no. ${so}.\n${punched}${later.length ? `\n\nYe abhi order pe hain, is order mein nahi: ${later.join(', ')}` : ''}`,
-      ),
-    );
+    const pc = order.portalCustomer || {};
+    const placedText = (tt, name) =>
+      tt(
+        `✅ ${name ? `${name} — y` : 'Y'}our order is placed — order no. ${so}.\n\n*Punched (${(res.punchedLines || []).length}):*\n${punched}${later.length ? `\n\n*Not available — could not be punched (${later.length}):*\n${later.join('\n')}` : ''}`,
+        `✅ ${name ? `${name} — a` : 'A'}apka order place ho gaya — order no. ${so}.\n\n*Punch hue (${(res.punchedLines || []).length}):*\n${punched}${later.length ? `\n\n*Stock mein nahi — punch nahi ho paye (${later.length}):*\n${later.join('\n')}` : ''}`,
+      );
+    await tell(placedText(ct, order.requestedBy ? pc.name : null));
+    // A salesman's order: the chat is the agent's, so the customer is told on
+    // the phone on their account too (never on one of our own numbers).
+    if (order.requestedBy) {
+      const acct = String(pc.phone || (pc.raw && (pc.raw.phone || pc.raw.mobile)) || '').replace(/\D/g, '').slice(-10);
+      const to = acct.length === 10 ? '91' + acct : null;
+      if (to && to !== String(order.chatId || '').split('@')[0] && !this.isOperator({ from: to })) {
+        try {
+          await escalation.ensureWindow(this.transport, to, `Order ${so} placed — details follow`, so);
+          const custChat = to + '@cloud';
+          const text = placedText(lang.for(custChat), pc.name);
+          const id = await this.transport.sendToChat(custChat, text);
+          this.recordOutgoing(custChat, id, text);
+          store.log(this.key, `${order.id}: customer ${pc.name || ''} told on +${to}`);
+        } catch (e) {
+          store.log(this.key, `${order.id}: could not tell the customer on +${to}: ${String((e && e.message) || e).slice(0, 80)}`);
+        }
+      }
+    }
     return reply(t(`Placed — ${order.id} is portal order ${so}.\n${punched}`, `Place ho gaya — ${order.id} portal order ${so} hai.\n${punched}`));
   }
 
