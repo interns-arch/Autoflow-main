@@ -108,12 +108,14 @@ for (let i = 0; i < rows.length; i++) {
       ev = 'approved';
       const um = rt.match(/\(([a-z0-9_]+)\)/);
       const om = rt.match(/partner (\d+)/);
-      Object.assign(extra, { username: um && um[1], odooPartner: om ? Number(om[1]) : null });
+      const nm = rt.match(/^Done — (.+?) is open \(/);
+      Object.assign(extra, { username: um && um[1], odooPartner: om ? Number(om[1]) : null, customer: nm ? nm[1].trim() : undefined });
     } else if (k === 'payment' && /^Settled/i.test(rt)) ev = 'settled';
     if (!ev) continue;
     const req = out.find((e) => e.id === id && e.event === 'requested') || {};
     const carry = k === 'account' ? ['customer', 'phone', 'gst', 'businessType', 'contactPerson', 'email', 'address', 'dob', 'bank'] : ['customer'];
-    for (const f of carry) if (req[f] && extra[f] === undefined) extra[f] = req[f];
+    for (const f of carry) if (req[f] && !extra[f]) extra[f] = req[f];
+    if (extra.customer === undefined) delete extra.customer;
     out.push({ at: r.at, kind: k, id, event: ev, by: who, detail, ...extra });
   }
 }
