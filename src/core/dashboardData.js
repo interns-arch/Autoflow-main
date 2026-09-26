@@ -42,7 +42,7 @@ function customers(events) {
     const last = list[list.length - 1];
     const done = list.find((e) => e.event === 'approved');
     const rej = list.find((e) => e.event === 'rejected');
-    const facts = { ...req, ...(done || {}) };
+    const facts = { ...req, ...(rej || {}), ...(done || {}) };
     out.push({
       id: last.id,
       requestedAt: req.at || (done && done.at) || last.at,
@@ -145,8 +145,9 @@ function orders(events) {
       status: failed && st !== 'placed' ? 'refused by portal' : st,
       customer: pc.name || (typeof o.customer === 'string' && !/@/.test(o.customer) ? o.customer : null),
       customerId: pc.buyerId || null,
-      placedBy: agent ? agent + ' (agent)' : 'customer',
-      approvedBy: o.approvedBy || null,
+      placedBy: agent ? (/^Admin /.test(agent) ? agent : agent + ' (agent)') : 'customer',
+      // Orders placed before the approval step existed (placing was on).
+      approvedBy: o.approvedBy || (st === 'placed' ? 'placed directly (no approval step)' : null),
       rejectedBy: o.rejectedBy || null,
       portalOrder: (o.placed || []).map((p) => p.soNumber).filter(Boolean).join(' / ') || o.soNumber || null,
       lines: (o.lines || []).map((l) => `${l.partNo || l.item} x${l.qty}`).join(', '),
