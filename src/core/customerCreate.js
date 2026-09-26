@@ -252,6 +252,28 @@ const FIELDS = [
       'Shop ki location bhej dijiye — attach (📎) → Location → Send your current location.',
     ],
   },
+  // THE CREDIT TERMS, asked only of an AGENT opening the account (founder,
+  // 26 Sep). A customer opening their own gets Rs 1,00,000 and 15 days; credit
+  // billing is always one invoice (commercialDefaults).
+  {
+    key: 'creditLimit',
+    req: true,
+    when: (form) => Boolean(form.byName),
+    ask: ['Credit limit for this customer (Rs)?', 'Is customer ka credit limit kitna rakhein (Rs)?'],
+    check: (v) => (Number(String(v).replace(/[^0-9.]/g, '')) > 0 ? null : 'Credit limit Rs mein bhejiye, jaise 50000.'),
+    clean: (v) => Math.round(Number(String(v).replace(/[^0-9.]/g, ''))),
+  },
+  {
+    key: 'collectionDays',
+    req: true,
+    when: (form) => Boolean(form.byName),
+    ask: ['Bill (collection) days — how many days to pay each bill? (1 to 30)', 'Bill (collection) days — har bill kitne din mein pay karna hai? (1 se 30)'],
+    check: (v) => {
+      const n = Number(String(v).replace(/[^0-9]/g, ''));
+      return n >= 1 && n <= 30 ? null : '1 se 30 ke beech din bhejiye (30 se zyada nahi).';
+    },
+    clean: (v) => Number(String(v).replace(/[^0-9]/g, '')),
+  },
   // OPTIONAL: the owner's date of birth, and the bank account. The portal has
   // no box for either, so both travel in remarks (dealerPortal.remarksWith)
   // and are on the approver's summary.
@@ -279,10 +301,26 @@ const FIELDS = [
 // they are filled from config so the request is complete when it reaches
 // them — an approver changing a number is a conversation, a customer
 // choosing one is not.
-function commercialDefaults() {
+// THE CREDIT TERMS (founder, 26 Sep).
+//   - Credit billing: always ONE invoice on credit — the portal's credit_days
+//     1, which its credit control reads as "ONE_DAY_OPEN_EXPOSURE": a second
+//     order waits until the first bill is paid.
+//   - A customer opening their own account: credit limit Rs 1,00,000 (never
+//     more) and collection days 15.
+//   - An agent opening one: the credit limit and the collection (bill) days
+//     the agent gave (form fields creditLimit / collectionDays, days 1-30);
+//     only if they are missing, the customer's defaults.
+const SELF_CREDIT_LIMIT = 100000;
+const SELF_COLLECTION_DAYS = 15;
+function commercialDefaults(form) {
+  const a = (form && form.answers) || {};
+  const byAgent = Boolean(form && form.byName);
+  const limit = byAgent && Number(a.creditLimit) > 0 ? Number(a.creditLimit) : SELF_CREDIT_LIMIT;
+  const days = byAgent && Number(a.collectionDays) >= 1 ? Math.min(30, Math.round(Number(a.collectionDays))) : SELF_COLLECTION_DAYS;
   return {
-    creditDays: config.creation.defaultCreditDays,
-    creditLimit: config.creation.defaultCreditLimit,
+    creditDays: 1,
+    creditLimit: byAgent ? limit : Math.min(limit, SELF_CREDIT_LIMIT),
+    collectionDays: days,
   };
 }
 
@@ -741,7 +779,7 @@ function escalate(form, why, t) {
   form.answers.requestId = 'WA-' + Date.now().toString(36).toUpperCase();
   form.answers.kind = 'gst-review';
   form.answers.gstProblem = why;
-  Object.assign(form.answers, commercialDefaults());
+  Object.assign(form.answers, commercialDefaults(form));
   open.delete(form.chatId);
   store.log('create', `${form.chatId}: GST not verified (${why}) — ${form.answers.requestId} to the Sales Heads`);
   return {
@@ -973,7 +1011,7 @@ function advance(form, t) {
     return { reply: t(next.ask[1], next.ask[1]), done: false, form };
   }
   // Every field is in. The commercial terms join it here, from config.
-  Object.assign(form.answers, commercialDefaults(), { kind: 'customer' });
+  Object.assign(form.answers, commercialDefaults(form), { kind: 'customer' });
   form.answers.requestId = 'WA-' + Date.now().toString(36).toUpperCase();
   open.set(form.chatId, form);
   store.log('create', `${form.chatId}: form complete — ${form.answers.name} (${form.answers.requestId})`);
@@ -1071,8 +1109,9 @@ function summary(form, t) {
       : null,
     a.createdByName ? 'Opened by: ' + a.createdByName + (a.openedFor ? ' (for ' + a.openedFor + ')' : '') : null,
     '',
-    line('Credit days', a.creditDays),
-    line('Credit limit', a.creditLimit),
+    line('Credit limit', a.creditLimit != null ? 'Rs ' + Number(a.creditLimit).toLocaleString('en-IN') : null),
+    a.creditDays != null ? 'Credit billing: ' + (Number(a.creditDays) === 1 ? '1 invoice at a time' : a.creditDays + ' days') : null,
+    line('Collection days', a.collectionDays),
     line('Remarks', a.remarks),
     '',
     t(

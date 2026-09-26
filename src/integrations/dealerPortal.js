@@ -929,6 +929,7 @@ module.exports = {
       ...(fields.address ? { address: fields.address } : {}),
       ...(fields.creditDays != null ? { credit_days: fields.creditDays } : {}),
       ...(fields.creditLimit != null ? { credit_limit: fields.creditLimit } : {}),
+      ...(fields.collectionDays != null ? { collection_days: fields.collectionDays } : {}),
       ...(fields.category ? { dealer_category: fields.category } : {}),
       ...(fields.branchId ? { home_branch_dealer_id: fields.branchId } : {}),
       // The API defaults this to 'dealer' for a customer account, which is
