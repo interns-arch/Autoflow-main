@@ -47,6 +47,9 @@ const fs = require('fs');
 const os = require('os');
 
 const config = require('../src/config');
+// Most of this suite finds customers by name and GSTIN; the mobile-only
+// search (the default since 26 Sep) has its own section, [74].
+config.customerSearchBy = 'any';
 config.dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'autoflow-smoke-'));
 config.customerDms = ['919899555001'];
 config.adminNumbers = ['919800000009'];
@@ -6054,6 +6057,45 @@ async function main() {
         cr73.approvers = apprWas73;
         orders.cancel(d73);
         orders.cancel(old73);
+      }
+
+      // 26 Sep, founder: "make customer search using only mobile no. not gst
+      // or name".
+      console.log('\n[74] customers are searched by mobile number only');
+      const so74 = require('../src/core/salesOrder');
+      const S74 = '919000000741';
+      const C74 = 'sim-' + S74;
+      config.salesTeamNumbers.push(S74);
+      config.customerSearchBy = 'mobile';
+      portal.setMockCustomers([
+        { id: 265, name: 'Kalra Motors', home_branch_dealer: 23, address: 'Gurgaon, Haryana (IN)', group_name: '', gst_no: '06AABCK1234L1Z5', phone: '9811122233' },
+      ]);
+      const say74 = async (body) => {
+        customer.transport.outbox.length = 0;
+        await customer.transport.injectIncoming({ id: 'wamid.s74-' + Math.random(), from: S74, chatId: C74, isGroup: false, body, hasMedia: false, mediaType: 'chat' });
+        return customer.transport.outbox.filter((o) => /919000000741/.test(o.to || '')).map((o) => o.text || '').join('\n');
+      };
+      try {
+        so74._resetDirectory();
+        check('a GSTIN is not a customer key', so74.readCustomerKey('06AABCK1234L1Z5') === null);
+        check('a mobile number is', JSON.stringify(so74.readCustomerKey('9811122233')) === JSON.stringify({ phone: '919811122233' }));
+        const byName74 = await say74('search Kalra Motors');
+        check('"search Kalra Motors" asks for the mobile number, and finds nobody by name', /mobile number/i.test(byName74) && !/Kalra Motors/.test(byName74.replace(/search Kalra Motors/g, '')), byName74);
+        so74._resetDirectory();
+        const so74a = await say74('Kalra Motors ka SO bana do');
+        check('"Kalra Motors ka SO bana do" asks for the mobile number', /mobile number/i.test(so74a) && !/Which one|Kaunsa/.test(so74a), so74a);
+        const gst74 = await say74('06AABCK1234L1Z5');
+        check('a GSTIN on its own asks for the mobile number instead', /mobile number/i.test(gst74), gst74);
+        so74._resetDirectory();
+        const ledger74 = await say74('Kalra Motors ka ledger');
+        check('"Kalra Motors ka ledger" asks for the mobile number', /mobile number/i.test(ledger74), ledger74);
+        so74._resetDirectory();
+        const phone74 = await say74('9811122233');
+        check('the mobile number finds the customer and shows the card', /Kalra Motors/.test(phone74), phone74);
+      } finally {
+        config.customerSearchBy = 'any';
+        config.salesTeamNumbers.splice(config.salesTeamNumbers.indexOf(S74), 1);
+        so74._resetDirectory();
       }
     } finally {
       config.salesTeamNumbers.splice(config.salesTeamNumbers.indexOf(S71), 1);

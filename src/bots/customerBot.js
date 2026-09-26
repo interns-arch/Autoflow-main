@@ -3227,10 +3227,12 @@ class CustomerBot {
     }
     discountSetup.save(m.chatId, st);
     return reply(
-      t(
-        "Whose discount? Send the customer's phone number or GST number (or the name).",
-        'Kis customer ka discount? Customer ka phone number ya GST number bhejiye (ya naam).',
-      ),
+      salesOrder.mobileOnly()
+        ? t("Whose discount? Send the customer's 10-digit mobile number.", 'Kis customer ka discount? Customer ka 10 digit mobile number bhejiye.')
+        : t(
+            "Whose discount? Send the customer's phone number or GST number (or the name).",
+            'Kis customer ka discount? Customer ka phone number ya GST number bhejiye (ya naam).',
+          ),
     );
   }
 
@@ -3374,6 +3376,8 @@ class CustomerBot {
           const key = salesOrder.readCustomerKey(said);
           let rows = [];
           if (key) rows = await salesOrder.findByKey(key).catch(() => []);
+          // Searching by mobile only: a name or a GSTIN is not searched.
+          else if (salesOrder.mobileOnly()) return next('customer', salesOrder.askMobile(t));
           else rows = ((await salesOrder.findCustomers(said).catch(() => ({ top: [] }))).top || []);
           if (!rows.length) {
             return next(
@@ -3399,7 +3403,12 @@ class CustomerBot {
       case 'confirmCustomer': {
         if (discountSetup.NO.test(said) || m.buttonId === 'DSC_NO') {
           delete st.row;
-          return next('customer', t("Then send the right customer's phone number or GST number.", 'Theek hai — sahi customer ka phone number ya GST number bhejiye.'));
+          return next(
+            'customer',
+            salesOrder.mobileOnly()
+              ? t("Then send the right customer's 10-digit mobile number.", 'Theek hai — sahi customer ka 10 digit mobile number bhejiye.')
+              : t("Then send the right customer's phone number or GST number.", 'Theek hai — sahi customer ka phone number ya GST number bhejiye.'),
+          );
         }
         if (!discountSetup.YES.test(said) && m.buttonId !== 'DSC_YES') {
           // Another phone or GST number here is another customer.
@@ -4234,8 +4243,12 @@ class CustomerBot {
       return (
         sorry +
         t(
-          "To place an order, pick the customer first: send the customer's phone number or GST number (or \"Kalra Motors ka SO bana do\").",
-          'Order ke liye pehle customer chuniye: customer ka phone number ya GST number bhejiye (ya "Kalra Motors ka SO bana do").',
+          salesOrder.mobileOnly()
+            ? "To place an order, pick the customer first: send the customer's 10-digit mobile number."
+            : "To place an order, pick the customer first: send the customer's phone number or GST number (or \"Kalra Motors ka SO bana do\").",
+          salesOrder.mobileOnly()
+            ? 'Order ke liye pehle customer chuniye: customer ka 10 digit mobile number bhejiye.'
+            : 'Order ke liye pehle customer chuniye: customer ka phone number ya GST number bhejiye (ya "Kalra Motors ka SO bana do").',
         )
       );
     }
@@ -4669,8 +4682,8 @@ class CustomerBot {
         salesOrder.holdItems(m.chatId, usable);
         const n = salesOrder.heldCount(m.chatId);
         const ask = t(
-          `To order ${n > 1 ? 'these ' + n + ' parts' : 'this'}, which customer is it for? Send the customer's phone number or GST number.`,
-          `Order karna hai to ${n > 1 ? 'ye ' + n + ' parts' : 'ye'} kis customer ke liye hai? Customer ka phone number ya GST number bhejiye.`,
+          `To order ${n > 1 ? 'these ' + n + ' parts' : 'this'}, which customer is it for? Send the customer's ${salesOrder.mobileOnly() ? '10-digit mobile number' : 'phone number or GST number'}.`,
+          `Order karna hai to ${n > 1 ? 'ye ' + n + ' parts' : 'ye'} kis customer ke liye hai? Customer ka ${salesOrder.mobileOnly() ? '10 digit mobile number' : 'phone number ya GST number'} bhejiye.`,
         );
         return reply([shown, askText, ask].filter(Boolean).join(NL));
       }
