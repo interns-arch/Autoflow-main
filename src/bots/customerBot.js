@@ -1697,6 +1697,22 @@ class CustomerBot {
           // Testing mode: the draft is kept exactly as it is, so the same YES
           // will place it the moment ORDER_CONFIRM_ENABLED is turned on.
           if (result.blocked) {
+            // A SALESMAN'S ORDER while placing is switched off goes to the
+            // Sales Heads, like a customer's: "OK ORD-…" places it and the
+            // portal order number comes back here. 26 Sep, live: it was
+            // answered "abhi testing chal rahi hai" and dropped.
+            const forCustomer = salesOrder.activeCustomer(m.chatId);
+            if (forCustomer && order.portalCustomer && order.portalCustomer.buyerId) {
+              const sent = await this.requestOrderApproval(order, { by: customerCreate.agentName(m.from) || m.from });
+              if (sent) {
+                return reply(
+                  t(
+                    `${forCustomer.name}'s order (${order.id}) has gone to the Sales Head for approval. Once approved it is placed on the portal and you get the order number here.`,
+                    `${forCustomer.name} ka order (${order.id}) Sales Head ko approval ke liye bhej diya. Approve hote hi portal pe place hoga aur order number yahin milega.`,
+                  ),
+                );
+              }
+            }
             const salesNote = salesOrder.whenBlocked(m.chatId, order, t);
             if (salesNote) return reply(salesNote);
             return reply(
@@ -3728,14 +3744,20 @@ class CustomerBot {
 
   // -> how many approvers it reached. The cart is taken out of the draft
   // state while it waits, so what the customer adds next starts a new cart.
-  async requestOrderApproval(order) {
+  async requestOrderApproval(order, opts = {}) {
     const inStock = (l) => l.source !== 'unidentified' && l.source !== 'unknown' && l.source !== 'unavailable' && (Number(l.available) || 0) > 0;
     const pc = order.portalCustomer || {};
     // order.customer is the agent's customer RECORD, not a name — printed as
     // is it read "Customer: [object Object]" (25 Sep, live).
     const oc = order.customer && typeof order.customer === 'object' ? order.customer.name : order.customer;
-    const phone = String(order.chatId || '').split('@')[0];
+    // The CUSTOMER's number: for a salesman's order the chat is the agent's,
+    // so the account's own phone is used when there is one.
+    const chatPhone = String(order.chatId || '').split('@')[0];
+    const acctPhone = String(pc.phone || (pc.raw && (pc.raw.phone || pc.raw.mobile)) || '').replace(/\D/g, '');
+    const phone = opts.by ? acctPhone : chatPhone;
     const custName = pc.name || oc || phone;
+    // What they still owe, for the Sales Head to weigh (Odoo's receivable).
+    const due = await payments.dueOf(pc).catch(() => null);
     const rows = order.lines.map((l, i) => {
       const got = Math.min(Number(l.qty) || 0, Number(l.available) || 0);
       const stock = inStock(l) ? (got < l.qty ? `${got} in stock, rest on order` : 'in stock') : 'on order — not punched';
@@ -3746,6 +3768,8 @@ class CustomerBot {
     const text = [
       `*Order approval* — ${order.id}`,
       `Customer: ${custName}${phone ? ` (+${phone})` : ''}`,
+      opts.by ? `Requested by: ${opts.by} (sales team)` : null,
+      due ? (payments.settled(due.due) ? 'Due balance: nil' : `⚠️ Due balance: ${payments.money(due.due)} unpaid`) : null,
       '',
       ...rows,
       '',
@@ -3753,7 +3777,9 @@ class CustomerBot {
         ? `In-stock lines go to the portal: ₹${Math.round(total).toLocaleString('en-IN')} incl. GST.`
         : 'Nothing in this cart is in stock — an OK will not place anything yet.',
       `Reply *OK ${order.id}* to place it on the portal, or *NO ${order.id}* to reject.`,
-    ].join('\n');
+    ]
+      .filter((l) => l !== null)
+      .join('\n');
     const was = order.status;
     order.status = 'approval';
     order.approvalAskedAt = new Date().toISOString();
@@ -3764,7 +3790,7 @@ class CustomerBot {
       store.save();
     }
     store.log(this.key, `${order.id} sent to ${sent} approver(s) for approval`);
-    if (sent) approvalLog.record({ kind: 'order', id: order.id, event: 'requested', by: 'customer (' + phone + ')', customer: custName, phone, detail: `${order.lines.length} line(s)`, amount: Math.round(total) });
+    if (sent) approvalLog.record({ kind: 'order', id: order.id, event: 'requested', by: opts.by ? opts.by + ' (sales team)' : 'customer (' + phone + ')', customer: custName, phone, detail: `${order.lines.length} line(s)`, amount: Math.round(total) });
     return sent;
   }
 
@@ -3861,8 +3887,21 @@ class CustomerBot {
         )
       );
     }
+    // "Kitni quantity chahiye?" is over once those parts are in the cart with
+    // a quantity. 26 Sep, live: it was asked again after "72321M76M01 2pcs,
+    // 71822M75L00 4 pcs" had gone into the draft, on every stray message.
     const waitingQty = askQty.get(m.chatId);
-    if (waitingQty && waitingQty.items && waitingQty.items.length) {
+    const inCart = orders.findDraft(m.chatId);
+    const norm = (x) => String(x || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (
+      waitingQty &&
+      waitingQty.items &&
+      inCart &&
+      inCart.lines.length &&
+      waitingQty.items.every((i) => inCart.lines.some((l) => norm(l.partNo || l.item) === norm(i.partNo || i.item)))
+    ) {
+      askQty.clear(m.chatId);
+    } else if (waitingQty && waitingQty.items && waitingQty.items.length) {
       const names = waitingQty.items.map((i) => i.partNo || i.item).join(', ');
       return sorry + t(`How many do you need - ${names}?`, `${names} - kitni quantity chahiye?`);
     }

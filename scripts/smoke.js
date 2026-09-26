@@ -2662,7 +2662,8 @@ async function main() {
   check('the draft is for the customer picked (buyer 345), not the salesman number', !!draft21a && !!draft21a.portalCustomer && draft21a.portalCustomer.buyerId === 345);
   markAsked('sim-' + SALES21);
   const maan21b = await say21(SALES21, 'haan');
-  check('with punching off, the salesman is told the SO was not punched', /haven.t punched|punch nahi kiya/i.test(maan21b));
+  // Punching off: a salesman's order goes to the Sales Heads for approval (26 Sep).
+  check('with punching off, the salesman order goes to the Sales Head for approval', /Sales Head ko approval ke liye bhej diya|gone to the Sales Head/i.test(maan21b));
 
   const anuj21a = await say21(SALES21, 'Anuj ka SO: 13780M68P01 5');
   check('two Anujs are listed, and Tanuj is not', /1\. anuj/.test(anuj21a) && /2\. Anuj/.test(anuj21a) && !/Tanuj/.test(anuj21a));
