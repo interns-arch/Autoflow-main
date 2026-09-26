@@ -2888,6 +2888,23 @@ class CustomerBot {
   // message (and its photo), and the customer is told so in one line. When he
   // answers, escalation gives his words to the customer.
   async agentUnavailable(m, text, reply, t, attachment) {
+    // THE MODEL IS DOWN (credits, quota, key): the admins are told once, with
+    // why — not Prateek sir once per customer message. 26 Sep, live: Gemini
+    // answered 402 "prepayment credits are depleted" and every "Hi" became a
+    // question to him.
+    await this.alertModelDown().catch(() => {});
+
+    // A GREETING or a courtesy is answered here, never sent to a person.
+    const said = String(text || '').trim();
+    if (!attachment && said && (GREETING.test(said) || /^(ok+|okay|thik|theek|theek hai|thik hai|thanks?|thank you|thx|dhanyawad|shukriya|haan|ha|ji|hmm+|👍|🙏)[\s!.]*$/i.test(said))) {
+      store.log(this.key, `agent could not answer ${m.from} — greeting answered without it: "${said.slice(0, 30)}"`);
+      return reply(
+        GREETING.test(said)
+          ? t('Hello! Send me the part number and quantity — I will check it for you.', 'Namaste! Part number aur quantity bhejiye — main check karke batata hoon.')
+          : t('👍', '👍'),
+      );
+    }
+
     const what = text || (attachment ? incoming.describeAttachment(attachment) : incoming.forLog(m));
     store.log(this.key, `agent could not answer ${m.from} — handed to a person: "${String(what).slice(0, 60)}"`);
     try {
@@ -2906,6 +2923,32 @@ class CustomerBot {
       store.log(this.key, 'could not hand the message to a person: ' + String((e && e.message) || e).slice(0, 80));
     }
     return reply(t('One moment — let me get someone to check this for you.', 'Ek minute — main kisi se check karwa ke batata hoon.'));
+  }
+
+  // Once per 6 hours while the model cannot run: the admins, with the reason.
+  async alertModelDown() {
+    const f = agent.lastFailure && agent.lastFailure();
+    if (!f || !f.down) return;
+    const slot = require('../core/chatState').slot('agent.downAlert');
+    const last = slot.get('last') || 0;
+    if (Date.now() - last < 6 * 60 * 60 * 1000) return;
+    slot.set('last', Date.now());
+    const credits = /credits? (are )?depleted|402|billing|prepay/i.test(f.message);
+    const text = [
+      '⚠️ *The bot\'s AI is down* — customers are not getting proper answers.',
+      credits ? 'Reason: the Gemini account is out of credit (HTTP 402 "prepayment credits are depleted").' : 'Reason: ' + f.message.slice(0, 200),
+      credits ? 'Fix: add credits at https://ai.studio/projects (Billing).' : 'Check the Gemini key / quota.',
+      'Until then: greetings are answered by the bot; other messages go to a person.',
+    ].join('\n');
+    for (const n of config.adminNumbers || []) {
+      try {
+        await escalation.ensureWindow(this.transport, n, 'Bot alert — details follow');
+        await this.transport.sendText(n, text);
+      } catch (e) {
+        store.log(this.key, `model-down alert to ${n} failed: ${String((e && e.message) || e).slice(0, 80)}`);
+      }
+    }
+    store.log(this.key, 'model is down — admins alerted: ' + f.message.slice(0, 120));
   }
 
   // ONE MESSAGE TO THE AGENT, and whatever it says back.

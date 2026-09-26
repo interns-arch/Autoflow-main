@@ -262,15 +262,28 @@ async function followUp({ bot, chatId, phone, note }) {
   }
 }
 
+// The last time the model could not run, and why (null once it runs again).
+let lastFailure = null;
+
 async function run(who, input, what) {
   const started = Date.now();
   let out = null;
   try {
     out = await build().invoke(input, configFor({ ...who }));
   } catch (e) {
-    store.log('agent', what + ' failed: ' + String((e && e.message) || e).slice(0, 140));
+    const msg = String((e && e.message) || e);
+    store.log('agent', what + ' failed: ' + msg.slice(0, 140));
+    // Why, kept: "the model could not run at all" (credits, quota, key) is a
+    // different thing from one bad turn — customerBot tells the admins once
+    // and answers greetings itself instead of sending each to a person.
+    lastFailure = {
+      at: Date.now(),
+      message: msg.slice(0, 300),
+      down: /\b(402|429|401|403)\b|credits? (are )?depleted|RESOURCE_EXHAUSTED|quota|billing|API key/i.test(msg),
+    };
     return { handled: false, reply: null, paused: false };
   }
+  lastFailure = null;
 
   const messages = (out && out.messages) || [];
   const calls = messages.filter((m) => (m.getType ? m.getType() : '') === 'tool').map((m) => m.name);
@@ -395,4 +408,4 @@ function textOf(msg) {
   return '';
 }
 
-module.exports = { handle, resume, followUp, warmUp, enabled, TOOLS, _build: build, _inventedMoney: inventedMoney, _claimsSentForApproval: claimsSentForApproval, _approvalThisTurn: approvalThisTurn };
+module.exports = { handle, resume, followUp, warmUp, enabled, lastFailure: () => lastFailure, TOOLS, _build: build, _inventedMoney: inventedMoney, _claimsSentForApproval: claimsSentForApproval, _approvalThisTurn: approvalThisTurn };
