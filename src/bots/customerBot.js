@@ -256,6 +256,10 @@ const JUST_ACK =
 
 // "only", "sirf", "bas": a yes to part of the list.
 const ONLY_WORD = /\b(only|sirf|srf|bas|just|keval|kewal)\b/i;
+// "only avl item punch krna hai", "sirf available part", "jo stock mein hai"
+// (26 Sep, live: Shubham asked five times; ORD-1069 still went to Prateek sir
+// with all 58 lines).
+const ONLY_AVAILABLE = /\b(avl|avail\w*|in[\s-]?stock|stock\s*(wale|vale|mein|me)|jo\s+(hai|h|stock))\b/i;
 
 // A real part number somewhere in it - letters and digits, or a digits-only
 // Hyundai/Toyota number.
@@ -761,6 +765,9 @@ class CustomerBot {
       const open = orders.findDraft(m.chatId);
       if (open && open.lines.length && open.confirmAskedAt && text.length <= 60 && /^\s*(only|sirf|srf|bas|just|keval|kewal)\b/i.test(text) && /\d/.test(text)) {
         return this.keepOnly(m, text, reply, t, open);
+      }
+      if (open && open.lines.length && text.length <= 80 && ONLY_WORD.test(text) && ONLY_AVAILABLE.test(text)) {
+        return this.keepAvailable(m, text, reply, t, open);
       }
     }
 
@@ -2373,6 +2380,7 @@ class CustomerBot {
   // and ask again. Never punches on the message that changed the list.
   async keepOnly(m, text, reply, t, order) {
     const n = order.lines.length;
+    if (ONLY_AVAILABLE.test(text)) return this.keepAvailable(m, text, reply, t, order);
     const nums = [...new Set((text.match(/\b\d{1,2}\b/g) || []).map(Number).filter((x) => x >= 1 && x <= n))];
     const pn = ai.partNumberIn(text);
     const named = pn ? order.lines.filter((l) => String(l.partNo || l.item).toUpperCase() === String(pn).toUpperCase()) : [];
@@ -2392,6 +2400,42 @@ class CustomerBot {
     store.log(this.key, `"${text}" - kept ${keep.length} of ${n} line(s) on ${order.id}, asking again`);
     return reply(
       t(`Only these, then:\n${orders.summary(order)}\n\nShall I place this order?`, `Sirf ye rakhe:\n${orders.summary(order)}\n\nYe order punch kar dun?`),
+    );
+  }
+
+  // "Only available items": drop every line with nothing in stock and cut the
+  // rest down to what is there, so the list - and the approval Prateek sir
+  // gets - is exactly what will be punched.
+  async keepAvailable(m, text, reply, t, order) {
+    const n = order.lines.length;
+    const have = (l) => l.source !== 'unidentified' && l.source !== 'unknown' && l.source !== 'unavailable' && (Number(l.available) || 0) > 0;
+    if (!order.lines.some(have)) {
+      store.log(this.key, `"${text}" - nothing in stock on ${order.id}`);
+      return reply(t(`None of the ${n} items is in stock right now, so there is nothing to place.`, `Sir, ${n} mein se abhi koi bhi item stock mein nahi hai - punch karne ko kuch nahi hai.`));
+    }
+    const dropped = order.lines.filter((l) => !have(l));
+    for (const l of dropped) orders.removeItem(order, l.partNo || l.item);
+    let cut = 0;
+    for (const l of order.lines) {
+      const a = Number(l.available) || 0;
+      if (a > 0 && Number(l.qty) > a) {
+        l.qty = a;
+        cut++;
+      }
+    }
+    cancelConfirmNudge(m.chatId);
+    order.confirmAskedAt = new Date().toISOString();
+    store.save();
+    store.log(this.key, `"${text}" - kept ${order.lines.length} available line(s) of ${n} on ${order.id} (${dropped.length} dropped, ${cut} cut to stock)`);
+    const note = t(
+      `Removed ${dropped.length} item(s) not in stock${cut ? `; ${cut} cut to the quantity in stock` : ''}.`,
+      `${dropped.length} item jo stock mein nahi hain hata diye${cut ? `; ${cut} ki quantity stock jitni kar di` : ''}.`,
+    );
+    return reply(
+      t(
+        `Only the available items, then:\n${orders.summary(order)}\n\n${note}\nShall I send this for approval?`,
+        `Sirf available items:\n${orders.summary(order)}\n\n${note}\nYe approval ke liye bhej dun?`,
+      ),
     );
   }
 
@@ -3860,12 +3904,16 @@ class CustomerBot {
     const custName = pc.name || oc || phone;
     // What they still owe, for the Sales Head to weigh (Odoo's receivable).
     const due = await payments.dueOf(pc).catch(() => null);
-    const rows = order.lines.map((l, i) => {
-      const got = Math.min(Number(l.qty) || 0, Number(l.available) || 0);
-      const stock = inStock(l) ? (got < l.qty ? `${got} in stock, rest on order` : 'in stock') : 'on order — not punched';
-      return `${i + 1}. ${l.partNo || l.item} × ${l.qty}${availability.priceOf(l)} — ${stock}`;
-    });
+    // Only what will be punched (founder, 26 Sep: "send only available part
+    // request to prateek sir"): in-stock lines at the quantity in stock; the
+    // rest is a count, not a list.
     const punchable = order.lines.filter(inStock);
+    const left = order.lines.length - punchable.length;
+    const rows = punchable.map((l, i) => {
+      const got = Math.min(Number(l.qty) || 0, Number(l.available) || 0);
+      return `${i + 1}. ${l.partNo || l.item} × ${got}${availability.priceOf(l)}${got < l.qty ? ` (asked ${l.qty}, ${got} in stock)` : ''}`;
+    });
+    if (left) rows.push('', `(${left} other item(s) not in stock — not included)`);
     const total = punchable.reduce((s, l) => s + (Number(l.rate) || Number(l.mrp) || 0) * Math.min(Number(l.qty) || 0, Number(l.available) || 0), 0);
     const text = [
       `*Order approval* — ${order.id}`,

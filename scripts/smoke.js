@@ -5835,6 +5835,66 @@ async function main() {
     }
   }
 
+  // 26 Sep, live: Shubham asked "Only avl item punch Krna hai" five ways, and
+  // ORD-1069 still reached Prateek sir with all 58 lines.
+  console.log('\n[71] "only available items": the cart and the approval carry only what is in stock');
+  {
+    const S71 = '919000000711';
+    const C71 = 'sim-' + S71;
+    config.salesTeamNumbers.push(S71);
+    const d71 = orders.getOrCreateDraft(C71, S71);
+    orders.addLines(d71, [
+      { item: 'AA-1', partNo: 'AA-1', qty: 4, source: 'portal', available: 10, mrp: 100 },
+      { item: 'BB-2', partNo: 'BB-2', qty: 5, source: 'portal', available: 2, mrp: 200 },
+      { item: 'CC-3', partNo: 'CC-3', qty: 3, source: 'unavailable', available: 0, mrp: 300 },
+      { item: 'DD-4', partNo: 'DD-4', qty: 1, source: 'portal', available: 0, mrp: 400 },
+    ]);
+    d71.portalCustomer = { buyerId: 345, name: 'Houseneed Test' };
+    d71.confirmAskedAt = new Date().toISOString();
+    try {
+      customer.transport.outbox.length = 0;
+      await customer.transport.injectIncoming({ id: 'wamid.s71', from: S71, chatId: C71, isGroup: false, body: 'Only avl item punch Krna hai', hasMedia: false, mediaType: 'chat' });
+      const said71 = customer.transport.outbox.filter((o) => o.to === C71).map((o) => o.text).join('\n');
+      check('"only avl item" keeps the two in-stock lines', d71.lines.map((l) => l.partNo).join(',') === 'AA-1,BB-2', d71.lines.map((l) => l.partNo).join(','));
+      check('...cuts the short one to what is in stock', d71.lines[1] && d71.lines[1].qty === 2);
+      check('...and says so, asking before sending', /2 item|Removed 2/i.test(said71) && /approval/i.test(said71), said71);
+
+      // The other ways he said it, live - with no list just asked about.
+      for (const say of ['Sirf available part btao', 'Only avl item do', 'Send request of only available parts', 'sirf stock wale items bhejo']) {
+        orders.addLines(d71, [{ item: 'CC-3', partNo: 'CC-3', qty: 3, source: 'unavailable', available: 0, mrp: 300 }]);
+        d71.confirmAskedAt = null;
+        customer.transport.outbox.length = 0;
+        await customer.transport.injectIncoming({ id: 'wamid.s71-' + Math.random(), from: S71, chatId: C71, isGroup: false, body: say, hasMedia: false, mediaType: 'chat' });
+        check(`"${say}" drops the line on order`, d71.lines.map((l) => l.partNo).join(',') === 'AA-1,BB-2', d71.lines.map((l) => l.partNo).join(','));
+      }
+
+      // The approval lists only what will be punched.
+      const d71b = orders.getOrCreateDraft('sim-919000000712', '919000000712');
+      orders.addLines(d71b, [
+        { item: 'AA-1', partNo: 'AA-1', qty: 4, source: 'portal', available: 10, mrp: 100 },
+        { item: 'CC-3', partNo: 'CC-3', qty: 3, source: 'unavailable', available: 0, mrp: 300 },
+      ]);
+      d71b.portalCustomer = { buyerId: 345, name: 'Houseneed Test' };
+      let appr71 = '';
+      const toWas71 = customer.toApprovers;
+      customer.toApprovers = async (text) => {
+        appr71 = text;
+        return 1;
+      };
+      try {
+        await customer.requestOrderApproval(d71b, { by: 'Test Agent' });
+      } finally {
+        customer.toApprovers = toWas71;
+      }
+      check('the approval lists the in-stock line', /AA-1 × 4/.test(appr71), appr71);
+      check('...and not the one on order, only a count of it', !/CC-3/.test(appr71) && /1 other item/.test(appr71), appr71);
+      orders.cancel(d71b);
+    } finally {
+      config.salesTeamNumbers.splice(config.salesTeamNumbers.indexOf(S71), 1);
+      if (orders.findDraft(C71)) orders.cancel(orders.findDraft(C71));
+    }
+  }
+
 
   console.log(
     failures === 0
