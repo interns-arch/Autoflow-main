@@ -1680,6 +1680,28 @@ class CustomerBot {
           store.log(this.key, 'actor lookup failed: ' + String((e && e.message) || e).slice(0, 90));
         }
 
+        // ONE INVOICE ON CREDIT (founder, 26 Sep): a salesman's order for a
+        // customer who still owes Rs 1 or more is held — the customer gets the
+        // amount and the QR, the accountant confirms the payment, and then the
+        // order goes on by itself (to the Sales Heads while placing is off).
+        const heldFor = salesOrder.activeCustomer(m.chatId);
+        if (heldFor && order.portalCustomer && order.portalCustomer.buyerId) {
+          const pc = order.portalCustomer;
+          const custPhone = String(pc.phone || (pc.raw && (pc.raw.phone || pc.raw.mobile)) || '').replace(/\D/g, '').slice(-10);
+          const hold = await this.holdForPayment(order, pc, {
+            customerPhone: custPhone.length === 10 ? '91' + custPhone : null,
+            agent: customerCreate.agentName(m.from) || null,
+          }).catch(() => null);
+          if (hold) {
+            return reply(
+              t(
+                `${heldFor.name} still owes ${payments.money(hold.due)} — with one invoice on credit, no new order until it is paid. ${order.id} is on hold${custPhone.length === 10 ? '; the amount and the payment QR went to the customer' : ''}. Once our accountant confirms the payment it goes for approval, and you get the order number here.`,
+                `${heldFor.name} ka ${payments.money(hold.due)} abhi baaki hai — ek invoice credit billing hai, isliye pay hone tak naya order nahi. ${order.id} hold pe hai${custPhone.length === 10 ? '; amount aur payment QR customer ko bhej diya' : ''}. Accountant ke confirm karte hi approval ke liye jayega aur order number yahin milega.`,
+              ),
+            );
+          }
+        }
+
         try {
           const result = await orders.confirm(order);
 
@@ -3591,12 +3613,31 @@ class CustomerBot {
 
   // At the order's "yes": does this customer still owe money? -> null when
   // the order may go on, or { req, due, qrSent } when it is held.
-  async holdForPayment(order, customer) {
+  // `opts.customerPhone`: the order is a SALESMAN'S (founder, 26 Sep: credit
+  // billing is one invoice — no new order until the balance is paid, whoever
+  // places it). The payment request, the QR and "your balance is settled" go
+  // to the CUSTOMER's WhatsApp; the agent hears when the order goes on.
+  async holdForPayment(order, customer, opts = {}) {
     const due = await payments.dueOf(customer).catch(() => null);
     if (!due || payments.settled(due.due)) return null;
+    const custChat = opts.customerPhone ? store.normPhone(opts.customerPhone) + '@cloud' : null;
+    if (custChat) {
+      const ct = lang.for(custChat);
+      const text = ct(
+        `Hello ${customer.name}. Your previous balance of ${payments.money(due.due)} is unpaid, so the new order${opts.agent ? ' placed by ' + opts.agent : ''} is on hold. Please pay it with the QR below and reply "payment done" — the order goes ahead as soon as it is confirmed.`,
+        `Namaste ${customer.name}. Aapka pichla ${payments.money(due.due)} baaki hai, isliye naya order${opts.agent ? ' (' + opts.agent + ' ne lagaya)' : ''} ruka hua hai. Neeche QR se pay karke "payment kar diya" likhiye — confirm hote hi order aage badh jayega.`,
+      );
+      try {
+        await escalation.ensureWindow(this.transport, store.normPhone(opts.customerPhone), 'Payment due — details follow');
+        const id = await this.transport.sendToChat(custChat, text);
+        this.recordOutgoing(custChat, id, text);
+      } catch (e) {
+        store.log(this.key, `${order.id}: could not tell ${customer.name} about the due: ${String((e && e.message) || e).slice(0, 80)}`);
+      }
+    }
     const req = payments.open({
-      chatId: order.chatId,
-      phone: String(order.chatId || '').split('@')[0],
+      chatId: custChat || order.chatId,
+      phone: custChat ? store.normPhone(opts.customerPhone) : String(order.chatId || '').split('@')[0],
       customer: customer.name,
       buyerId: customer.buyerId,
       due: due.due,
@@ -3748,6 +3789,20 @@ class CustomerBot {
     if (order && order.status === 'awaitingPayment') {
       const went = await this.releaseHeldOrder(order);
       next = went;
+      // A salesman's order: the agent hears it is moving again.
+      if (order.chatId && order.chatId !== req.chatId) {
+        const at = lang.for(order.chatId);
+        const msg = at(
+          `✅ ${req.customer} has paid — balance settled. ${order.id} ${went ? 'has gone on (' + went.en + ')' : 'can go ahead now'}.`,
+          `✅ ${req.customer} ne pay kar diya — balance settle ho gaya. ${order.id} ${went ? 'aage badh gaya (' + went.hi + ')' : 'ab aage ja sakta hai'}.`,
+        );
+        try {
+          const id = await this.transport.sendToChat(order.chatId, msg);
+          this.recordOutgoing(order.chatId, id, msg);
+        } catch (e) {
+          store.log(this.key, `${order.id}: could not tell the agent: ${String((e && e.message) || e).slice(0, 80)}`);
+        }
+      }
     }
     await tell(
       ct(`✅ Your balance is settled. Thank you!${next ? ' ' + next.en : ''}`, `✅ Aapka balance settle ho gaya. Shukriya!${next ? ' ' + next.hi : ''}`),
@@ -3759,17 +3814,21 @@ class CustomerBot {
   // sent to the Sales Heads for approval. -> the words for the customer.
   async releaseHeldOrder(order) {
     order.status = 'draft';
+    // A salesman's order says so on the approval (not the agent's number as
+    // the customer's).
+    const placer = String(order.chatId || '').split('@')[0];
+    const byAgent = salesOrder.isSalesPerson(placer) ? { by: customerCreate.agentName(placer) || placer } : {};
     store.save();
     let res = null;
     try {
       res = await orders.confirm(order);
     } catch (e) {
       store.log(this.key, `${order.id}: placing after the payment failed: ${String((e && e.message) || e).slice(0, 100)}`);
-      const sent = await this.requestOrderApproval(order);
+      const sent = await this.requestOrderApproval(order, byAgent);
       return sent ? { en: `Your order ${order.id} has gone for approval.`, hi: `Aapka order ${order.id} approval ke liye bhej diya hai.` } : null;
     }
     if (res && res.blocked) {
-      const sent = await this.requestOrderApproval(order);
+      const sent = await this.requestOrderApproval(order, byAgent);
       return sent ? { en: `Your order ${order.id} has gone for approval.`, hi: `Aapka order ${order.id} approval ke liye bhej diya hai.` } : null;
     }
     if (res && res.soNumber) return { en: `Your order is placed — order no. ${res.soNumber}.`, hi: `Aapka order place ho gaya — order no. ${res.soNumber}.` };
