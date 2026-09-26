@@ -5892,6 +5892,7 @@ async function main() {
       // Approved: the agent AND the customer hear what was punched and what not.
       d71b.portalCustomer.phone = '9000000799';
       d71b.leftOut = ['EE-5 × 2'];
+      d71b.leftOutLines = [{ partNo: 'EE-5', item: 'EE-5', qty: 2, price: 50 }];
       const confWas71 = orders.confirm;
       const opWas71 = customer.isOperator;
       customer.isOperator = realIsOperator;
@@ -5908,6 +5909,55 @@ async function main() {
       check('the customer is told on their own number', /SO-71/.test(toCust71) && /AA-1 × 4/.test(toCust71), JSON.stringify(customer.transport.outbox.map((o) => o.to)));
       check('...with the parts that could not be punched, including ones the agent took out', /CC-3 × 3/.test(toCust71) && /EE-5 × 2/.test(toCust71), toCust71);
       check('the agent gets the same breakdown', /CC-3 × 3/.test(toAgent71) && /AA-1 × 4/.test(toAgent71), toAgent71);
+
+      // ETA FIRST (founder, 26 Sep): the parts on order are offered to the
+      // customer with the ETA explained; booked on the portal only on a yes.
+      const adv71 = require('../src/core/advanceOrders');
+      const CUST71 = '919000000799@cloud';
+      check('the customer is offered the parts on order with the ETA explained', /ETA/.test(toCust71) && /estimated time of arrival/i.test(toCust71) && /CC-3/.test(toCust71) && /(HAAN|YES)/.test(toCust71), toCust71);
+      check('...including the part the agent took out before approval', /EE-5 × 2 — ETA/.test(toCust71), toCust71);
+      check('...and nothing is booked before they answer', portal._mockAdvance().length === 0);
+      check('the agent is told the customer was asked', /asked to accept the ETA|ETA .*poocha/i.test(toAgent71), toAgent71);
+      check('the offer is standing on the customer chat', Boolean(adv71.pending(CUST71)));
+
+      customer.transport.outbox.length = 0;
+      await customer.transport.injectIncoming({ id: 'wamid.s71-yes', from: '919000000799', chatId: CUST71, isGroup: false, body: 'haan', hasMedia: false, mediaType: 'chat' });
+      const booked71 = portal._mockAdvance()[0];
+      check('"haan" books an advance order on the portal', Boolean(booked71), JSON.stringify(customer.transport.outbox.map((o) => o.text)));
+      check('...for that customer, unallocated, the on-order part with its whole quantity short', booked71 && booked71.selected_buyer_id === 345 && booked71.include_unallocated === true && booked71.allow_empty_dealers === true && booked71.lines.length === 2 && booked71.lines[0].part_no === 'CC-3' && booked71.lines[0].shortfall === 3 && booked71.lines[1].part_no === 'EE-5' && booked71.lines.every((l) => l.dealers.length === 0), JSON.stringify(booked71));
+      const after71 = customer.transport.outbox.map((o) => `${o.to}: ${o.text || ''}`).join('\n');
+      check('...the customer is told it is booked, with the date', /Advance mein book|Booked in advance/.test(after71), after71);
+      check('...and the agent is told', customer.transport.outbox.some((o) => o.to === 'sim-919000000712' && /advance order/i.test(o.text || '')), after71);
+      check('...and the offer is closed', !adv71.pending(CUST71));
+
+      // A "no" books nothing.
+      const d71c = orders.getOrCreateDraft('sim-919000000713', '919000000713');
+      orders.addLines(d71c, [{ item: 'FF-6', partNo: 'FF-6', qty: 2, source: 'unavailable', available: 0, mrp: 100 }]);
+      d71c.portalCustomer = { buyerId: 346, name: 'Nahi Motors', phone: '9000000798' };
+      await customer.requestOrderApproval(d71c, { by: 'Test Agent' }).catch(() => {});
+      d71c.status = 'approval';
+      const confWas71c = orders.confirm;
+      orders.confirm = async () => ({ nothingInStock: true, skipped: d71c.lines });
+      customer.isOperator = realIsOperator;
+      let decided71 = '';
+      try {
+        await customer.decideOrder({ from: '919999492550', chatId: 'sim-919999492550' }, { requestId: d71c.id, yes: true }, async (x) => { decided71 = x; }, (en) => en);
+      } finally {
+        orders.confirm = confWas71c;
+        customer.isOperator = opWas71;
+      }
+      check('with nothing in stock, the approver hears the customer was asked about the ETA', /asked to accept an ETA/.test(decided71), decided71);
+      check('...and the offer is standing', Boolean(adv71.pending('919000000798@cloud')));
+      const n71 = portal._mockAdvance().length;
+      customer.transport.outbox.length = 0;
+      await customer.transport.injectIncoming({ id: 'wamid.s71-no', from: '919000000798', chatId: '919000000798@cloud', isGroup: false, body: 'nahi', hasMedia: false, mediaType: 'chat' });
+      check('"nahi" books nothing, and says so', portal._mockAdvance().length === n71 && /kuch book nahi|nothing has been booked/i.test(customer.transport.outbox.map((o) => o.text || '').join('\n')));
+      orders.cancel(d71c);
+
+      // The portal's own ETA date wins over the standard one when it has one.
+      portal._setMockEta('GG-7', [{ partNo: 'GG-7', eta: '2099-01-15' }]);
+      const eta71 = await adv71.withEta([{ partNo: 'GG-7', qty: 1 }, { partNo: 'HH-8', qty: 1 }]);
+      check('ETA: the portal date when it has one, the standard days otherwise', eta71.lines[0].etaDate === '2099-01-15' && eta71.lines[1].etaFromPortal === false && eta71.etaDate === '2099-01-15');
       orders.cancel(d71b);
     } finally {
       config.salesTeamNumbers.splice(config.salesTeamNumbers.indexOf(S71), 1);

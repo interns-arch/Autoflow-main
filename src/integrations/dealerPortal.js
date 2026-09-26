@@ -78,6 +78,8 @@ function enabled() {
   return Boolean(dp.baseUrl && (dp.token || (dp.username && dp.password)));
 }
 const isMock = () => !enabled();
+const mockEta = new Map(); // partNo -> eta-mapping rows (tests)
+const mockAdvance = []; // advance-order bodies sent in mock mode (tests)
 
 // ---------------------------------------------------------------- transport
 
@@ -886,6 +888,14 @@ module.exports = {
   },
   setMockStock,
   setMockCustomers,
+  // The portal's ETA record for a part (GET /eta-mapping): the rows of the
+  // purchase orders it is coming in on, newest first. [] when none.
+  async etaMapping(partNo) {
+    if (isMock()) return mockEta.get(String(partNo).toUpperCase()) || [];
+    const rows = await api('GET', `/eta-mapping?partNo=${encodeURIComponent(partNo)}&limit=20`);
+    return Array.isArray(rows) ? rows : (rows && (rows.items || rows.data)) || [];
+  },
+  _setMockEta: (partNo, rows) => mockEta.set(String(partNo).toUpperCase(), rows || []),
   _setMockDuplicates: (rows) => { mockDuplicates = rows || []; },
   // Pulled at boot so the first customer who types a GSTIN is not the
   // one who finds out it takes 84 seconds.
@@ -1894,4 +1904,54 @@ module.exports = {
     store.log('portal', `sales order punched: ${result.soNumber}`);
     return result;
   },
+
+  // AN ADVANCE ORDER: parts with no stock, booked for the customer once they
+  // accept the ETA (founder, 26 Sep). The same confirm route, asked for the
+  // portal's UNALLOCATED order: each line "Not Available" with its whole
+  // quantity as the shortfall and no dealer allocation - the shape
+  // commercial-analyze itself returns for such a part.
+  //   adv = { id, ctx: portalCustomer, lines: [{ partNo, item, qty, price }], etaDate, actorUserId }
+  async advanceOrder(adv) {
+    const body = advanceBody(adv);
+    if (isMock()) {
+      const soNumber = 'ADV-' + store.nextSeq('so');
+      mockAdvance.push(body);
+      store.log('portal', `MOCK advance order: ${soNumber} (${body.lines.length} lines)`);
+      return { soNumber, body };
+    }
+    const data = await api('POST', dp.confirmPath, body);
+    const result = readConfirmResponse(data);
+    store.log('portal', `advance order placed: ${result.soNumber} (unallocated ${result.unallocatedOrderId || '-'})`);
+    return result;
+  },
+  _advanceBody: (adv) => advanceBody(adv),
+  _mockAdvance: () => mockAdvance,
 };
+
+function advanceBody(adv) {
+  const ctx = adv.ctx || {};
+  const days = adv.etaDate ? Math.max(1, Math.round((new Date(adv.etaDate + 'T00:00:00Z') - Date.now()) / 86400000)) : null;
+  const body = {
+    user_id: dp.userId,
+    ...(ctx.buyerId ? { selected_buyer_id: Number(ctx.buyerId) } : {}),
+    external_order_reference: `${adv.id}-ADV`,
+    include_unallocated: true,
+    allow_empty_dealers: true,
+    client_source: 'whatsapp-bot',
+    remarks: `Advance order - customer accepted ETA${adv.etaDate ? ' ' + adv.etaDate : ''} on WhatsApp (${adv.id})`,
+    lines: adv.lines.map((l) => ({
+      part_no: portalPartNo(l.partNo || l.item),
+      ...(l.partName || l.item ? { part_name: l.partName || l.item } : {}),
+      requested_qty: Number(l.qty) || 1,
+      status: 'Not Available',
+      shortfall: Number(l.qty) || 1,
+      dealers: [],
+      ...(l.price != null ? { price: Number(l.price) } : {}),
+      ...(days ? { tat_days: days } : {}),
+    })),
+  };
+  const branch = ctx.branchId || dp.sourceBranchDealerId;
+  if (branch) body.source_branch_dealer_id = Number(branch);
+  if (adv.actorUserId) body.actor_user_id = Number(adv.actorUserId);
+  return body;
+}

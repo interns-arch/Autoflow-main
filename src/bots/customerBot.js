@@ -112,6 +112,7 @@ const rateOptions = require('../core/chatState').slot('rateOptions');
 const discountSetup = require('../core/discountSetup');
 const approvalLog = require('../core/approvalLog');
 const payments = require('../core/payments');
+const advanceOrders = require('../core/advanceOrders');
 // The car a customer last NAMED in words, for the half hour after. "Swift
 // Dzire bumper price", then "mera gaadi 2018 model hai, kaun sa rear bumper"
 // - the second never says the car again, and searching "rear bumper" alone
@@ -454,6 +455,10 @@ class CustomerBot {
       rememberMsg(m.chatId, sentId, 'us', out);
       return true;
     };
+
+    // A yes/no to an ETA offer (core/advanceOrders) - customer or salesman -
+    // is taken before anything else reads it.
+    if (await this.answerEtaOffer(m, reply, t)) return true;
 
     // CUSTOMERS TALK TO THE AGENT — AND ONLY TO THE AGENT.
     //
@@ -2416,13 +2421,17 @@ class CustomerBot {
     const dropped = order.lines.filter((l) => !have(l));
     // Kept for the customer's "placed" message: what could not be punched.
     order.leftOut = order.leftOut || [];
+    // ...and as lines, so they can be offered to the customer with an ETA.
+    order.leftOutLines = order.leftOutLines || [];
     for (const l of dropped) order.leftOut.push(`${l.partNo || l.item} × ${l.qty}`);
+    for (const l of dropped) if (l.source === 'unavailable') order.leftOutLines.push({ partNo: l.partNo || l.item, item: l.item, qty: Number(l.qty) || 1, price: l.rate != null ? l.rate : l.price, mrp: l.mrp });
     for (const l of dropped) orders.removeItem(order, l.partNo || l.item);
     let cut = 0;
     for (const l of order.lines) {
       const a = Number(l.available) || 0;
       if (a > 0 && Number(l.qty) > a) {
         order.leftOut.push(`${l.partNo || l.item} × ${Number(l.qty) - a} (only ${a} in stock)`);
+        order.leftOutLines.push({ partNo: l.partNo || l.item, item: l.item, qty: Number(l.qty) - a, price: l.rate != null ? l.rate : l.price, mrp: l.mrp });
         l.qty = a;
         cut++;
       }
@@ -4004,6 +4013,19 @@ class CustomerBot {
     if (res && res.noCustomer) return reply(t(`${order.id} has no customer account attached, so the portal cannot bill it. Nothing was placed.`, `${order.id} pe customer account nahi hai, portal bill nahi kar sakta. Kuch place nahi hua.`));
     if (res && res.nothingInStock) {
       store.log(this.key, `${order.id} approved by ${who} — nothing in stock, nothing placed`);
+      // All of it is on order: the customer is offered the lot with its ETA.
+      const offered = await this.offerEta(order, { skipped: res.skipped || order.lines, short: [] }, null);
+      if (offered) {
+        order.status = 'eta-offered';
+        order.approvedBy = who;
+        store.save();
+        return reply(
+          t(
+            `Nothing in ${order.id} is in stock, so nothing was placed now. The customer has been asked to accept an ETA of ${advanceOrders.pretty(offered.etaDate)}; on their yes the parts are booked on the portal as an advance order.`,
+            `${order.id} mein abhi kuch stock mein nahi hai, isliye abhi kuch place nahi hua. Customer se ${advanceOrders.pretty(offered.etaDate)} ki ETA ke liye poocha hai; unke haan pe portal pe advance order book ho jayega.`,
+          ),
+        );
+      }
       return reply(t(`Nothing in ${order.id} is in stock now, so nothing was placed on the portal. It stays waiting — *OK ${order.id}* again once stock is in.`, `${order.id} mein abhi kuch stock mein nahi hai, isliye portal pe kuch place nahi hua. Stock aane pe dobara *OK ${order.id}* bhejiye.`));
     }
 
@@ -4031,23 +4053,110 @@ class CustomerBot {
     await tell(placedText(ct, order.requestedBy ? pc.name : null));
     // A salesman's order: the chat is the agent's, so the customer is told on
     // the phone on their account too (never on one of our own numbers).
-    if (order.requestedBy) {
-      const acct = String(pc.phone || (pc.raw && (pc.raw.phone || pc.raw.mobile)) || '').replace(/\D/g, '').slice(-10);
-      const to = acct.length === 10 ? '91' + acct : null;
-      if (to && to !== String(order.chatId || '').split('@')[0] && !this.isOperator({ from: to })) {
-        try {
-          await escalation.ensureWindow(this.transport, to, `Order ${so} placed — details follow`, so);
-          const custChat = to + '@cloud';
-          const text = placedText(lang.for(custChat), pc.name);
-          const id = await this.transport.sendToChat(custChat, text);
-          this.recordOutgoing(custChat, id, text);
-          store.log(this.key, `${order.id}: customer ${pc.name || ''} told on +${to}`);
-        } catch (e) {
-          store.log(this.key, `${order.id}: could not tell the customer on +${to}: ${String((e && e.message) || e).slice(0, 80)}`);
-        }
+    const custChat = this.customerChatOf(order);
+    if (order.requestedBy && custChat) {
+      const to = custChat.split('@')[0];
+      try {
+        await escalation.ensureWindow(this.transport, to, `Order ${so} placed — details follow`, so);
+        const text = placedText(lang.for(custChat), pc.name);
+        const id = await this.transport.sendToChat(custChat, text);
+        this.recordOutgoing(custChat, id, text);
+        store.log(this.key, `${order.id}: customer ${pc.name || ''} told on +${to}`);
+      } catch (e) {
+        store.log(this.key, `${order.id}: could not tell the customer on +${to}: ${String((e && e.message) || e).slice(0, 80)}`);
       }
     }
+    // Parts on order: the customer is offered them with an ETA, and they are
+    // booked in advance only on a yes.
+    await this.offerEta(order, res, so);
     return reply(t(`Placed — ${order.id} is portal order ${so}.\n${punched}`, `Place ho gaya — ${order.id} portal order ${so} hai.\n${punched}`));
+  }
+
+  // The customer's own chat for an order: the chat itself when they placed it,
+  // the phone on their account when a salesman did (never one of our numbers).
+  customerChatOf(order) {
+    if (!order.requestedBy) return order.chatId || null;
+    const pc = order.portalCustomer || {};
+    const acct = String(pc.phone || (pc.raw && (pc.raw.phone || pc.raw.mobile)) || '').replace(/\D/g, '').slice(-10);
+    const to = acct.length === 10 ? '91' + acct : null;
+    if (!to || to === String(order.chatId || '').split('@')[0] || this.isOperator({ from: to })) return null;
+    return to + '@cloud';
+  }
+
+  // Offer the parts that could not be punched to the customer, with their ETA
+  // (core/advanceOrders). With no customer number on a salesman's order, the
+  // salesman is asked instead. The salesman hears either way.
+  async offerEta(order, res, so) {
+    const custChat = this.customerChatOf(order);
+    const to = custChat || order.chatId;
+    if (!to) return null;
+    try {
+      const o = await advanceOrders.offer(this, {
+        order,
+        res,
+        soNumber: so,
+        to,
+        customerName: (order.portalCustomer && order.portalCustomer.name) || null,
+        agentChat: order.requestedBy ? order.chatId : null,
+        agentName: order.requestedBy || null,
+      });
+      if (o && order.requestedBy && custChat) {
+        const at = lang.for(order.chatId);
+        const text = at(
+          `ℹ️ ${o.lines.length} part(s) of ${order.id} are on order. ${o.customerName || 'The customer'} has been asked to accept the ETA (${advanceOrders.pretty(o.etaDate)}); on their yes they are booked as an advance order and you will be told.`,
+          `ℹ️ ${order.id} ke ${o.lines.length} part on order hain. ${o.customerName || 'Customer'} se ETA (${advanceOrders.pretty(o.etaDate)}) ke liye poocha hai; unke haan pe advance order book hoga aur aapko bata denge.`,
+        );
+        const id = await this.transport.sendToChat(order.chatId, text);
+        this.recordOutgoing(order.chatId, id, text);
+      }
+      return o;
+    } catch (e) {
+      store.log(this.key, `${order.id}: ETA offer failed: ${String((e && e.message) || e).slice(0, 120)}`);
+      return null;
+    }
+  }
+
+  // A reply to a standing ETA offer. true when it was one.
+  async answerEtaOffer(m, reply, t) {
+    const o = advanceOrders.pending(m.chatId);
+    if (!o) return false;
+    const said = String(m.body || '').trim();
+    const answer = advanceOrders.readReply(said, m.buttonId);
+    if (!answer) return false;
+    const tellAgent = async (en, hi) => {
+      if (!o.agentChat || o.agentChat === m.chatId) return;
+      try {
+        const text = lang.for(o.agentChat)(en, hi);
+        const id = await this.transport.sendToChat(o.agentChat, text);
+        this.recordOutgoing(o.agentChat, id, text);
+      } catch (_) {
+        /* the customer's answer stands either way */
+      }
+    };
+    if (answer === 'no') {
+      advanceOrders.decline(m.chatId);
+      await reply(t('No problem — nothing has been booked. Just message us whenever you need them.', 'Koi baat nahi — kuch book nahi kiya. Jab zaroorat ho, bas message kar dijiye.'));
+      await tellAgent(`${o.customerName || 'The customer'} said NO to the ETA for ${o.orderId} — nothing booked.`, `${o.customerName || 'Customer'} ne ${o.orderId} ki ETA ke liye NA kaha — kuch book nahi hua.`);
+      return true;
+    }
+    let done;
+    try {
+      done = await advanceOrders.accept(this, m.chatId);
+    } catch (e) {
+      const why = String((e && e.message) || e).slice(0, 200);
+      store.log(this.key, `${o.orderId}: advance order refused by the portal: ${why}`);
+      await reply(t('Thank you! Our team is booking these for you and will confirm shortly.', 'Shukriya! Hamari team inhe aapke liye book kar rahi hai, thodi der mein confirm karenge.'));
+      await this.toApprovers(`⚠️ Advance order for ${o.customerName || m.chatId} (${o.orderId}) — the customer accepted ETA ${advanceOrders.pretty(o.etaDate)}, but the portal refused it: ${why}\nParts:\n${o.lines.map((l) => `• ${l.partNo} × ${l.qty}`).join('\n')}\nPlease book it on the portal by hand.`).catch(() => {});
+      return true;
+    }
+    if (!done) return false;
+    await reply(advanceOrders.bookedText(o, done.soNumber, t));
+    await tellAgent(
+      `✅ ${o.customerName || 'The customer'} accepted the ETA — ${o.lines.length} part(s) of ${o.orderId} booked as advance order ${done.soNumber} (expected ${advanceOrders.pretty(o.etaDate)}).`,
+      `✅ ${o.customerName || 'Customer'} ne ETA maan li — ${o.orderId} ke ${o.lines.length} part advance order ${done.soNumber} mein book (${advanceOrders.pretty(o.etaDate)} tak).`,
+    );
+    await this.toApprovers(`📦 *Advance order* ${done.soNumber} — ${o.customerName || m.chatId} accepted ETA ${advanceOrders.pretty(o.etaDate)} for ${o.orderId}:\n${o.lines.map((l) => `• ${l.partNo} × ${l.qty}`).join('\n')}`).catch(() => {});
+    return true;
   }
 
   whereWeAre(m, t, { unclear = false } = {}) {

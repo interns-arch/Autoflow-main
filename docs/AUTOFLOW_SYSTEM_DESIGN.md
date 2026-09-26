@@ -309,6 +309,8 @@ Never escalated: sales team or admin questions, money questions from the desk, c
 | Every part line | search, `commercial-analyze` | Part match, stock, MRP, discount, tax, rate |
 | Customer from number / name | order-for-user, customer search | Who the order is for |
 | Punch | `POST /purchase-orders/confirm` | Draft SO (pending, nothing allocated). `include_unallocated` not sent, so only in-stock lines |
+| Advance order | `POST /purchase-orders/confirm` with `include_unallocated: true`, `allow_empty_dealers: true` | Parts not in stock, only after the customer accepts the ETA on WhatsApp (`core/advanceOrders`). Lines `status: Not Available`, `shortfall` = qty, no dealers; reference `ORD-NNNN-ADV` |
+| ETA | `GET /eta-mapping?partNo=` | The portal's ETA date for a part when it has one; otherwise `ON_ORDER_ETA_DAYS` (7) |
 | Confirm | `POST /orders/{id}/confirm-do` | Allocation starts |
 | Cancel / edit | `DELETE /orders/{id}` | Cancel; edit = cancel + punch again |
 | Status / detail | `GET /orders/{id}`, orders for a customer | "order kahan hai", "details of 686" |
