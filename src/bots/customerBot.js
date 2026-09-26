@@ -3314,9 +3314,9 @@ class CustomerBot {
   }
 
   // The portal's MRP for a part, for the price question.
-  async mrpOf(partNo, dealerId) {
+  async mrpOf(partNo, accountId) {
     try {
-      const got = await rates.prices([partNo], { ctx: dealerId ? { buyerId: dealerId } : null });
+      const got = await rates.prices([partNo], { ctx: accountId ? { buyerId: accountId } : null });
       const p = got.get(rates.norm(partNo));
       return p && p.mrp ? Number(p.mrp) : null;
     } catch (e) {
@@ -3353,7 +3353,11 @@ class CustomerBot {
         type,
         rule: { ...d },
         customer: st.customer,
+        // Two different ids (integrations/portalContracts): the ACCOUNT the
+        // agent picked, and the DEALER the portal's rules are made against.
+        accountId: st.accountId || null,
         dealerId: st.dealerId || null,
+        odooPartnerId: st.odooPartnerId || null,
         accountRequestId: st.accountRequestId || null,
         phone: st.phone || null,
         by: st.setBy,
@@ -3420,10 +3424,29 @@ class CustomerBot {
           }
           return next('confirmCustomer', t(`Set up the discount for ${st.row.name}? yes or no`, `${st.row.name} ka discount setup karein? haan ya nahi`));
         }
-        st.dealerId = st.row.id;
+        // The row is an ACCOUNT (its id is the account id). A rule is made
+        // against the customer's DEALER record: found through the Odoo
+        // partner both carry, or the setup stops - never the account id put
+        // where a dealer id goes (26 Sep, live: Houseneed's rule landed on
+        // dealer 227, Dhakad Car Decor).
+        st.accountId = Number(st.row.id);
+        const dl = await portal.dealerIdForAccount(st.accountId, st.row).catch((e) => ({ dealerId: null, why: 'the portal did not answer (' + String((e && e.message) || e).slice(0, 60) + ')' }));
+        if (!dl.dealerId) {
+          const name = st.row.name;
+          discountSetup.cancel(m.chatId);
+          store.log(this.key, `${m.from}: no discount for ${name} (account ${st.accountId}): ${dl.why}`);
+          return reply(
+            t(
+              `I can't set a discount for ${name}: ${dl.why}. Discount rules are made against the customer's dealer record on the portal — please ask the portal team to link this account to its dealer, then try again.`,
+              `${name} ka discount set nahi ho sakta: ${dl.why}. Discount rule portal pe customer ke dealer record pe banta hai — portal team se is account ko uske dealer se link karwaiye, phir dobara try kijiye.`,
+            ),
+          );
+        }
+        st.dealerId = dl.dealerId;
+        st.odooPartnerId = dl.odooPartnerId;
         st.customer = st.row.name;
         delete st.row;
-        store.log(this.key, `${m.from} confirmed ${st.customer} (${st.dealerId}) for a discount setup`);
+        store.log(this.key, `${m.from} confirmed ${st.customer} (account ${st.accountId} -> dealer ${st.dealerId}) for a discount setup`);
         return this.showDiscountRules(m, st, reply, t);
       }
       // ---- which rule ----
@@ -3442,7 +3465,7 @@ class CustomerBot {
         d.kind = rule.type === 'ITEM' ? 'part' : rule.type === 'BRAND' ? 'brand' : 'dealer';
         d.target = rule.partNo || rule.brand || 'ALL PARTS';
         if (d.kind === 'part') {
-          const mrp = await this.mrpOf(rule.partNo, st.dealerId);
+          const mrp = await this.mrpOf(rule.partNo, st.accountId);
           if (mrp) {
             d.mrp = mrp;
             return next(
@@ -3517,7 +3540,7 @@ class CustomerBot {
         }
         d.target = line.partNo || pn;
         // The price it may be sold at, against the portal's own MRP.
-        const mrp = await this.mrpOf(d.target, st.dealerId);
+        const mrp = await this.mrpOf(d.target, st.accountId);
         if (mrp) {
           d.mrp = mrp;
           return next('price', t(`${d.target} — MRP ${money(mrp)}. Lowest price to sell it at (₹)?`, `${d.target} — MRP ${money(mrp)}. Minimum kitne mein bechna hai (₹)?`));
@@ -3628,21 +3651,31 @@ class CustomerBot {
   // One approved rule, created on the portal against the customer as the
   // portal has them - looked up by phone for an account that was new.
   async createDiscountFor(req) {
-    let dealerId = req.dealerId;
+    // The ACCOUNT the request is for. Requests filed before 26 Sep kept it
+    // in `dealerId` (the bug this fixes): without an odooPartnerId, that
+    // number is the account id.
+    let accountId = req.accountId || (!req.odooPartnerId ? req.dealerId : null) || null;
     let name = req.customer;
-    if (!dealerId && req.phone) {
+    if (!accountId && req.phone) {
       try {
         const c = await portal.lookupCustomer(req.phone);
         if (c && c.found) {
-          dealerId = c.buyerId;
+          accountId = c.buyerId; // selected_buyer_id: an ACCOUNT id
           name = c.name || name;
         }
       } catch (e) {
         store.log(this.key, 'discount: customer lookup failed: ' + String((e && e.message) || e).slice(0, 80));
       }
     }
-    if (!dealerId) return { ok: false, name: req.rule.ruleName, why: 'customer not found on the portal yet' };
-    const body = discountSetup.toPortal({ ...req.rule, requestId: req.id, setBy: req.by }, dealerId, name);
+    if (!accountId) return { ok: false, name: req.rule.ruleName, why: 'customer not found on the portal yet' };
+    let target;
+    try {
+      target = await portal.dealerIdForAccount(accountId);
+    } catch (e) {
+      return { ok: false, name: req.rule.ruleName, why: 'the portal did not answer: ' + String((e && e.message) || e).slice(0, 80) };
+    }
+    if (!target.dealerId) return { ok: false, name: req.rule.ruleName, why: target.why };
+    const body = discountSetup.toPortal({ ...req.rule, requestId: req.id, setBy: req.by }, target, name);
     try {
       const made = await portal.createDiscountRule(body);
       // Approved here means approved there: a rule the portal parked as

@@ -6097,6 +6097,37 @@ async function main() {
         config.salesTeamNumbers.splice(config.salesTeamNumbers.indexOf(S74), 1);
         so74._resetDirectory();
       }
+
+      // 26 Sep, live: Houseneed (ACCOUNT 227) had its discount rule written to
+      // DEALER 227 - Dhakad Car Decor. Houseneed's dealer is 3340.
+      console.log('\n[75] discount rules go to the customer\'s DEALER id, never its account id');
+      {
+        portal._resetDealerCache();
+        portal._setMockDealerFor(227, { dealerId: 3340, dealerName: 'Houseneed Doorstep Services Private Limited', odooPartnerId: 1696, accountId: 227, accountName: 'Houseneed Doorstep Services Private Limited' });
+        portal._setMockDealerFor(9999, { dealerId: null, accountId: 9999, why: 'no dealer record carries Odoo partner 4242' });
+        portal._setMockDiscountRules([
+          { rule_id: 1, rule_type: 'BRAND', brand: 'MARUTI', dealer_id: 227, discount_mode: 'PERCENT', discount_value: 12, approval_status: 'APPROVED', is_active: true, rule_name: 'Dhakad MARUTI 12%' },
+          { rule_id: 2, rule_type: 'BRAND', brand: 'TATA', dealer_id: 3340, discount_mode: 'PERCENT', discount_value: 7, approval_status: 'APPROVED', is_active: true, rule_name: 'Houseneed TATA 7%' },
+        ]);
+        const disc75 = await portal.activeDiscounts(227);
+        check("a customer's discounts are the ones on its DEALER (3340), not on dealer 227", disc75.length === 1 && /TATA/i.test(JSON.stringify(disc75)), JSON.stringify(disc75));
+
+        const made75 = await customer.createDiscountFor({ id: 'DSC-T75', rule: { kind: 'brand', target: 'MARUTI SUZUKI', value: 15, minQty: 1, days: 30, ruleName: 'x' }, customer: 'Houseneed Doorstep Services Private Limited', dealerId: 227, by: 'Shubham' });
+        const rule75 = (await portal.listDiscountRules()).find((r) => r.rule_metadata && r.rule_metadata.requestId === 'DSC-T75');
+        check('a request filed with the account id in dealerId (before the fix) is created on dealer 3340', made75.ok && rule75 && rule75.dealer_id === 3340, JSON.stringify(rule75));
+        check('...and the rule says which account and Odoo partner it was resolved from', rule75 && rule75.rule_metadata.account_id === 227 && rule75.rule_metadata.odoo_partner_id === 1696);
+
+        const made75b = await customer.createDiscountFor({ id: 'DSC-T75B', rule: { kind: 'brand', target: 'MARUTI', value: 10, minQty: 1, days: 30, ruleName: 'y' }, customer: 'Nolink Motors', accountId: 9999, odooPartnerId: null, by: 'Shubham' });
+        check('an account with no single dealer gets no rule at all, and says why', !made75b.ok && /no dealer record/.test(made75b.why || ''), JSON.stringify(made75b));
+
+        const card75 = await require('../src/core/salesOrder').customerCard({ id: 227, name: 'Houseneed Doorstep Services Private Limited', credit_limit: 100000 }, (en) => en);
+        check('the card names both ids for what they are', /Account id: 227 · Dealer id: 3340/.test(card75), card75);
+        const ds75 = require('../src/core/discountSetup');
+        const rej75 = ds75.activeRules([{ rule_id: 9, rule_type: 'BRAND', brand: 'MARUTI', dealer_id: 227, discount_mode: 'PERCENT', discount_value: 15, approval_status: 'REJECTED', is_active: true, rule_metadata: { source: 'whatsapp-bot' } }], 227);
+        check("a bot rule REJECTED on the portal gives no discount", rej75.length === 0, JSON.stringify(rej75));
+        portal._resetDealerCache();
+        portal._setMockDiscountRules([]);
+      }
     } finally {
       config.salesTeamNumbers.splice(config.salesTeamNumbers.indexOf(S71), 1);
       if (orders.findDraft(C71)) orders.cancel(orders.findDraft(C71));

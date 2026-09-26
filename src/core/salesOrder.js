@@ -410,6 +410,9 @@ async function customerCard(row, t) {
   }
   const money = (v) => (v === null || v === undefined || v === '' ? null : '₹' + Number(v).toLocaleString('en-IN', { maximumFractionDigits: 2 }));
   const discounts = await portal.activeDiscounts(full.id).catch(() => []);
+  // Two ids, named as what they are (integrations/portalContracts): this row's
+  // id is the ACCOUNT; discount rules are made against the DEALER.
+  const dl = await portal.dealerIdForAccount(full.id, full).catch(() => null);
   const lines = [
     `*${full.name}*`,
     full.phone || full.mobile ? 'Phone: ' + (full.phone || full.mobile) : null,
@@ -427,7 +430,7 @@ async function customerCard(row, t) {
     full.home_branch_dealer_id || full.home_branch_dealer
       ? 'Home branch: ' + require('./dataEntryRequests').branchName(full.home_branch_dealer_id || full.home_branch_dealer)
       : null,
-    'Portal id: ' + full.id,
+    'Account id: ' + full.id + (dl && dl.dealerId ? ' · Dealer id: ' + dl.dealerId : ''),
     discounts.length
       ? t('Discounts now: ', 'Abhi discount: ') + discounts.map((d) => `${d.on} ${d.percent}%${d.validTill ? ' (till ' + d.validTill + ')' : ''}`).join('; ')
       : t('Discounts now: none', 'Abhi discount: koi nahi'),
