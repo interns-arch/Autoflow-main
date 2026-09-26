@@ -195,6 +195,8 @@ const config = {
   dailyReportTime: (process.env.DAILY_REPORT_TIME || '20:00').trim(),
   // The CSV report to the Sales Heads: customers created, sales, approvals.
   approvalReportTime: (process.env.APPROVAL_REPORT_TIME || '18:00').trim(),
+  // The dashboard (/dashboard): its data is shown only with this key. Unset = off.
+  dashboardKey: (process.env.DASHBOARD_KEY || '').trim(),
 
   // human-confirm escalation: confusion par is number ko DM, itni der jawab
   // ka intezar, phir customer ko fallback reply. Helper ka jawab PERMANENTLY
