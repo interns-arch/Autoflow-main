@@ -5959,6 +5959,42 @@ async function main() {
       const eta71 = await adv71.withEta([{ partNo: 'GG-7', qty: 1 }, { partNo: 'HH-8', qty: 1 }]);
       check('ETA: the portal date when it has one, the standard days otherwise', eta71.lines[0].etaDate === '2099-01-15' && eta71.lines[1].etaFromPortal === false && eta71.etaDate === '2099-01-15');
       orders.cancel(d71b);
+
+      // 26 Sep, live: DSC-NH2X reached Prateek sir only - WhatsApp refused
+      // Arun sir's and Shad's (131042 template, then 131047) - and the agent
+      // was told "Sent for approval" regardless.
+      console.log('\n[72] an approval WhatsApp would not deliver is reported to whoever asked');
+      const dw72 = require('../src/core/deliveryWatch');
+      const cr72 = require('../src/config').creation;
+      const apprWas72 = cr72.approvers;
+      cr72.approvers = { 919999492550: 'Prateek Sir', 919773900582: 'Arun Sir', 916388059016: 'Shad' };
+      try {
+        customer.transport.outbox.length = 0;
+        await customer.toApprovers('*Discount rule* — DSC-T72', { ref: 'DSC-T72', requesterChat: 'sim-919000000721' });
+        const ids72 = Object.fromEntries(customer.transport.outbox.filter((o) => /DSC-T72/.test(o.text)).map((o) => [o.to, o.id]));
+        check('(the request went to all three)', Object.keys(ids72).length === 3, JSON.stringify(ids72));
+        customer.transport.outbox.length = 0;
+        // Shad: the template fails first (not tracked), then the request itself.
+        await customer.transport.injectFailure({ id: 'wamid.template-x', to: '916388059016', code: 131042, why: 'Business eligibility payment issue' });
+        await customer.transport.injectFailure({ id: ids72['916388059016'], to: '916388059016', code: 131047, why: 'Re-engagement message' });
+        await customer.transport.injectFailure({ id: ids72['919773900582'], to: '919773900582', code: 131047, why: 'Re-engagement message' });
+        await customer.transport.injectFailure({ id: ids72['919773900582'], to: '919773900582', code: 131047, why: 'Re-engagement message' }); // a repeat
+        check('nothing is said while the failures are still coming in', customer.transport.outbox.length === 0);
+        await dw72._flushAll(customer);
+        const toAgent72 = customer.transport.outbox.filter((o) => /919000000721/.test(o.to || '')).map((o) => o.text);
+        const toPrateek72 = customer.transport.outbox.filter((o) => o.to === '919999492550').map((o) => o.text);
+        check('the agent who asked gets ONE warning naming both who did not get it', toAgent72.length === 1 && /DSC-T72/.test(toAgent72[0]) && /Shad/.test(toAgent72[0]) && /Arun Sir/.test(toAgent72[0]), JSON.stringify(toAgent72));
+        check('...with the reason and the fix: Meta billing, and "Hi" for the 24h window', /currency|payment method/i.test(toAgent72[0] || '') && /Hi/.test(toAgent72[0] || ''), toAgent72[0]);
+        check('the Sales Head whose copy went through is told too', toPrateek72.length === 1 && /DSC-T72/.test(toPrateek72[0]), JSON.stringify(toPrateek72));
+        check('...and nothing is sent to the ones it could not reach', !customer.transport.outbox.some((o) => o.to === '916388059016' || o.to === '919773900582'));
+        customer.transport.outbox.length = 0;
+        await customer.transport.injectFailure({ id: 'wamid.unrelated', to: '919000000999', code: 131047, why: '' });
+        await dw72._flushAll(customer);
+        check('a failure of any other message warns nobody', customer.transport.outbox.length === 0);
+      } finally {
+        cr72.approvers = apprWas72;
+        dw72._reset();
+      }
     } finally {
       config.salesTeamNumbers.splice(config.salesTeamNumbers.indexOf(S71), 1);
       if (orders.findDraft(C71)) orders.cancel(orders.findDraft(C71));

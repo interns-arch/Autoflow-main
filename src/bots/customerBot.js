@@ -113,6 +113,7 @@ const discountSetup = require('../core/discountSetup');
 const approvalLog = require('../core/approvalLog');
 const payments = require('../core/payments');
 const advanceOrders = require('../core/advanceOrders');
+const deliveryWatch = require('../core/deliveryWatch');
 // The car a customer last NAMED in words, for the half hour after. "Swift
 // Dzire bumper price", then "mera gaadi 2018 model hai, kaun sa rear bumper"
 // - the second never says the car again, and searching "rear bumper" alone
@@ -312,6 +313,8 @@ class CustomerBot {
     // pipeline/shadow watches beside the handler when AI_SHADOW=true, and
     // otherwise just calls it. It never changes what the handler returns.
     this.transport.onMessage((m) => require('../pipeline/shadow').around(this, m, () => this.handleMessage(m)));
+    // An approval WhatsApp would not deliver is reported (core/deliveryWatch).
+    if (this.transport.onDeliveryFailed) this.transport.onDeliveryFailed((info) => deliveryWatch.onFailed(this, info));
     await this.transport.start();
   }
 
@@ -2515,6 +2518,7 @@ class CustomerBot {
             ? await this.transport.sendImage(phone, Buffer.from(form._photo, 'base64'), form.answers.shopPhoto.mime, text)
             : await this.transport.sendText(phone, text);
         customerCreate.noteSummary(sentId, form.answers.requestId);
+        deliveryWatch.track(sentId, { ref: form.answers.requestId, to: phone, requesterChat: this.isOperator(m) ? m.chatId : null });
       } catch (e) {
         store.log(this.key, `could not reach approver ${phone}: ${String((e && e.message) || e).slice(0, 90)}`);
       }
@@ -2573,7 +2577,9 @@ class CustomerBot {
       try {
         // Outside the 24h window a plain text is silently dropped (escalation.ensureWindow).
         await escalation.ensureWindow(this.transport, phone, 'Account approval coming — details follow');
-        customerCreate.noteSummary(await this.transport.sendText(phone, text), form.answers.requestId);
+        const sentId = await this.transport.sendText(phone, text);
+        customerCreate.noteSummary(sentId, form.answers.requestId);
+        deliveryWatch.track(sentId, { ref: form.answers.requestId, to: phone, requesterChat: this.isOperator(m) ? m.chatId : null });
       } catch (e) {
         store.log(this.key, `could not reach approver ${phone}: ${String((e && e.message) || e).slice(0, 90)}`);
       }
@@ -3104,13 +3110,16 @@ class CustomerBot {
     ];
   }
 
-  async toApprovers(text) {
+  // track = { ref, requesterChat }: an approval request, watched for delivery
+  // (core/deliveryWatch) - the one who asked hears if a Sales Head never got it.
+  async toApprovers(text, track = null) {
     let sent = 0;
     for (const phone of Object.keys(config.creation.approvers)) {
       try {
         // Outside the 24h window a plain text is silently dropped (escalation.ensureWindow).
         await escalation.ensureWindow(this.transport, phone, 'Discount approval coming — details follow');
-        await this.transport.sendText(phone, text);
+        const id = await this.transport.sendText(phone, text);
+        if (track) deliveryWatch.track(id, { ...track, to: phone });
         sent++;
       } catch (e) {
         store.log(this.key, `could not reach approver ${phone}: ${String((e && e.message) || e).slice(0, 90)}`);
@@ -3299,7 +3308,7 @@ class CustomerBot {
         chatId: m.chatId,
         ...extra,
       });
-      await this.toApprovers(discountSetup.approvalText(req));
+      await this.toApprovers(discountSetup.approvalText(req), { ref: req.id, requesterChat: m.chatId });
       store.log(this.key, `${req.id}: discount ${type} for ${st.customer} sent for approval (${d.target || ''} ${d.value}%)`);
       approvalLog.record({ kind: 'discount', id: req.id, event: 'requested', by: st.setBy || null, customer: st.customer, detail: `${type === 'change' ? 'change ' + (extra && extra.oldValue) + '% → ' : ''}${d.kind || ''} ${d.target || ''} ${d.value}%`.trim() });
       return req;
@@ -3745,8 +3754,9 @@ class CustomerBot {
     for (const acc of Object.keys(config.payments.accountants || {})) {
       try {
         await escalation.ensureWindow(this.transport, acc, 'Payment to check — details follow');
-        if (photo && this.transport.sendImage) await this.transport.sendImage(acc, Buffer.from(photo.base64, 'base64'), photo.mime, text);
-        else await this.transport.sendText(acc, text);
+        const sentId =
+          photo && this.transport.sendImage ? await this.transport.sendImage(acc, Buffer.from(photo.base64, 'base64'), photo.mime, text) : await this.transport.sendText(acc, text);
+        deliveryWatch.track(sentId, { ref: req.id, to: acc });
         sent++;
       } catch (e) {
         store.log(this.key, `${req.id}: could not reach accountant ${acc}: ${String((e && e.message) || e).slice(0, 80)}`);
@@ -3949,7 +3959,7 @@ class CustomerBot {
     order.status = 'approval';
     order.approvalAskedAt = new Date().toISOString();
     store.save();
-    const sent = await this.toApprovers(text);
+    const sent = await this.toApprovers(text, { ref: order.id, requesterChat: opts.by ? order.chatId : null });
     if (!sent) {
       order.status = was;
       store.save();

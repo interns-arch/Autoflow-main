@@ -84,6 +84,12 @@ class CloudTransport {
     this.handlers.push(fn);
   }
 
+  // A message WhatsApp would not deliver: fn({ id, to, code, why }). Called
+  // for every "failed" status the webhook brings (core/deliveryWatch).
+  onDeliveryFailed(fn) {
+    (this.failHandlers = this.failHandlers || []).push(fn);
+  }
+
   async _post(path, body) {
     const res = await fetch(`${GRAPH}/${path}`, {
       method: 'POST',
@@ -349,6 +355,17 @@ class CloudTransport {
             })
             .join(', ');
           const errs = (value.errors || []).map((e) => e.title || e.message).join('; ');
+          for (const s of value.statuses || []) {
+            if (s.status !== 'failed' || !(this.failHandlers || []).length) continue;
+            const e0 = (s.errors || [])[0] || {};
+            const info = {
+              id: s.id,
+              to: s.recipient_id,
+              code: e0.code || null,
+              why: [e0.title || e0.message, e0.error_data && e0.error_data.details].filter(Boolean).join(' - '),
+            };
+            for (const fn of this.failHandlers) Promise.resolve().then(() => fn(info)).catch(() => {});
+          }
           store.log(
             this.botKey,
             `webhook [${change.field}] pn=${pnid || '?'} keys=${kinds.join('+') || 'none'}` +
