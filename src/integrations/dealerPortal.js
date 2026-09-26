@@ -1255,6 +1255,13 @@ module.exports = {
     return Array.isArray(data) ? data : (data && (data.items || data.data || data.results)) || [];
   },
 
+  // The portal's credit control for one account: credit_days, collection_days,
+  // credit_limit, open invoices, whether billing is blocked and why.
+  async creditControl(accountId) {
+    if (isMock()) return { account_id: accountId, credit_days: 1, collection_days: 15, credit_limit: 100000, allowed: true };
+    return api('GET', '/accounts/' + encodeURIComponent(accountId) + '/credit-control', null, true, 'admin');
+  },
+
   // A customer's HOME BRANCH (Bijwasan 23 / Mansarovar 1078), which decides
   // the warehouse their orders are allocated from. It lives on the ACCOUNT,
   // and the portal's own way to change it is the customer-branch mapping —

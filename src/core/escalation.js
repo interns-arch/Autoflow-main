@@ -213,7 +213,9 @@ function pickSender(customerBot) {
 // with a short heads-up so the helper knows a question is coming.
 const WINDOW_MS = 22 * 60 * 60 * 1000; // 22h with 2h safety margin
 const TEMPLATE_NAME = (process.env.ESCALATION_TEMPLATE || 'order_update').trim();
-async function ensureWindow(sender, helperPhone, headsUp = 'New customer question incoming — details follow') {
+// `label` fills the template's first slot ("Update on your order {{1}}"):
+// 'Helper' for staff; an invoice number or the customer's name for customers.
+async function ensureWindow(sender, helperPhone, headsUp = 'New customer question incoming — details follow', label = 'Helper') {
   if (!sender.sendTemplate) return; // not Cloud API
   const norm = store.normPhone(helperPhone);
   const last = helperLastInbound.get(norm) || 0;
@@ -224,7 +226,7 @@ async function ensureWindow(sender, helperPhone, headsUp = 'New customer questio
       {
         type: 'body',
         parameters: [
-          { type: 'text', text: 'Helper' },
+          { type: 'text', text: String(label || 'Helper').slice(0, 60) },
           { type: 'text', text: headsUp },
         ],
       },

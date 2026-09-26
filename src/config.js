@@ -195,6 +195,9 @@ const config = {
   dailyReportTime: (process.env.DAILY_REPORT_TIME || '20:00').trim(),
   // The CSV report to the Sales Heads: customers created, sales, approvals.
   approvalReportTime: (process.env.APPROVAL_REPORT_TIME || '18:00').trim(),
+  // Payment reminders, two days before the collection date (core/collectionReminders).
+  // REMINDER_TIME=off turns them off.
+  reminderTime: (process.env.REMINDER_TIME || '10:00').trim(),
   // The dashboard (/dashboard): its data is shown only with this key. Unset = off.
   dashboardKey: (process.env.DASHBOARD_KEY || '').trim(),
 

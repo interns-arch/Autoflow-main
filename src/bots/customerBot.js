@@ -3628,7 +3628,7 @@ class CustomerBot {
         `Namaste ${customer.name}. Aapka pichla ${payments.money(due.due)} baaki hai, isliye naya order${opts.agent ? ' (' + opts.agent + ' ne lagaya)' : ''} ruka hua hai. Neeche QR se pay karke "payment kar diya" likhiye — confirm hote hi order aage badh jayega.`,
       );
       try {
-        await escalation.ensureWindow(this.transport, store.normPhone(opts.customerPhone), 'Payment due — details follow');
+        await escalation.ensureWindow(this.transport, store.normPhone(opts.customerPhone), 'Payment due — details follow', customer.name);
         const id = await this.transport.sendToChat(custChat, text);
         this.recordOutgoing(custChat, id, text);
       } catch (e) {
