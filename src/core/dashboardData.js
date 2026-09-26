@@ -20,6 +20,7 @@ function whoIs(phone) {
   const agent = (config.creation.team || {})[p];
   if (agent) return agent;
   if ((config.salesTeamNumbers || []).includes(p)) return 'Sales team ' + p;
+  if ((config.adminNumbers || []).includes(p)) return 'Admin ' + p;
   return null;
 }
 
@@ -47,7 +48,7 @@ function customers(events) {
       requestedAt: req.at || (done && done.at) || last.at,
       decidedAt: (done || rej || {}).at || null,
       status: done ? 'created' : rej ? 'rejected' : 'waiting for approval',
-      customer: facts.customer || null,
+      customer: facts.customer || (facts.phone ? facts.phone + (rej && rej.note === 'GST review' ? ' (GST not verified)' : '') : null),
       phone: facts.phone || null,
       gst: facts.gst || null,
       businessType: facts.businessType || null,
@@ -128,7 +129,14 @@ function orders(events) {
     const failed = log.find((e) => e.event === 'failed');
     const pc = o.portalCustomer || (typeof o.customer === 'object' ? o.customer : null) || {};
     const chatPhone = phoneOf(o.chatId);
-    const agent = req && /sales team/i.test(req.by || '') ? String(req.by).replace(/\s*\(sales team\)\s*$/, '') : whoIs(chatPhone);
+    // Who placed it, as recorded when it was asked for; the number's role
+    // today only when nothing was recorded (7355374975 was a customer's
+    // number on 25 Sep and is an agent's now).
+    const agent = req
+      ? /sales team/i.test(req.by || '')
+        ? String(req.by).replace(/\s*\(sales team\)\s*$/, '')
+        : null
+      : whoIs(chatPhone);
     const punched = (o.lines || []).filter((l) => l.source !== 'unidentified' && l.source !== 'unknown' && l.source !== 'unavailable' && (Number(l.available) || 0) > 0);
     const amount = punched.reduce((s, l) => s + (Number(l.rate) || Number(l.mrp) || 0) * Math.min(Number(l.qty) || 0, Number(l.available) || 0), 0);
     out.push({
@@ -148,6 +156,37 @@ function orders(events) {
     });
   }
   return out.sort((a, b) => String(b.at).localeCompare(String(a.at)));
+}
+
+// Accounts opened before the approval log kept their details (24 Sep) are
+// filled in from the portal: phone, GSTIN, address, home branch.
+let portalCache = { at: 0, rows: new Map() };
+async function enrich(list) {
+  const portal = require('../integrations/dealerPortal');
+  const de = require('./dataEntryRequests');
+  if (Date.now() - portalCache.at > 10 * 60 * 1000) portalCache = { at: Date.now(), rows: new Map() };
+  for (const c of list) {
+    if (c.status !== 'created' || !c.customer || (c.gst && c.phone && c.address && c.homeBranch)) continue;
+    let row = portalCache.rows.get(c.customer);
+    if (row === undefined) {
+      const rows = await portal.searchAccounts(c.customer).catch(() => []);
+      row = rows.find((r) => String(r.name || '').trim() === c.customer) || null;
+      portalCache.rows.set(c.customer, row);
+    }
+    if (!row) continue;
+    c.phone = c.phone || row.phone || row.mobile || null;
+    c.gst = c.gst || row.gst_no || null;
+    c.address = c.address || [row.address, row.state_name].filter(Boolean).join(', ') || null;
+    c.contactPerson = c.contactPerson || row.person || null;
+    c.homeBranch = c.homeBranch || (row.address || row.state_name ? de.branchName(de.branchFor({ state: row.state_name, address: row.address })) : null);
+  }
+  return list;
+}
+
+async function buildLive() {
+  const out = build();
+  await enrich(out.customers).catch(() => {});
+  return out;
 }
 
 function build() {
@@ -178,4 +217,4 @@ function build() {
   };
 }
 
-module.exports = { build };
+module.exports = { build, buildLive };
