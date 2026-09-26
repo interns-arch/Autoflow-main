@@ -2896,7 +2896,7 @@ class CustomerBot {
 
     // A GREETING or a courtesy is answered here, never sent to a person.
     const said = String(text || '').trim();
-    if (!attachment && said && (GREETING.test(said) || /^(ok+|okay|thik|theek|theek hai|thik hai|thanks?|thank you|thx|dhanyawad|shukriya|haan|ha|ji|hmm+|👍|🙏)[\s!.]*$/i.test(said))) {
+    if (!attachment && said && (GREETING.test(said) || /^(ok+|okay|thik|theek|theek hai|thik hai|thanks?|thank you|thx|dhanyawad|shukriya|haan|ha|ji|hmm+|👍)[\s!.]*$/i.test(said))) {
       store.log(this.key, `agent could not answer ${m.from} — greeting answered without it: "${said.slice(0, 30)}"`);
       return reply(
         GREETING.test(said)
