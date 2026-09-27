@@ -103,7 +103,7 @@ function addLines(order, resolvedLines, { replace = false } = {}) {
     // overwrite ORDER 179's. Only typed items merge by name, which is what a
     // customer listing more parts in chat actually means.
     // Match on the PART NUMBER the portal resolved, not only on the customer's
-    // wording. The same label photographed twice can come out of OCR as
+    // wording. The same label photographed twice can be read back as
     // "17521m52TOO" and "17521M52T00" — one character apart, the same part —
     // and the cart ended up holding both. Once the portal has named them, they
     // are the same line.
@@ -175,9 +175,11 @@ function cancel(order) {
 function lineText(l, t) {
   t = t || ((en) => en);
   const name = availability.displayName(l);
-  // NO PRICE to the customer. The CRM team does not quote rates over WhatsApp
-  // and neither does the bot — a rate needs a person who knows the account.
-  const price = '';
+  // The money, on the same line as the stock. One rule, in
+  // availability.priceOf: a customer the portal knows sees the rate it priced
+  // for THEIR account; anyone else sees MRP and never the logged-in account's
+  // negotiated discount.
+  const price = availability.priceOf(l);
   if (l.source === 'unavailable')
     return `${name} x${l.qty}${price} - on order, ETA = ${appConfig.onOrderEtaDays} days`;
   if (l.source === 'unknown' || l.source === 'unidentified')
@@ -236,7 +238,7 @@ function summary(order) {
   return order.lines
     .map((l, i) => {
       const name = availability.displayName(l);
-      const price = ''; // see lineText: rates never go to the customer
+      const price = availability.priceOf(l);
       const state =
         l.source === 'unavailable'
           ? `on order, ETA = ${appConfig.onOrderEtaDays} days`
@@ -269,7 +271,11 @@ function summary(order) {
 // because both calls read it before either writes.
 const inFlight = new Set();
 
-async function confirm(order) {
+// `opts.approvedBy`: a Sales Head said "OK ORD-…" to this order. That is the
+// one thing that places it while ORDER_CONFIRM_ENABLED is off — the switch
+// stays off for everything else — and it is placed as it stands now: stock is
+// re-read and whatever is there is punched, without asking the customer again.
+async function confirm(order, opts = {}) {
   if (!order.lines.length) throw new Error('nothing to confirm');
 
   // Already being punched by another message this second.
@@ -279,7 +285,7 @@ async function confirm(order) {
   }
   inFlight.add(order.id);
   try {
-    return await punch(order);
+    return await punch(order, opts);
   } finally {
     inFlight.delete(order.id);
   }
@@ -287,14 +293,28 @@ async function confirm(order) {
 
 // The punch itself. Only ever called through confirm() above, which holds
 // the lock for the whole of it.
-async function punch(order) {
+async function punch(order, opts = {}) {
 
   const config = require('../config');
 
   // Refused BEFORE the portal is touched, so no stray "yes" during testing can
   // create an order a person then has to cancel by hand. Checked here rather
   // than at the call site because this is the only door to the confirm API.
-  if (!config.dealerPortal.confirmEnabled) {
+  // AN ORDER IS FOR SOMEBODY. The customer the portal bills is
+  // order.portalCustomer; a cart that only carries order.customer (the
+  // agent's, before 25 Sep) takes it from there. Without one, the portal
+  // makes an order with no buyer — no customer on it, no Odoo SO (portal order
+  // 1214) — so nothing is sent at all.
+  if (!(order.portalCustomer && order.portalCustomer.buyerId) && order.customer && typeof order.customer === 'object' && order.customer.buyerId) {
+    order.portalCustomer = order.customer;
+    store.save();
+  }
+  if (!(order.portalCustomer && order.portalCustomer.buyerId)) {
+    store.log('orders', `${order.id} confirm REFUSED — no portal customer on the order`);
+    return { noCustomer: true };
+  }
+
+  if (!config.dealerPortal.confirmEnabled && !opts.approvedBy) {
     store.log('orders', `${order.id} confirm BLOCKED — ORDER_CONFIRM_ENABLED is not true (testing mode)`);
     return { blocked: true, lines: order.lines.length };
   }
@@ -302,7 +322,7 @@ async function punch(order) {
   const ageMin = (Date.now() - quotedAt) / 60000;
 
   // Too old to be worth refreshing — the intent is gone, not just the numbers.
-  if (ageMin > config.dealerPortal.quoteMaxAgeHours * 60) {
+  if (!opts.approvedBy && ageMin > config.dealerPortal.quoteMaxAgeHours * 60) {
     order.status = 'expired';
     store.save();
     return { stale: true, expired: true };
@@ -328,7 +348,7 @@ async function punch(order) {
 
   // Only interrupt when the change actually matters to the customer, or when
   // the quote had gone stale on time anyway.
-  if (moved.length && ageMin > config.dealerPortal.quoteTtlMinutes) {
+  if (!opts.approvedBy && moved.length && ageMin > config.dealerPortal.quoteTtlMinutes) {
     store.log('orders', `${order.id} confirm: stock moved since the quote — asking again`);
     return { stale: true, moved, ageMin: Math.round(ageMin) };
   }

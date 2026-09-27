@@ -1,7 +1,7 @@
 'use strict';
 // Message understanding.
-// Deterministic parsers work out of the box; if ANTHROPIC_API_KEY is set,
-// Claude is used first (handles Hinglish, free-form sentences, messy lists)
+// Deterministic parsers work out of the box; with GEMINI_API_KEY set the
+// model is used first (handles Hinglish, free-form sentences, messy lists)
 // and the deterministic parser remains the fallback.
 const config = require('../config');
 const store = require('../store');
@@ -230,8 +230,8 @@ function looksLikeList(text) {
 }
 
 function parseLinesBlock(rawText) {
-  // Applied here rather than only in the OCR path: customers copy the spaced
-  // form straight off the label into a typed message too.
+  // Applied to TYPED messages too, not only to what came off a photo:
+  // customers copy the spaced form straight off the label into a message.
   const text = joinSpacedPartNumbers(rawText);
   // Scan tokens when a line holds two or more part numbers (the line parser
   // would glue them into one nonsense item), or when a quantity is written
@@ -489,29 +489,22 @@ function textGrounded(item, text) {
   return needle.split(' ').some((w) => w.length >= 3 && hay.includes(w));
 }
 
-// ---------------- Claude-backed parsing ----------------
+// ---------------- model-backed parsing ----------------
 
 // Tests put a stand-in here, so the suite can reproduce what the live model
 // actually did (13 Sep: "16510m65l10 -5" came back as an inquiry) without a
 // network call.
-let claudeStub = null;
+let modelStub = null;
 
-// Gemini, asked the same question and answering in the same shape, so every
-// caller of claude() below works unchanged when Anthropic is not there.
+// THE MODEL IS GEMINI. Every caller — smallTalk, the free-text parser, the
+// naming model, the knowledge base, photos — goes through model() below, so
+// there is one place that knows the provider.
 //
-// 21 Sep: the Anthropic key was revoked and this bot lost its voice — not
-// just photos. smallTalk, the free-text parser and the naming model all go
-// through claude(), so one dead credential turned every conversational reply
-// into "Samajh nahi paya sir". Routing the fallback HERE rather than at each
-// call site means there is one place that knows about providers.
-//
-// `user` is Claude's own shape: a plain string, or content blocks where an
-// image is { type:'image', source:{ media_type, data } }. Both are mapped.
-async function geminiJson(system, user) {
-  const g = config.gemini;
-  if (!g.apiKey) throw new Error('no Gemini key');
+// `user` is a plain string, or content blocks where an image is
+// { type:'image', source:{ media_type, data } }. Both are mapped.
+function partsOf(user) {
   const blocks = Array.isArray(user) ? user : [{ type: 'text', text: String(user == null ? '' : user) }];
-  const parts = blocks
+  return blocks
     .map((b) => {
       if (b && b.type === 'image' && b.source && b.source.data) {
         return { inline_data: { mime_type: b.source.media_type || 'image/jpeg', data: b.source.data } };
@@ -520,10 +513,14 @@ async function geminiJson(system, user) {
       return text ? { text: String(text) } : null;
     })
     .filter(Boolean);
+}
 
+async function geminiJson(system, user, { modelName, tools, timeoutMs } = {}) {
+  const g = config.gemini;
+  if (!g.apiKey) throw new Error('no Gemini key');
   const url =
     'https://generativelanguage.googleapis.com/v1beta/models/' +
-    encodeURIComponent(g.visionModel) +
+    encodeURIComponent(modelName || g.visionModel) +
     ':generateContent';
   // 500-class is the model being busy — worth one more ask. 429 is not: it is
   // either "slow down" or a spent quota, and neither is fixed by hammering.
@@ -536,13 +533,14 @@ async function geminiJson(system, user) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         systemInstruction: system ? { parts: [{ text: String(system) }] } : undefined,
-        contents: [{ parts }],
+        contents: [{ parts: partsOf(user) }],
+        ...(tools ? { tools } : {}),
       }),
-      signal: AbortSignal.timeout(g.timeoutMs),
+      signal: AbortSignal.timeout(timeoutMs || g.timeoutMs),
     });
     if (res.ok || !RETRY_ON.has(res.status)) break;
   }
-  if (!res.ok) throw new Error('Gemini API HTTP ' + res.status + ' ' + (await res.text()).slice(0, 120));
+  if (!res.ok) throw new Error('Gemini API HTTP ' + res.status + ' ' + (await res.text()).slice(0, 160));
   const data = await res.json();
   const text = (((data.candidates || [])[0] || {}).content?.parts || []).map((p) => p.text || '').join('');
   const json = text.match(/\{[\s\S]*\}/);
@@ -550,89 +548,27 @@ async function geminiJson(system, user) {
   return JSON.parse(json[0]);
 }
 
-// Is there any model at all behind this bot? Callers used to ask
-// `config.ai.apiKey`, which is now only half the answer.
+// Is there a model behind this bot at all?
 function modelAvailable() {
-  return Boolean(config.ai.apiKey || (config.gemini && config.gemini.apiKey));
+  return Boolean(config.gemini && config.gemini.apiKey);
 }
 
 // user may be a plain string or a content-block array (for images)
-async function claude(system, user) {
-  if (claudeStub) return claudeStub(system, user);
-  // No Anthropic key configured at all — Gemini is the model, not a fallback.
-  if (!config.ai.apiKey) return geminiJson(system, user);
-  try {
-    return await anthropic(system, user);
-  } catch (e) {
-    // A revoked key, a rate limit, an outage: whatever it is, the customer is
-    // still waiting. Try the other provider before giving up on them.
-    if (!config.gemini || !config.gemini.apiKey) throw e;
-    store.log('ai', 'Anthropic failed (' + String((e && e.message) || e).slice(0, 60) + ') — asking Gemini');
-    return geminiJson(system, user);
-  }
+async function model(system, user) {
+  if (modelStub) return modelStub(system, user);
+  return geminiJson(system, user);
 }
 
-async function anthropic(system, user) {
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'x-api-key': config.ai.apiKey,
-      'anthropic-version': '2023-06-01',
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: config.ai.model,
-      max_tokens: 1024,
-      system,
-      messages: [{ role: 'user', content: user }],
-    }),
+// The same call with Google Search behind it, for facts the model should look
+// up rather than remember: which car 3V5845049RNVB fits, its HSN. The same
+// grounding the agent's search_the_web uses (agent/tools/web.js).
+async function modelWeb(system, user) {
+  if (modelStub) return modelStub(system, user);
+  return geminiJson(system, user, {
+    modelName: (config.agent && config.agent.webSearchModel) || undefined,
+    tools: [{ google_search: {} }],
+    timeoutMs: 60000,
   });
-  if (!res.ok) throw new Error('Anthropic API HTTP ' + res.status);
-  const data = await res.json();
-  const text = (data.content || []).map((c) => c.text || '').join('');
-  const jsonMatch = text.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) throw new Error('no JSON in AI reply');
-  return JSON.parse(jsonMatch[0]);
-}
-
-// The same call with Anthropic's server-side web search, for facts the model
-// should look up rather than remember: which car 3V5845049RNVB fits, its HSN.
-// The searching happens on Anthropic's side inside this one request. A long
-// search can stop with `pause_turn`; sending the reply back continues it.
-async function claudeWeb(system, user, { maxSearches = 5 } = {}) {
-  const messages = [{ role: 'user', content: user }];
-  for (let round = 0; round < 3; round++) {
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'x-api-key': config.ai.apiKey,
-        'anthropic-version': '2023-06-01',
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: config.ai.model,
-        max_tokens: 8000,
-        system,
-        tools: [{ type: 'web_search_20260209', name: 'web_search', max_uses: maxSearches }],
-        messages,
-      }),
-      signal: AbortSignal.timeout(180000),
-    });
-    if (!res.ok) throw new Error('Anthropic API HTTP ' + res.status + ' ' + (await res.text()).slice(0, 160));
-    const data = await res.json();
-    if (data.stop_reason === 'pause_turn') {
-      messages.push({ role: 'assistant', content: data.content });
-      continue;
-    }
-    const text = (data.content || [])
-      .filter((c) => c.type === 'text')
-      .map((c) => c.text)
-      .join('');
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error('no JSON in AI reply');
-    return JSON.parse(jsonMatch[0]);
-  }
-  throw new Error('web research did not finish');
 }
 
 // A space before the quantity is required. Without it "43430-0K021" would
@@ -696,7 +632,7 @@ async function parseCustomerMessage(text, catalogNames) {
 
   if (modelAvailable()) {
     try {
-      const r = await claude(
+      const r = await model(
         'You parse WhatsApp messages from auto-parts customers (English/Hindi/Hinglish). ' +
           'Reply ONLY with JSON: {"intent":"order|inquiry|confirm|cancel|remove|set_qty|status|other",' +
           '"lines":[{"item":str,"qty":int}],"items":[str],"item":str,"qty":int}. ' +
@@ -705,13 +641,13 @@ async function parseCustomerMessage(text, catalogNames) {
         text
       );
       if (r && r.intent) {
-        // Claude answers "Bhejo 5pc" with {item:"", qty:5} — it correctly sees
+        // The model answers "Bhejo 5pc" with {item:"", qty:5} — it correctly sees
         // a quantity and honestly reports no item. That empty string must not
         // reach the portal, which rejects the whole batch with a 422, nor the
         // customer, who was shown a line reading " x5 - checking".
         if (Array.isArray(r.lines)) r.lines = r.lines.filter((l) => l && String(l.item || '').trim().length >= 2);
         if (Array.isArray(r.items)) r.items = r.items.filter((i) => String(i || '').trim().length >= 2);
-        // "Known catalog items" in the prompt is there so Claude can match a
+        // "Known catalog items" in the prompt is there so the model can match a
         // name the customer typed to its real spelling — never a menu to pick
         // from. A vague quantity with no named item ("I need one piece of each
         // item", 13 Sep live) made it invent lines from that list, and the cart
@@ -731,7 +667,7 @@ async function parseCustomerMessage(text, catalogNames) {
         return r;
       }
     } catch (e) {
-      store.log('ai', 'Claude parse failed, using basic parser: ' + e.message);
+      store.log('ai', 'model parse failed, using basic parser: ' + e.message);
     }
   }
   return parseCustomerMessageBasic(text, catalogNames);
@@ -742,7 +678,7 @@ async function parseVendorStock(text) {
   if (basic.length) return basic;
   if (modelAvailable()) {
     try {
-      const r = await claude(
+      const r = await model(
         'You parse WhatsApp stock lists from auto-parts vendors (any format/language). ' +
           'Reply ONLY with JSON: {"lines":[{"item":str,"qty":int,"price":number|null}]}. ' +
           'If the message is not a stock list, reply {"lines":[]}.',
@@ -750,86 +686,31 @@ async function parseVendorStock(text) {
       );
       if (r && Array.isArray(r.lines)) return r.lines.filter((l) => l.item && l.qty > 0);
     } catch (e) {
-      store.log('ai', 'Claude stock parse failed: ' + e.message);
+      store.log('ai', 'model stock parse failed: ' + e.message);
     }
   }
   return [];
 }
 
-// ---------------- photo orders (OCR chain) ----------------
-// "Customer photograph mein order bheje" — read it with, in order:
-//   1. Python OCR libraries  (scripts/ocr/read_order.py: pytesseract/easyocr)
-//   2. Windows built-in OCR  (scripts/ocr/windows_ocr.ps1 — zero install)
-//   3. Claude vision         (only if ANTHROPIC_API_KEY is set)
-// OCR text is parsed with the deterministic line parser; if that finds
-// nothing and an AI key exists, Claude cleans up the raw OCR text.
-const { execFile } = require('child_process');
-const fs = require('fs');
-const os = require('os');
-const path = require('path');
-
-const OCR_DIR = path.join(__dirname, '..', '..', 'scripts', 'ocr');
-
-function run(cmd, args, timeoutMs) {
-  return new Promise((resolve) => {
-    execFile(cmd, args, { timeout: timeoutMs || 60000, windowsHide: true }, (err, stdout) => {
-      resolve(err ? null : String(stdout || ''));
-    });
-  });
-}
-
-async function ocrImageToText(base64, mediaType) {
-  const ext = (mediaType || 'image/png').split('/')[1].replace('jpeg', 'jpg');
-  const tmp = path.join(os.tmpdir(), 'autoflow-ocr-' + Date.now() + '.' + ext);
-  fs.writeFileSync(tmp, Buffer.from(base64, 'base64'));
-  // Both backends failing looks identical to "OCR is not installed", and the
-  // customer is told the feature is off when in fact it ran and saw nothing.
-  // Log which one was tried and what came back, so a photo that fails on this
-  // machine can be told apart from one that is genuinely unreadable.
-  const bytes = Buffer.from(base64, 'base64').length;
-  try {
-    let text = await run('python', [path.join(OCR_DIR, 'read_order.py'), tmp]);
-    if (text && text.trim()) {
-      store.log('ai', `OCR via python: ${text.trim().length} chars from ${bytes} byte ${ext}`);
-      return text;
-    }
-    if (process.platform === 'win32') {
-      text = await run('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(OCR_DIR, 'windows_ocr.ps1'), '-Path', tmp]);
-      if (text && text.trim()) {
-        store.log('ai', `OCR via windows: ${text.trim().length} chars from ${bytes} byte ${ext}`);
-        return text;
-      }
-    }
-    store.log('ai', `OCR found NO text in a ${bytes} byte ${ext} image (both backends ran)`);
-    return null;
-  } finally {
-    try { fs.unlinkSync(tmp); } catch {}
-  }
-}
-
-// Customers photograph their WHATSAPP SCREEN, so the OCR text carries the
-// chat furniture with it — and a timestamp is just digits to a parser.
-// "3pcs clutch bearing 23820M72R40 11:59 am" was read as quantity ELEVEN for
-// every single line of a 27-item order. Scrub the chrome before parsing.
+// ---------------- photo orders ----------------
+// "Customer photograph mein order bheje" — read by VISION: Gemini
+// (see parseOrderImage). There is no local OCR any more and
+// no OCR binary in the image: it was a Windows-only fast path, it was switched
+// off everywhere it actually ran, and a reader that only works on a developer's
+// desk is a reader the customer never benefits from. What it taught us is kept
+// — joinSpacedPartNumbers below — because vision reads a Maruti box label the
+// same spaced way OCR did.
 // Maruti Genuine Parts labels print the part number SPACED: "43401 M 68R00",
 // "17522 M 92TA0". Tokenised as-is, the leading block becomes a quantity and
 // the tail becomes the item — an order for 43,401 hub assemblies of "M 68R00".
-// Every "M68K00" / "OOM81" fragment in the early photo tests came from here.
-// The shape is fixed (5 digits, a letter, 5 more) so gluing it is safe.
+// The shape is fixed (5 digits, a letter, 5 more) so gluing it is safe, and it
+// is needed whoever read the photo: vision reads the label off the box exactly
+// as it is printed.
 function joinSpacedPartNumbers(text) {
   return String(text || '').replace(
     /\b(\d{5})\s*([A-Za-z])\s*([A-Za-z0-9]{5})\b/g,
     (_, a, b, c) => a + b + c
   );
-}
-
-function scrubOcrNoise(text) {
-  return joinSpacedPartNumbers(String(text || ''))
-    .replace(/\b\d{1,2}:\d{2}(:\d{2})?\s*(a\.?m\.?|p\.?m\.?)?/gi, ' ') // 11:59 am · 5:31 pm
-    .replace(/\b\d{1,2}\/\d{1,2}\/\d{2,4}\b/g, ' ') // 31/8/26
-    .replace(/\b(yesterday|today|forwarded|omitted|image|document|voice message)\b/gi, ' ')
-    .replace(/[✓✔]{1,2}/g, ' ') // delivery ticks
-    .replace(/[ \t]+/g, ' ');
 }
 
 // Sanity filter for photo-derived lines: an invoice/bill photo must never
@@ -839,9 +720,9 @@ function sanitizeOrderLines(lines, rawText) {
   // if the text looks like a tax invoice, refuse the whole thing
   if (rawText && /(gst\s*invoice|tax\s*invoice|invoice\s*(no|number|#|-)\s*\d+|hsn|igst|cgst|sgst)/i.test(rawText)) return [];
   return (lines || [])
-    // Maruti prints the part number SPACED on the box: "33400 M 68K31". The
-    // OCR path already joined it; Claude vision reads it off the label the
-    // same way and its lines went through untouched, so "33400 M 68K31 COIL
+    // Maruti prints the part number SPACED on the box: "33400 M 68K31".
+    // Vision reads it off the label exactly as printed, and those lines went
+    // through untouched, so "33400 M 68K31 COIL
     // ASSY,IGNITION" reached the portal as a NAME and the customer was asked
     // "Which vehicle?" about a part number sitting in the photo.
     .map((l) => (l && l.item ? { ...l, item: joinSpacedPartNumbers(l.item) } : l))
@@ -854,8 +735,8 @@ function sanitizeOrderLines(lines, rawText) {
     );
 }
 
-// Returns: lines[] on success, [] if nothing readable, null only when no
-// OCR backend produced text AND no AI key exists (caller apologises politely).
+// Returns: lines[] on success, [] if nothing readable, null only when there is
+// no vision key at all (the caller then apologises politely and asks a person).
 // Why the last photo gave no order lines. The console prints it next to
 // the picture, so "why did it not read my photo?" has an answer without
 // anyone opening the container logs.
@@ -864,14 +745,14 @@ function imageNote() {
   return lastImageNote;
 }
 
-// What Claude is told about a photo.
+// What the model is told about a photo.
 //
 // Customers do not only photograph lists. They photograph the BOX, the printed
 // label, another dealer's WhatsApp screen, an estimate, and the bare part
 // itself. Asking only for "order lists" made the model answer {"lines":[]} for
 // a perfectly readable label, and the customer was told to type it out.
 //
-// Handwriting (13 Sep, founder: "ye handwritten photo kyon nhi pd rha..claude
+// Handwriting (13 Sep, founder: "ye handwritten photo kyon nhi pd rha..AI
 // api lagaya hi isliye hai"). A coil box labelled "33400 M" with "68P10" written
 // after it came back twice as "33400M" and went to a person; 33400M68P10 is on
 // the portal. On a handwritten 22-line list "- 10" was read as x16 and
@@ -919,168 +800,63 @@ function visionFragment(lines) {
 
 async function parseOrderImage(base64, mediaType) {
   lastImageNote = null;
-  const raw = config.ai.ocr ? await ocrImageToText(base64, mediaType) : null;
-  const ocrText = raw ? scrubOcrNoise(raw) : raw;
-  if (ocrText) {
-    const lines = sanitizeOrderLines(parseLinesBlock(ocrText), ocrText);
-    if (lines.length) {
-      store.log('ai', `photo order read via OCR: ${lines.length} line(s)`);
-      return lines;
-    }
-    if (modelAvailable()) {
-      try {
-        const r = await claude(
-          'This is raw OCR text from a photo of an auto-parts order (may be messy/Hinglish). ' +
-            'Reply ONLY with JSON: {"lines":[{"item":str,"qty":int}]}. If it is not an order, reply {"lines":[]}.',
-          ocrText
-        );
-        const clean = r && Array.isArray(r.lines) ? sanitizeOrderLines(r.lines, ocrText) : [];
-        if (clean.length) {
-          store.log('ai', `photo order read via OCR + Claude: ${clean.length} line(s)`);
-          return clean;
-        }
-      } catch (e) {
-        store.log('ai', 'OCR-text cleanup failed: ' + e.message);
-      }
-    }
-    // OCR produced text, but nothing usable came out of it. That is not a
-    // reason to give up: a label OCR read as three characters of noise is
-    // exactly what vision handles well. Falling through here instead of
-    // returning meant the best reader we have was skipped whenever the worst
-    // one managed to emit a single character.
-    store.log('ai', `OCR text (${ocrText.trim().length} chars) held no order — trying vision`);
-  }
-  // GEMINI FIRST, Claude behind it.
-  //
-  // 21 Sep: the Anthropic key was revoked, and with local OCR off that left
-  // no reader at all — every photo went to a person. Gemini reads a label
-  // just as well (3s on the test fixture) and its key is the one that works,
-  // so it leads and Claude catches what it cannot do. A photo that Gemini
-  // reads but finds no part in is a finished answer, not a failure: it
-  // returns an empty list and nobody else is asked, exactly as Claude did
-  // when it led.
+  // GEMINI reads the photo. A photo it reads but finds no part in is a
+  // finished answer, not a failure: it returns an empty list.
   const primary = await geminiOrderImage(base64, mediaType);
-  if (primary) return primary;
-
-  // Gemini is not configured, or could not answer — Claude vision if available
-  if (config.ai.apiKey) {
-    try {
-      const image = { type: 'image', source: { type: 'base64', media_type: mediaType || 'image/jpeg', data: base64 } };
-      let r = await claude(VISION_PROMPT, [image, { type: 'text', text: 'Extract the order lines from this image.' }]);
-      // It stopped at the printed half of a number ("33400M"): one more look,
-      // told where the rest usually is. Used only if it then gives a longer
-      // number that starts the same way.
-      const fragment = r && Array.isArray(r.lines) ? visionFragment(r.lines) : null;
-      if (fragment) {
-        store.log('ai', `photo gave only "${fragment}" - asking again for the whole number`);
-        try {
-          const again = await claude(VISION_PROMPT, [
-            image,
-            {
-              type: 'text',
-              text:
-                'Extract the order lines from this image. The part number starting "' + fragment + '" is incomplete - ' +
-                'the rest is usually written by hand next to it or hidden under a sticker. Give the full part number.',
-            },
-          ]);
-          const norm = (v) => String(v || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-          const whole = (l) => {
-            const pn = norm(partNumberIn(String(l.item || '')) || String(l.item || '').split(/\s+/)[0]);
-            return pn.startsWith(fragment) && pn.length >= fragment.length + 4;
-          };
-          if (again && Array.isArray(again.lines) && again.lines.some(whole)) r = again;
-        } catch (e) {
-          store.log('ai', 'second look at the photo failed: ' + String((e && e.message) || e).slice(0, 90));
-        }
-      }
-      if (r && Array.isArray(r.lines)) {
-        const clean = sanitizeOrderLines(r.lines, null);
-        // Carried on the array so the caller can tell "a bill" from "could not
-        // read it" without a second call to the model. Callers that only use
-        // .length / .map are unaffected.
-        if (r.doc) clean.docType = String(r.doc).toLowerCase().slice(0, 20);
-        // A number plate in the photo is the customer's CAR, not a part.
-        // Carried on the array so media.js can look it up instead of sending
-        // an unreadable photo to a person.
-        if (r.plate) clean.plate = require('../integrations/vahan').plateIn(String(r.plate)) || null;
-        lastImageNote = clean.length ? null : "the photo was read, but no part number is visible in it";
-        // Say what happened either way. Without this the log went silent after
-        // "OCR found NO text", which reads as "Claude was never called" when in
-        // fact it looked at the photo and found no order in it — two completely
-        // different problems with the same symptom on the customer's screen.
-        store.log(
-          'ai',
-          clean.length
-            ? `photo order read via Claude vision: ${clean.length} line(s)`
-            : `Claude vision saw the photo but found no order lines (${r.lines.length} raw)`
-        );
-        return clean;
-      }
-      lastImageNote = "the model did not answer properly about this photo";
-      store.log('ai', 'Claude vision returned no usable JSON');
-    } catch (e) {
-      lastImageNote = "reading the photo failed: " + String((e && e.message) || e).slice(0, 90);
-      store.log('ai', 'Claude vision failed: ' + String((e && e.message) || e).slice(0, 120));
+  if (!primary) {
+    if (!modelAvailable()) {
+      lastImageNote = 'there is no AI key on this machine, so photos cannot be read';
+      store.log('ai', 'no vision key on this machine — the photo cannot be read');
     }
-    return [];
+    return null;
   }
-  lastImageNote = "there is no AI key on this machine, so photos cannot be read";
-  store.log('ai', 'no OCR text and no vision key — photo cannot be read');
-  return null;
+
+  // It stopped at the printed half of a number ("33400M"): one more look,
+  // told where the rest usually is. Used only if it then gives a longer
+  // number that starts the same way.
+  const fragment = visionFragment(primary);
+  if (!fragment) return primary;
+  store.log('ai', `photo gave only "${fragment}" - asking again for the whole number`);
+  try {
+    const image = { type: 'image', source: { type: 'base64', media_type: mediaType || 'image/jpeg', data: base64 } };
+    const again = await model(VISION_PROMPT, [
+      image,
+      {
+        type: 'text',
+        text:
+          'Extract the order lines from this image. The part number starting "' + fragment + '" is incomplete - ' +
+          'the rest is usually written by hand next to it or hidden under a sticker. Give the full part number.',
+      },
+    ]);
+    const norm = (v) => String(v || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const whole = (l) => {
+      const pn = norm(partNumberIn(String(l.item || '')) || String(l.item || '').split(/\s+/)[0]);
+      return pn.startsWith(fragment) && pn.length >= fragment.length + 4;
+    };
+    if (again && Array.isArray(again.lines) && again.lines.some(whole)) {
+      const clean = sanitizeOrderLines(again.lines, null);
+      if (primary.docType) clean.docType = primary.docType;
+      if (primary.plate) clean.plate = primary.plate;
+      return clean;
+    }
+  } catch (e) {
+    store.log('ai', 'second look at the photo failed: ' + String((e && e.message) || e).slice(0, 90));
+  }
+  return primary;
 }
 
-// Ask Gemini to read the photo, in the same shape Claude is asked for.
+// Ask Gemini to read the photo.
 // Returns the cleaned lines, or null when Gemini is not configured or could
 // not answer — null means "nothing to add", never "the photo is empty".
 async function geminiOrderImage(base64, mediaType) {
-  const g = config.gemini;
-  if (!g.apiKey) return null;
+  if (!modelAvailable() && !modelStub) return null;
   try {
-    const url =
-      'https://generativelanguage.googleapis.com/v1beta/models/' +
-      encodeURIComponent(g.visionModel) +
-      ':generateContent';
-    // 503 means "the model is busy, ask again", NOT "this photo cannot be
-    // read" — and the two had the same ending: straight past a dead Claude
-    // key to a person. Measured 21 Sep: one in five calls came back 503 while
-    // the same photo read perfectly on the retry. Backs off 1s, 2s.
-    //
-    // 429 is NOT in that set on purpose. Google answers 429 both for "too
-    // fast, slow down" and for "your quota is gone until it resets", and the
-    // second is not worth three attempts — on 21 Sep a spent free-tier quota
-    // cost five seconds of retries per photo before the same failure. A
-    // rate-limited call is caught by the next photo anyway; an exhausted one
-    // needs a person to fix the billing, not a tighter loop.
-    const RETRY_ON = new Set([500, 502, 503, 504]);
-    let res = null;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      if (attempt) await new Promise((r) => setTimeout(r, 1000 * attempt));
-      res = await fetch(url + '?key=' + encodeURIComponent(g.apiKey), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [
-            {
-              parts: [
-                { text: VISION_PROMPT + '\n\nExtract the order lines from this image.' },
-                { inline_data: { mime_type: mediaType || 'image/jpeg', data: base64 } },
-              ],
-            },
-          ],
-        }),
-        signal: AbortSignal.timeout(g.timeoutMs),
-      });
-      if (res.ok || !RETRY_ON.has(res.status)) break;
-      store.log('ai', `Gemini vision HTTP ${res.status} (attempt ${attempt + 1}/3) — retrying`);
-    }
-    if (!res.ok) throw new Error('HTTP ' + res.status + ' ' + (await res.text()).slice(0, 120));
-    const data = await res.json();
-    const text = (((data.candidates || [])[0] || {}).content?.parts || [])
-      .map((p) => p.text || '')
-      .join('');
-    const json = text.match(/\{[\s\S]*\}/);
-    if (!json) throw new Error('no JSON in the reply');
-    const r = JSON.parse(json[0]);
+    // model() retries a busy model (500-class) with a 1 s, 2 s back-off — 21
+    // Sep, one in five calls came back 503 and read perfectly on the retry —
+    // and does NOT retry 429: that is either "slow down" or a spent quota,
+    // and neither is fixed by asking three times.
+    const image = { type: 'image', source: { type: 'base64', media_type: mediaType || 'image/jpeg', data: base64 } };
+    const r = await model(VISION_PROMPT, [image, { type: 'text', text: 'Extract the order lines from this image.' }]);
     if (!r || !Array.isArray(r.lines)) throw new Error('no lines array');
     const clean = sanitizeOrderLines(r.lines, null);
     if (r.doc) clean.docType = String(r.doc).toLowerCase().slice(0, 20);
@@ -1097,6 +873,7 @@ async function geminiOrderImage(base64, mediaType) {
     );
     return clean;
   } catch (e) {
+    lastImageNote = 'reading the photo failed: ' + String((e && e.message) || e).slice(0, 90);
     store.log('ai', 'Gemini vision failed: ' + String((e && e.message) || e).slice(0, 120));
     return null;
   }
@@ -1139,6 +916,66 @@ function stampedGps(g) {
   if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
   if (Math.abs(lat) > 90 || Math.abs(lng) > 180 || (lat === 0 && lng === 0)) return null;
   return { lat, lng, address: String(g.address || '').trim().slice(0, 200) || null };
+}
+
+// THE GSTIN OFF A PHOTOGRAPH.
+//
+// Nobody types fifteen characters correctly on a phone. What a dealer actually
+// does is photograph the registration certificate on the wall, or a
+// letterhead, or one of their own bills — and before this that photo was read
+// as a picture of a PART, searched in the catalogue, and sent to a person as
+// an unidentified item.
+//
+// Vision, and only vision: a certificate photographed at an angle under a
+// tubelight is exactly what a character recogniser is worst at, which is most
+// of why the local one was taken out.
+//
+// WHAT COMES BACK IS A CANDIDATE, NOT A FACT. At this font size 8/B, 0/O, 1/I
+// and 5/S are the whole game. The caller checks the shape and then looks the
+// number up in the GST register, so a misread character produces "not found"
+// — a question to the customer, never a wrong account.
+const GST_PHOTO_PROMPT =
+  'You are reading a photograph for an Indian car-parts dealership. ' +
+  'Find the GSTIN (GST Identification Number) in the image and return it exactly as printed. ' +
+  'A GSTIN is exactly 15 characters: 2 digits, 5 letters, 4 digits, 1 letter, 1 letter or digit, the letter Z, then 1 letter or digit. ' +
+  'It may be labelled GSTIN, GST No or GST Number, and may appear on a GST registration certificate, a letterhead, an invoice or a signboard. ' +
+  'Copy only the characters you can actually see. Do NOT correct, complete or invent any character, and do NOT guess one you cannot read. ' +
+  'Return ONLY JSON: {"gstin":"07AABCU9603R1ZM"} or {"gstin":null} if there is no GSTIN in the image.';
+
+async function readGstPhoto(base64, mediaType) {
+  const g = config.gemini;
+  if (!g.apiKey || !base64) return null;
+  try {
+    const url =
+      'https://generativelanguage.googleapis.com/v1beta/models/' +
+      encodeURIComponent(g.visionModel) +
+      ':generateContent';
+    const RETRY_ON = new Set([500, 502, 503, 504]);
+    let res = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt) await new Promise((r) => setTimeout(r, 1000 * attempt));
+      res = await fetch(url + '?key=' + encodeURIComponent(g.apiKey), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: GST_PHOTO_PROMPT }, { inline_data: { mime_type: mediaType || 'image/jpeg', data: base64 } }] }],
+        }),
+        signal: AbortSignal.timeout(g.timeoutMs),
+      });
+      if (res.ok || !RETRY_ON.has(res.status)) break;
+    }
+    if (!res || !res.ok) throw new Error('HTTP ' + (res && res.status));
+    const data = await res.json();
+    const text = (((data.candidates || [])[0] || {}).content?.parts || []).map((p) => p.text || '').join('');
+    const json = text.match(/\{[\s\S]*\}/);
+    if (!json) throw new Error('no JSON in the reply');
+    const r = JSON.parse(json[0]);
+    const raw = String(r.gstin == null ? '' : r.gstin).replace(/[\s-]/g, '').toUpperCase();
+    return !raw || raw === 'NULL' ? { gstin: null } : { gstin: raw };
+  } catch (e) {
+    store.log('ai', 'GST photo read failed: ' + String((e && e.message) || e).slice(0, 100));
+    return null;
+  }
 }
 
 async function readShopPhoto(base64, mediaType) {
@@ -1193,20 +1030,20 @@ module.exports = {
   // What the gate chain decided is noted for the shadow log (pipeline/shadow).
   // The result is returned untouched.
   parseCustomerMessage: (...args) => parseCustomerMessage(...args).then((r) => require('../pipeline/shadow').noteGate(r)),
-  parseVendorStock, parseOrderImage, parseLinesBlock, readShopPhoto, matchCatalog, CONFIRM_RE, partNumberIn,
+  parseVendorStock, parseOrderImage, parseLinesBlock, readShopPhoto, readGstPhoto, matchCatalog, CONFIRM_RE, partNumberIn,
   // why the last photo could not be read - written into the chat as a note
   imageNote,
   // exported for tests
   bareQty,
   captionQty,
   // The raw model call, so core/smallTalk.js does not open a second one.
-  // Is there a model behind this bot at all — Anthropic, Gemini, either.
+  // Is there a model behind this bot at all?
   modelAvailable,
-  _claude: claude,
-  // With web search, for looking facts up (core/partNaming).
-  _claudeWeb: claudeWeb,
-  _setClaude: (fn) => {
-    claudeStub = fn || null;
+  _model: model,
+  // With Google Search, for looking facts up (core/partNaming).
+  _modelWeb: modelWeb,
+  _setModel: (fn) => {
+    modelStub = fn || null;
   },
   // exported for tests
   _internals: { scanPartTokens, maxTokensPerLine, isPartToken, isJunkItem, joinSpacedPartNumbers, sanitizeOrderLines, PART_TOKEN_RE, QTY_UNIT_TOKEN } };

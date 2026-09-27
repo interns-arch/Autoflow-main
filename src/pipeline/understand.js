@@ -149,7 +149,7 @@ function guard(raw, snap) {
 }
 
 async function understand(snap) {
-  const call = stub || ai._claude;
+  const call = stub || ai._model;
   const t0 = Date.now();
   let timer = null;
   const timeout = new Promise((_, reject) => {

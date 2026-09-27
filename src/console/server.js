@@ -46,6 +46,24 @@ function start(bots) {
     for (const t of cloudTransports()) t.handleWebhook(req.body).catch(() => {});
   });
 
+  // ---- the dashboard (founder, 26 Sep) ----
+  // Customers created, orders placed, discounts and payments: who asked, who
+  // approved, where each stands. The page is public/dashboard.html; its data
+  // needs DASHBOARD_KEY (?key= or the x-dashboard-key header).
+  app.get('/dashboard', (req, res) => res.sendFile(path.join(__dirname, 'public', 'dashboard.html')));
+  app.get('/api/dashboard', async (req, res) => {
+    const key = String(req.query.key || req.get('x-dashboard-key') || '');
+    if (!config.dashboardKey) return res.status(503).json({ error: 'DASHBOARD_KEY is not set on the server' });
+    const a = Buffer.from(key);
+    const b = Buffer.from(config.dashboardKey);
+    if (a.length !== b.length || !require('crypto').timingSafeEqual(a, b)) return res.status(401).json({ error: 'wrong key' });
+    try {
+      res.json(await require('../core/dashboardData').buildLive());
+    } catch (e) {
+      res.status(500).json({ error: String((e && e.message) || e) });
+    }
+  });
+
   app.get('/api/status', (req, res) => {
     const out = {};
     for (const [key, bot] of Object.entries(bots)) {
@@ -132,6 +150,11 @@ function start(bots) {
     if (!phrase || !partNo) return res.status(400).json({ error: 'phrase and partNo required' });
     res.json({ entry: knowledge.learnAlias(phrase, partNo, 'console') });
   });
+
+  // ---- self-learning knowledge base (Postgres + pgvector), token-protected ----
+  require('./kbRoutes').mount(app);
+  // ---- imported WhatsApp history: examples, part mappings, approval ----
+  require('./historyRoutes').mount(app);
 
   // ---- customers / engagement ----
   app.get('/api/customers', (req, res) => res.json({ customers: store.customers() }));

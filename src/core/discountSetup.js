@@ -95,6 +95,8 @@ function toPortal(r, dealerId, customerName, from = new Date()) {
     min_amount: r.minAmount || null,
     max_amount: r.maxAmount || null,
     is_active: true,
+    // Only ever sent after a Sales Head said "OK DSC-…" on WhatsApp.
+    approval_status: 'APPROVED',
     valid_from: iso(start),
     valid_to: end ? iso(end) : null,
     priority: 100,
@@ -103,6 +105,65 @@ function toPortal(r, dealerId, customerName, from = new Date()) {
     rule_name: ruleName(customerName || r.customer, r.target, r.value),
     rule_metadata: { source: 'whatsapp-bot', requestId: r.requestId, setBy: r.setBy || null },
   };
+}
+
+// ---- the rule that prices a line ----
+//
+// The portal's commercial-analyze answers every line at MRP with
+// discount_percent 0 — 25 Sep, live: MIYA JI MOTORS had an approved MARUTI
+// 10% rule and a MARUTI headlight came back at ₹21,310, and dealer 1002's
+// APPROVED MARUTI 12% was not applied either. So the rule is applied here.
+//
+// A rule counts when it is APPROVED on the portal, or when WE made it
+// (rule_metadata.source 'whatsapp-bot'): the bot only ever creates a rule
+// after a Sales Head said "OK DSC-…", and the portal keeps those PENDING
+// because only a Super Admin may review there.
+//
+// Most specific wins: a rule for this part, then for its brand, then one for
+// every part; between two of the same kind, the bigger discount.
+const counts = (r) =>
+  r &&
+  r.is_active !== false &&
+  String(r.discount_mode || 'PERCENT').toUpperCase() === 'PERCENT' &&
+  (String(r.approval_status || '').toUpperCase() === 'APPROVED' || (r.rule_metadata && r.rule_metadata.source === 'whatsapp-bot'));
+
+function ruleFor(rules, { dealerId, partNo, brand, qty = 1, now = new Date() } = {}) {
+  const norm = (s) => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const t = new Date(now).getTime();
+  const inDate = (r) => (!r.valid_from || new Date(r.valid_from).getTime() <= t) && (!r.valid_to || new Date(r.valid_to).getTime() >= t);
+  const inQty = (r) => (!r.min_qty || qty >= Number(r.min_qty)) && (!r.max_qty || qty <= Number(r.max_qty));
+  const kind = (r) => {
+    const type = String(r.rule_type || '').toUpperCase();
+    if (type === 'ITEM') return r.part_no && norm(r.part_no) === norm(partNo) ? 3 : 0;
+    if (type === 'BRAND') return r.brand && brand && norm(r.brand) === norm(brand) ? 2 : 0;
+    return !r.part_no && !r.brand ? 1 : 0; // every part for this customer
+  };
+  let best = null;
+  for (const r of rules || []) {
+    if (Number(r.dealer_id) !== Number(dealerId) || !counts(r) || !inDate(r) || !inQty(r)) continue;
+    const k = kind(r);
+    if (!k || !(Number(r.discount_value) > 0)) continue;
+    if (!best || k > best.k || (k === best.k && Number(r.discount_value) > Number(best.r.discount_value))) best = { r, k };
+  }
+  return best ? best.r : null;
+}
+
+// Every rule this customer has today that counts (see ruleFor), for "mere
+// discount kya hain" and for the note under a price list.
+function activeRules(rules, dealerId, now = new Date()) {
+  const t = new Date(now).getTime();
+  return (rules || [])
+    .filter((r) => Number(r.dealer_id) === Number(dealerId) && counts(r) && Number(r.discount_value) > 0)
+    .filter((r) => (!r.valid_from || new Date(r.valid_from).getTime() <= t) && (!r.valid_to || new Date(r.valid_to).getTime() >= t))
+    .map((r) => {
+      const type = String(r.rule_type || '').toUpperCase();
+      return {
+        on: type === 'ITEM' ? `part ${r.part_no}` : type === 'BRAND' ? `all ${r.brand} parts` : 'all parts',
+        percent: Number(r.discount_value),
+        minQty: Number(r.min_qty) > 1 ? Number(r.min_qty) : null,
+        validTill: r.valid_to ? String(r.valid_to).slice(0, 10) : null,
+      };
+    });
 }
 
 // ---- approval ----
@@ -150,10 +211,8 @@ function approvalText(req) {
   const money2 = r.mrp
     ? `\nMRP ${money(r.mrp)} → sells at ${money(priceAt(r.mrp, r.value))} (${r.value}% off, ${money(round2(r.mrp - priceAt(r.mrp, r.value)))} per piece)`
     : '';
-  const head =
-    req.type === 'change'
-      ? `*Discount change* — ${req.id}\nCustomer: ${req.customer}\nRule: ${req.oldName || '#' + req.ruleId}\n${target}\nNow ${req.oldValue}% → asked ${r.value}%`
-      : `*Discount rule* — ${req.id}\nCustomer: ${req.customer}${req.accountRequestId ? ` (new account ${req.accountRequestId})` : ''}\n${target} — ${r.value}%`;
+  if (req.type === 'change') return changeText(req);
+  const head = `*Discount rule* — ${req.id}\nCustomer: ${req.customer}${req.accountRequestId ? ` (new account ${req.accountRequestId})` : ''}\n${target} — ${r.value}%`;
   const limits = [
     r.minQty ? `Min qty ${r.minQty}` : null,
     r.maxQty ? `Max qty ${r.maxQty}` : null,
@@ -170,11 +229,85 @@ function approvalText(req) {
   );
 }
 
-// "discount change karna hai", "mera discount badhao", "Kalra ka discount update"
-const CHANGE_RE =
-  /\bdiscount\b.{0,40}\b(change|chnage|badal\w*|update|badha\w*|kam\s*kar\w*|increase|decrease|set|lagao|lagana|laga\s*do|naya|new|revise)\b|\b(change|badal\w*|update|badha\w*|increase|revise)\b.{0,40}\bdiscount\b/i;
+// ASKING FOR A DISCOUNT TO BE SET UP.
+//
+// A CHANGE, written so the Sales Head can decide from this message alone:
+// who, which rule, what it is now, what they want instead, what that does to
+// a price, and that saying OK changes only the % on the rule that exists.
+function changeText(req) {
+  const r = req.rule;
+  const o = req.oldRule || {};
+  const phone = req.customerPhone ? ` (+${String(req.customerPhone).replace(/^\+/, '')})` : '';
+  const what = r.kind === 'brand' ? `Brand ${r.target}` : r.kind === 'part' ? `Part ${r.target}` : 'All parts';
+  const delta = round2(r.value - req.oldValue);
+  const date = (v) => (v ? new Date(v).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }) : null);
+  const limits = [
+    o.minQty ? `Min qty ${o.minQty}` : null,
+    o.maxQty ? `Max qty ${o.maxQty}` : null,
+    o.validTo ? `valid till ${date(o.validTo)}` : 'no end date',
+  ].filter(Boolean);
+  const lines = [
+    `*Discount change* — ${req.id}`,
+    `Customer: ${req.customer}${phone}`,
+    `Rule: ${req.oldName || '#' + req.ruleId}${req.ruleId ? ` (#${req.ruleId})` : ''}`,
+    `On: ${what}`,
+    `Current discount: *${req.oldValue}%*`,
+    `Customer wants: *${r.value}%* (${delta > 0 ? '+' : ''}${delta}%)`,
+    r.mrp
+      ? `MRP ${money(r.mrp)}: now ${money(priceAt(r.mrp, req.oldValue))} → would be ${money(priceAt(r.mrp, r.value))}`
+      : `On MRP ₹1,000: now ${money(priceAt(1000, req.oldValue))} → would be ${money(priceAt(1000, r.value))}`,
+    `Rule stays: ${limits.join(' · ')}`,
+    `Asked by: ${req.by || 'customer'}`,
+    '',
+    `OK changes only the % on this rule — no new rule is made.`,
+    `Reply *OK ${req.id}* to approve, or *NO ${req.id}* to reject.`,
+  ];
+  return lines.join('\n');
+}
+
+// "discount change karna hai", "mera discount badhao", "Kalra ka discount
+// update", "mera discount setup kardo".
+//
+// That last one used to miss, and missing is expensive: the message fell
+// through to small talk, which answered "seniors se confirm karke bataunga"
+// — a sentence that promises a callback nobody has been asked to make. The
+// customer thinks it is in hand; nothing has been filed and nobody has been
+// told. Live, 24 Sep.
+//
+// The hole was "\bset\b", which does not match "setup": \b needs a non-word
+// character after "set", and "u" is a word character. So the verbs are listed
+// properly now, including the ways people actually ask for one to be MADE
+// rather than changed — banao, chahiye, lagwana, karwana.
+const VERB =
+  '(?:change|chnage|badal\\w*|update|badha\\w*|kam\\s*kar\\w*|increase|decrease|revise|' +
+  'set\\s*up|setup|set|lagao|lagana|laga\\s*do|lagw\\w*|naya|new|create|make|start|add|chalu|shuru\\w*|' +
+  'bana\\w*|banw\\w*|karw\\w*|kar\\s*do|kardo|karo|karna|chahiye|chaiye|de\\s*do|dedo)';
+
+const WANTS_RE = new RegExp(
+  '\\bdiscount\\b.{0,40}\\b' + VERB + '\\b|\\b' + VERB + '\\b.{0,40}\\bdiscount\\b',
+  'i',
+);
+
+// A QUESTION IS NOT A REQUEST.
+//
+// "discount kitna hai", "kitna milega", "aapki discount policy kya hai" are
+// asking what the discount IS. Starting a nine-question setup on those would
+// answer nothing they asked and take over the conversation — and "chahiye" in
+// the verbs above makes that easy to trip, so the guard earns its place.
+const ASKING_RE = /\b(kitna|kitni|kitne|how\s*much|what\s*is|kya\s*hai|kya\s*h|policy|milega|milta|hota\s*hai)\b/i;
+
+// -> true when this message is asking for a discount rule to be set up or
+// changed, and is not merely asking what the discount is.
+function wantsSetup(text) {
+  const s = String(text || '');
+  return WANTS_RE.test(s) && !ASKING_RE.test(s);
+}
+
+// Kept for anything still testing the raw pattern; wantsSetup is the one to
+// call, because it carries the question guard with it.
+const CHANGE_RE = WANTS_RE;
 
 module.exports = {
   open, get, pending, save, cancel, STEPS, SKIP, LATER, YES, NO, readNumber, readDuration, ruleName, describe, toPortal,
-  requests, file, find, drop, forAccount, approvalText, pctFromPrice, priceAt, money, CHANGE_RE,
+  requests, file, find, drop, forAccount, approvalText, pctFromPrice, priceAt, money, CHANGE_RE, wantsSetup, ruleFor, activeRules,
 };

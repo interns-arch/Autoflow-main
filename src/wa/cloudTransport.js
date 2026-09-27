@@ -13,6 +13,55 @@ const seen = require('../core/seen');
 
 const GRAPH = 'https://graph.facebook.com/v23.0';
 
+// The parts of an inbound message that are not plain text, as Meta documents
+// them (developers.facebook.com, "messages webhook reference", read 24 Sep).
+// Every field is null/false when absent, so a handler can test it directly.
+function whatsappExtras(msg) {
+  const ctx = msg.context || {};
+  const inner = (msg.edit && msg.edit.message) || {};
+  const captionOf = (x) => (x && (x.image || x.video || x.document) && (x.image || x.video || x.document).caption) || null;
+  return {
+    // The words under a photo, video or document. `body` carries them too, as
+    // it always has; this says that they WERE a caption, which "3pise" typed
+    // on its own and "3pise" under a photo of the part are not.
+    caption: captionOf(msg),
+    // Sent on from someone else — a mechanic's list, another dealer's message.
+    // Meta distinguishes forwarded (up to 5 hops) from frequently forwarded.
+    forwarded: ctx.frequently_forwarded ? 'frequently' : ctx.forwarded ? 'forwarded' : null,
+    // An emoji on one of OUR messages (Meta: within the last 30 days). No
+    // emoji means they took a reaction back.
+    reaction: msg.reaction ? { messageId: msg.reaction.message_id || null, emoji: msg.reaction.emoji || null } : null,
+    // They edited a message they sent (Meta: within 15 minutes). The new
+    // version is here; the original is identified by id.
+    edit: msg.edit
+      ? {
+          originalId: msg.edit.original_message_id || null,
+          text: (inner.text && inner.text.body) || captionOf(inner) || '',
+          type: inner.type || null,
+        }
+      : null,
+    // They deleted a message they sent (Meta: within two days).
+    revoke: msg.revoke ? { originalId: msg.revoke.original_message_id || null } : null,
+    contacts: Array.isArray(msg.contacts)
+      ? msg.contacts.map((c) => ({
+          name: (c.name && (c.name.formatted_name || [c.name.first_name, c.name.last_name].filter(Boolean).join(' '))) || null,
+          phone: ((c.phones || [])[0] && (c.phones[0].wa_id || c.phones[0].phone)) || null,
+        }))
+      : null,
+    sticker: Boolean(msg.sticker),
+    // A voice recording, as opposed to an audio file they attached.
+    voice: Boolean(msg.audio && msg.audio.voice),
+    // Asked from a product in our WhatsApp catalogue.
+    product: ctx.referred_product
+      ? { catalogId: ctx.referred_product.catalog_id || null, productId: ctx.referred_product.product_retailer_id || null }
+      : null,
+    // Arrived through a Click-to-WhatsApp ad.
+    referral: msg.referral ? { headline: msg.referral.headline || null, body: msg.referral.body || null, url: msg.referral.source_url || null } : null,
+    // Something WhatsApp itself could not show us (Meta type "unsupported").
+    unsupported: msg.type === 'unsupported',
+  };
+}
+
 class CloudTransport {
   constructor(botKey, label) {
     this.botKey = botKey;
@@ -74,36 +123,14 @@ class CloudTransport {
     return id;
   }
 
-  // REPLY BUTTONS. Up to three, each with an id we get back when it is
-  // tapped — the customer taps instead of typing, and we read an exact
-  // string instead of guessing at "haan ok kardo".
+  // NO REPLY BUTTONS. This transport used to send them, and they were taken
+  // out on purpose: the bot talks like a person at a parts counter, and a
+  // person asks a question and reads the answer. Every question that carried
+  // buttons already asked itself in words and reads a typed reply.
   //
-  // Cloud API only. The linked (QR) transport cannot send these at all, so
-  // the base class falls back to writing the choices out as text and the
-  // caller must accept either — see transport.js.
-  async sendButtons(number, text, buttons) {
-    const to = store.normPhone(number);
-    const three = (buttons || []).slice(0, 3).map((b) => ({
-      type: 'reply',
-      // 20 characters is the Cloud API's limit on a button title; a longer
-      // one is rejected for the whole message, not trimmed.
-      reply: { id: String(b.id).slice(0, 256), title: String(b.title).slice(0, 20) },
-    }));
-    if (!three.length) return this.sendText(number, text);
-    const data = await this._post(`${config.cloud.phoneNumberId}/messages`, {
-      messaging_product: 'whatsapp',
-      to,
-      type: 'interactive',
-      interactive: {
-        type: 'button',
-        // 1024 characters on the body of an interactive message.
-        body: { text: String(text).slice(0, 1024) },
-        action: { buttons: three },
-      },
-    });
-    store.log(this.botKey, `send -> ${to} [cloud, ${three.length} button(s)]: ${String(text).slice(0, 100).replace(/\n/g, ' | ')}`);
-    return (data && data.messages && data.messages[0] && data.messages[0].id) || null;
-  }
+  // The INBOUND side still understands a tap (see the webhook parser below),
+  // because buttons already sent sit in customers' chats and can be tapped
+  // days later.
 
   // Send a FILE. Two steps: upload the bytes to get a media id, then send a
   // message referencing it. A 71-line order does not belong in a chat bubble —
@@ -376,6 +403,9 @@ class CloudTransport {
                 (msg.text && msg.text.body) ||
                 (msg.image && msg.image.caption) ||
                 (msg.document && msg.document.caption) ||
+                // A video is not downloaded, but the words under it are still
+                // the customer talking. Dropped, the message fell silent.
+                (msg.video && msg.video.caption) ||
                 // A TAPPED BUTTON. The id is ours - we set it when the
                 // buttons were sent - and the title is what the customer
                 // saw. The id becomes the body so handlers read an exact
@@ -410,6 +440,15 @@ class CloudTransport {
                       address: msg.location.address || null,
                     }
                   : null,
+              // EVERYTHING ELSE A WHATSAPP MESSAGE CAN CARRY, per Meta's
+              // messages-webhook reference. Structured, and kept OUT of `body`
+              // where it is not the customer typing: an edit put into body
+              // would reach the order parser as a fresh "25 pcs" on top of the
+              // "20 pcs" it corrects, and the cart would hold both. The agent
+              // reads these through agent/incoming; the template path, which
+              // does not understand them, sees an empty body and passes, as
+              // it always did.
+              ...whatsappExtras(msg),
             };
             // Learn the real payload shape: log anything carrying a hint of a
             // group that we did not manage to parse into a group id.
@@ -488,4 +527,4 @@ function pieces(text, max = PIECE_MAX) {
   return out;
 }
 
-module.exports = { CloudTransport, _pieces: pieces };
+module.exports = { CloudTransport, _pieces: pieces, _whatsappExtras: whatsappExtras };

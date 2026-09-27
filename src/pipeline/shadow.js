@@ -28,7 +28,7 @@ const trace = new AsyncLocalStorage();
 const pending = new Set();
 
 function enabled() {
-  return Boolean(config.ai.shadow && (config.ai.apiKey || require('./understand')._stubbed()));
+  return Boolean(config.ai.shadow && (require('../core/ai').modelAvailable() || require('./understand')._stubbed()));
 }
 
 function file() {

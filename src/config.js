@@ -193,6 +193,13 @@ const config = {
     pdf: (process.env.PDF_READING || 'on').toLowerCase() !== 'off',
   },
   dailyReportTime: (process.env.DAILY_REPORT_TIME || '20:00').trim(),
+  // The CSV report to the Sales Heads: customers created, sales, approvals.
+  approvalReportTime: (process.env.APPROVAL_REPORT_TIME || '18:00').trim(),
+  // Payment reminders, two days before the collection date (core/collectionReminders).
+  // REMINDER_TIME=off turns them off.
+  reminderTime: (process.env.REMINDER_TIME || '10:00').trim(),
+  // The dashboard (/dashboard): its data is shown only with this key. Unset = off.
+  dashboardKey: (process.env.DASHBOARD_KEY || '').trim(),
 
   // human-confirm escalation: confusion par is number ko DM, itni der jawab
   // ka intezar, phir customer ko fallback reply. Helper ka jawab PERMANENTLY
@@ -250,22 +257,10 @@ const config = {
   },
 
   ai: {
-    apiKey: (process.env.ANTHROPIC_API_KEY || '').trim(),
-    model: (process.env.ANTHROPIC_MODEL || 'claude-sonnet-5').trim(),
     // Phase 3 of the pipeline review: the Understand model runs beside the bot
     // and writes what it WOULD have decided to /shared/shadow.jsonl. It answers
     // nobody. AI_SHADOW=true switches it on (pipeline/shadow).
     shadow: (process.env.AI_SHADOW || '').toLowerCase() === 'true',
-    // The production image ships no tesseract and no PowerShell (see the
-    // Dockerfile: OCR is CPU-heavy and this host has none spare). Spawning two
-    // processes per photo that can only fail costs seconds of the customer's
-    // wait for nothing. On Windows the local OCR is real and stays on.
-    // AI_OCR=on / off overrides either way.
-    ocr: (process.env.AI_OCR || '').toLowerCase() === 'on'
-      ? true
-      : (process.env.AI_OCR || '').toLowerCase() === 'off'
-        ? false
-        : process.platform === 'win32',
   },
 
   // GSTIN -> the firm (integrations/gst, gstinapi.in). Fills in the half of
@@ -288,6 +283,20 @@ const config = {
   //
   // The phone:name lists were already in .env and read by nothing; this is
   // what finally uses them.
+  // PAYMENT BEFORE A NEW ORDER (founder, 25 Sep). A customer with a due
+  // balance of Rs 1 or more is asked to settle it first, with a payment QR;
+  // the accountant confirms what came in (core/payments).
+  payments: {
+    // "919971194578:Anurag" — who confirms a payment arrived.
+    accountants: nameMap(process.env.ACCOUNTANT_NUMBERS || '919971194578:Anurag'),
+    // The QR: built for the exact amount from a UPI id, or a fixed image.
+    upiId: (process.env.PAYMENT_UPI_ID || '').trim(),
+    upiName: (process.env.PAYMENT_UPI_NAME || 'Cartrends').trim(),
+    qrImage: (process.env.PAYMENT_QR_IMAGE || '').trim(),
+    // Below this, a balance counts as settled.
+    settledBelow: Number(process.env.PAYMENT_SETTLED_BELOW || 1),
+  },
+
   creation: {
     // Who may be asked to fill one in, and what to call them.
     team: nameMap(process.env.CREATION_TEAM_NUMBERS),
@@ -326,13 +335,9 @@ const config = {
     })(),
   },
 
-  // A SECOND pair of eyes on a photo, for when the first is unavailable.
-  //
-  // 21 Sep: the Anthropic key was revoked and every photo stopped being read —
-  // one dead credential took the whole photo path down, and with local OCR off
-  // there was nothing behind it. Claude is still tried first; this runs only
-  // when that fails or is not configured. Same GEMINI_API_KEY as the voice
-  // notes use, but its own model: reading a label is not transcribing audio.
+  // THE MODEL: every photo, free-text parse, reply and name the bot asks for
+  // goes to Gemini (core/ai.model). Same GEMINI_API_KEY as the voice notes
+  // use, but its own model: reading a label is not transcribing audio.
   gemini: {
     apiKey: (process.env.GEMINI_API_KEY || '').trim(),
     // gemini-2.5-flash is RETIRED (404 "no longer available to new users").
@@ -341,7 +346,150 @@ const config = {
     timeoutMs: parseInt(process.env.GEMINI_VISION_TIMEOUT_MS || '30000', 10),
   },
 
-  // Voice notes -> text, for the HELPER to read. Claude takes no audio at all,
+  // How long an answer that is not a part number stays good for.
+  knowledgeMemory: {
+    // "We do not carry that" is true of a catalogue, not forever. After this
+    // many days the question goes back to a person once, in case it is now
+    // stocked. A wrong "not available" costs a sale; one extra question does
+    // not.
+    notCarriedDays: parseInt(process.env.NOT_CARRIED_MEMORY_DAYS || 30, 10),
+  },
+
+  // The catalogue index: which PART the customer means. Never what it costs
+  // or whether we have it - see core/parts.
+  // THE AGENT.
+  //
+  // One agent, every tool, a docstring on each so the model chooses rather
+  // than a router deciding for it. Flash Lite because routing accuracy is
+  // what matters here and it measured 94% at a fraction of the latency.
+  agent: {
+    // The name it answers to and signs off as. Appears in the system prompt
+    // and nowhere else, so changing it here changes it everywhere.
+    name: process.env.AGENT_NAME || 'Prateek',
+    model: process.env.AGENT_MODEL || 'gemini-3.5-flash-lite',
+    // ON unless switched off. The agent is the ONLY way a customer is
+    // answered now — there is no template path behind it — so "off" means
+    // every customer message goes straight to a person with one fixed line
+    // (bots/customerBot.agentUnavailable). AGENT_ENABLED=false does that on
+    // purpose; a missing Gemini key does it too (agent/index.enabled).
+    //
+    // AGENT_ALLOW_FROM is gone: with no template path, a list could only
+    // decide who gets no answer at all.
+    enabled: String(process.env.AGENT_ENABLED || 'true').toLowerCase() !== 'false',
+    // A runaway loop costs money and makes a customer wait. Measured: a
+    // normal part-and-price turn is 2 to 4 tool calls.
+    maxToolCalls: parseInt(process.env.AGENT_MAX_TOOL_CALLS || '10', 10),
+
+    // THE CONTEXT — a running summary, and the last K messages word for word.
+    // The thread itself keeps everything; this only decides what is SENT. See
+    // agent/memory.js.
+    //
+    // K counts messages, tool calls included, and the cut always lands on a
+    // customer message so no turn is split — so the window holds AT LEAST K.
+    contextKeepMessages: parseInt(process.env.AGENT_CONTEXT_KEEP_MESSAGES || '20', 10),
+    // How many messages leave the window before the summary is rewritten.
+    // One at a time would be a summarising call on every turn.
+    summaryBatch: parseInt(process.env.AGENT_SUMMARY_BATCH || '6', 10),
+    // Writing a summary is reading, not judgement: the cheap model does it.
+    summaryModel: (process.env.AGENT_SUMMARY_MODEL || process.env.AGENT_MODEL || 'gemini-3.5-flash-lite').trim(),
+    // The backstop: a summary that keeps failing, or one turn that went round
+    // and round, never makes the request longer than this.
+    contextMaxMessages: parseInt(process.env.AGENT_CONTEXT_MAX_MESSAGES || '60', 10),
+    // THE OPEN WEB, for finding a part number our own sources do not have.
+    // Grounded search runs through Gemini on the key the bot already holds,
+    // so there is no second vendor and no second bill. Flash rather than
+    // Flash Lite: this call reads search results, which is the one job in
+    // the loop where the bigger model earns its latency.
+    webSearchModel: process.env.AGENT_WEB_SEARCH_MODEL || 'gemini-3.5-flash',
+    webSearchTimeoutMs: parseInt(process.env.AGENT_WEB_SEARCH_TIMEOUT_MS || '20000', 10),
+    // How long a question may sit with the specialist before the paused
+    // conversation is given up on. Longer than escalation's own five-minute
+    // nudge on purpose: a hard part can take him an afternoon, and the
+    // customer has already been told someone is looking.
+    hitlHours: parseInt(process.env.AGENT_HITL_HOURS || '48', 10),
+  },
+
+  parts: {
+    // Lower than the knowledge threshold on purpose. A part name is a short,
+    // dense string and the customer writes a different short, dense string;
+    // "Cartend wiper blade 16 number" against "Wiper Blade | 16 Inches | All
+    // Cars" is a real match that scores nothing like a paraphrased sentence.
+    // Tune with /api/parts/search before trusting it.
+    threshold: parseFloat(process.env.PARTS_SIMILARITY_THRESHOLD || '0.60'),
+    topK: parseInt(process.env.PARTS_TOP_K || '5', 10),
+    // How far clear the best match must be from the runner-up. Two parts a
+    // whisker apart is the wiper case - right size, wrong brand, sitting
+    // next to each other - and a near-tie is shown rather than chosen.
+    margin: parseFloat(process.env.PARTS_MATCH_MARGIN || '0.03'),
+    // Recalling a PHRASE a person already answered (core/parts/aliases), not a
+    // catalogue row. Both sides are a customer's own words here — "swift ka
+    // clutch plate chahiye" against "clutch plate for swift dzire" — and two
+    // sentences about the same part score higher than a sentence against a
+    // catalogue line, so this is held above the catalogue threshold. The brand
+    // check still has the last word on anything it lets through.
+    aliasThreshold: parseFloat(process.env.PARTS_ALIAS_THRESHOLD || '0.72'),
+  },
+
+  // ---------------------------------------------------------------- knowledge
+  // The self-learning knowledge base: what a person has told us that is worth
+  // telling the next customer who asks the same thing. Postgres + pgvector,
+  // separate from data/state.json on purpose — see core/kb/db.js.
+  //
+  // With DATABASE_URL unset the whole feature is OFF and the bot behaves
+  // exactly as it did before: it asks a person. Nothing degrades silently.
+  kb: {
+    databaseUrl: (process.env.DATABASE_URL || '').trim(),
+    ssl: /^(1|true|yes)$/i.test(process.env.DATABASE_SSL || ''),
+    poolMax: parseInt(process.env.DATABASE_POOL_MAX || '5', 10),
+    connectTimeoutMs: parseInt(process.env.DATABASE_CONNECT_TIMEOUT_MS || '4000', 10),
+
+    // Gemini's embedding endpoint, using the key the vision and voice paths
+    // already use.
+    //
+    // text-embedding-004 was the default here and answers 404 on this key —
+    // the same way gemini-2.5-flash was retired under the vision path. The
+    // models this account can actually call are gemini-embedding-001 and
+    // gemini-embedding-2; -001 is the one measured against real questions.
+    // It returns 3072 floats by default and is asked for 768 via
+    // outputDimensionality, which MUST match the vector(768) column in
+    // migrations/001 — change one without the other and every search fails.
+    embeddingModel: (process.env.EMBEDDING_MODEL || 'gemini-embedding-001').trim(),
+    embeddingDim: parseInt(process.env.EMBEDDING_DIM || '768', 10),
+    embeddingTimeoutMs: parseInt(process.env.EMBEDDING_TIMEOUT_MS || '10000', 10),
+
+    // How close a stored question must be before it is even considered.
+    //
+    // 0.85 came from the specification and was WRONG for this model: measured
+    // against the real endpoint, a stored return-policy entry scores 0.80
+    // against "Can I return this part?" and 0.76 against "Ye part wapas ho
+    // sakta hai?" — so nothing ever matched and nothing was ever recalled.
+    // Unrelated questions sit at 0.46-0.53, so the gap is wide and real; the
+    // threshold just has to be inside it. Measured 22 Sep on
+    // gemini-embedding-001 at 768 dims. Re-measure with /api/kb/search if the
+    // model or the dimension ever changes.
+    similarityThreshold: parseFloat(process.env.KNOWLEDGE_SIMILARITY_THRESHOLD || '0.65'),
+    topK: parseInt(process.env.KNOWLEDGE_TOP_K || '5', 10),
+    // Below this the model's own "yes this answers it" is not trusted either.
+    minConfidence: parseFloat(process.env.KNOWLEDGE_MIN_CONFIDENCE || '0.75'),
+    // Two stored entries this close are the same question, and the second one
+    // updates the first instead of becoming a duplicate.
+    //
+    // Measured on gemini-embedding-001, comparing whole entries (question +
+    // answer + keywords, which is what duplicate detection compares):
+    //   0.976  same question, answer corrected 7 days -> 15 days
+    //   0.976  reworded question, same answer
+    //   0.946  Hinglish question, same answer
+    //   0.799  a different subject entirely
+    // 0.93 left the Hinglish case clearing by 0.016 - one phrasing away from
+    // silently creating a second copy. 0.90 sits between the two groups.
+    duplicateThreshold: parseFloat(process.env.KNOWLEDGE_DUPLICATE_THRESHOLD || '0.90'),
+
+    // Who may call the knowledge-management API. Unset = the endpoints refuse
+    // every request rather than standing open.
+    apiToken: (process.env.KNOWLEDGE_API_TOKEN || '').trim(),
+  },
+
+  // Voice notes -> text, for the HELPER to read. Audio needs a model that takes it,
   // so this is Google. Blank key = the whole feature is off and voice notes
   // reach a person exactly as they did before.
   //

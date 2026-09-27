@@ -76,7 +76,7 @@ async function readWithModel(text, asked) {
     '"partNo" is the one part number that answers the customer\'s request when there is exactly one. ' +
     '"customerReply" is null when the answer is a part number or list of them; otherwise one or two short lines to send the customer, in the language of the request (Hinglish if Hindi), stating only what the customer needs to know - no internal remarks, no staff names.';
   try {
-    const j = await ai._claude(system, `Customer asked for: ${asked}\n\nManager's instruction:\n${text}`);
+    const j = await ai._model(system, `Customer asked for: ${asked}\n\nManager's instruction:\n${text}`);
     if (!j || typeof j !== 'object') return null;
     const variants = (Array.isArray(j.variants) ? j.variants : [])
       .map((v) => ({ key: String(v.key || '').replace(/\D/g, '') || String(v.key || ''), label: String(v.label || v.key || ''), partNo: cleanPartNo(v.partNo) }))

@@ -164,6 +164,190 @@ async function findCustomers(query) {
   return { total: all.length, top: all.slice(0, MAX_CANDIDATES) };
 }
 
+// THE CUSTOMER BY PHONE OR GST NUMBER (founder, 25 Sep): "first he needs
+// the customer's phone number or GST number, so the bot, the portal and Odoo
+// know who the order is for and where to ship it". A name finds several
+// Anujs; a number finds one account.
+//
+// "9812345678", "+91 98123 45678", "customer 9812345678", "gst 07ABCDE1234F1Z5"
+// -> { phone } | { gst } | null. Only when the message IS that — a part
+// number with digits in it is not a phone number.
+const GSTIN_IN = /^(?:gst(?:in)?(?:\s*(?:no|number))?\s*[:\-]?\s*)?([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9A-Z]Z[0-9A-Z])$/i;
+const PHONE_IN = /^(?:(?:customer|cust|party|mobile|mob|phone|number|no)\.?\s*(?:no\.?|number)?\s*[:\-]?\s*)?(?:\+?91[\s-]?)?([6-9]\d{4}[\s-]?\d{5})$/i;
+function readCustomerKey(text) {
+  const t = String(text || '').trim();
+  const g = t.replace(/\s+/g, ' ').match(GSTIN_IN);
+  if (g) return { gst: g[1].toUpperCase() };
+  const p = t.match(PHONE_IN);
+  if (p) return { phone: '91' + p[1].replace(/\D/g, '') };
+  return null;
+}
+
+// The portal accounts for that phone or GSTIN. For a GSTIN the portal has no
+// search, so the GST register gives the firm's name, the name search finds
+// the candidates, and only the one carrying this GSTIN is kept.
+async function findByKey(key) {
+  const portal = require('../integrations/dealerPortal');
+  if (key.phone) {
+    // The portal's customer_mobile filter reads the `mobile` column, which
+    // accounts the bot opened leave empty (the number is in `phone`) — live,
+    // 25 Sep, MIYA JI MOTORS was not found by it. The lookup every customer
+    // message already uses finds them; the mobile search adds any others.
+    const rows = [];
+    const c = await portal.lookupCustomer(key.phone).catch(() => null);
+    if (c && c.found && c.buyerId) {
+      const raw = c.raw || {};
+      rows.push({
+        id: c.buyerId,
+        name: c.name,
+        gst_no: c.gstNo || raw.gst_no || null,
+        phone: key.phone,
+        address: raw.address || null,
+        state_name: raw.state_name || null,
+        home_branch_dealer_id: c.branchId || raw.home_branch_dealer_id || null,
+      });
+    }
+    for (const r of await portal.searchAccountsByMobile(key.phone).catch(() => [])) {
+      if (!rows.some((x) => Number(x.id) === Number(r.id))) rows.push(r);
+    }
+    return rows;
+  }
+  if (key.gst) {
+    const firm = await require('../integrations/gst').lookup(key.gst).catch(() => null);
+    const names = [firm && firm.name, firm && firm.tradeName, firm && firm.legalName].filter(Boolean);
+    for (const n of names) {
+      const found = await findCustomers(n).catch(() => ({ top: [] }));
+      const rows = (found.top || []).filter((r) => String(r.gst_no || '').toUpperCase() === key.gst);
+      if (rows.length) return rows;
+      // A first word alone brings back more; the GSTIN still decides.
+      const wide = await portal.searchAccounts(String(n).split(/\s+/)[0]).catch(() => []);
+      const hit = wide.filter((r) => String(r.gst_no || '').toUpperCase() === key.gst);
+      if (hit.length) return hit;
+    }
+    return [];
+  }
+  return [];
+}
+
+// "Customer ka order punch karna hai" names nobody: "customer" is the word
+// for the person, not their name. 25 Sep, live: it was searched as a name and
+// listed "BIKE OIL CUSTOMER", "Walk In Customer"… — so a generic word asks
+// whose order it is instead.
+const GENERIC_NAME = /^(?:(?:ek|kisi|koi|new|naya|nayi|another|dusre|doosre|is|us|mere|mera|apne)\s+)?(?:customer|customers|cust|party|client|dealer|shop|dukaan|dukan|garage|account)(?:\s+(?:ka|ke|ki|ko|ne))?$/i;
+const isGenericName = (name) => GENERIC_NAME.test(String(name || '').trim());
+
+// A reply that can only be a customer's name: a few words, letters, no part
+// number, no question, not a yes/no.
+function looksLikeName(text) {
+  const s = String(text || '').trim();
+  if (s.length < 3 || s.length > 60 || s.split(/\s+/).length > 6) return false;
+  if (PART_LIKE.test(s) || /\d{3,}/.test(s) || /\?/.test(s)) return false;
+  if (/^(haan|han|ha|yes|ok|okay|nahi|nhi|no|na|cancel|rehne do|thik|theek|done)\b/i.test(s)) return false;
+  if (/\b(kya|kitna|kitne|kaise|kab|kahan|rate|price|stock|order|discount|detail|check)\b/i.test(s)) return false;
+  return /[a-z]/i.test(s);
+}
+
+// ASKING ABOUT A CUSTOMER: "customer ki detail", "check customer 9654078241",
+// "is GST ka account", "customer ka due kitna hai", "mere number pe koi
+// account hai". Answered with the customer card — due balance included.
+const INFO_RE = /\b(customer|party|client|account|khata|gst|gstin)\b[\s\S]{0,40}\b(detail|details|info|information|jankari|jaankari|check|search|dhundh\w*|find|kaun|hai\s*kya|due|balance|baaki|baki|outstanding)\b|\b(detail|details|info|check|search|find|dhundh\w*|due|balance)\b[\s\S]{0,30}\b(customer|party|client|account|gst|gstin)\b|\b(mere|mera|my)\s+(number|no\.?)\b[\s\S]{0,30}\b(account|khata)\b|\b(gst|gstin|number|no\.?)\b[\s\S]{0,40}\b(ka|ki|ke|kiska|kaun|whose)\b[\s\S]{0,20}\b(account|customer|party|khata)\b/i;
+// A phone number or GSTIN anywhere in a sentence.
+function findKeyIn(text) {
+  const s = String(text || '');
+  const g = s.toUpperCase().match(/\b[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9A-Z]Z[0-9A-Z]\b/);
+  if (g) return { gst: g[0] };
+  const p = s.replace(/[\s-]/g, ' ').match(/(?:\+?91\s?)?\b([6-9]\d{9})\b/) || s.replace(/[\s-]/g, '').match(/(?:\+?91)?([6-9]\d{9})/);
+  return p ? { phone: '91' + p[1] } : null;
+}
+
+// SEARCHING A CUSTOMER BY NAME / SHOP NAME (founder, 25 Sep): "search Vinod
+// automobiles", "customer Kalra Motors", "shop name Miya ji motors", "Kalra
+// Motors ki detail", "Kalra Motors ka due kitna hai". -> the name, or null.
+const SEARCH_LEAD = /^(?:please\s+|pls\s+)?(?:search|find|dhundh\w*|dhoondh\w*|dhundo|check|lookup|look\s+up|show)\s+(?:(?:the|a|this)\s+)?(?:(?:customer|party|shop|dukan|dukaan|dealer|account|client)\s*)?(?:name\s*)?[:\-]?\s*(.+)$/i;
+const TYPE_LEAD = /^(?:customer|party|shop|dukan|dukaan|dealer|client|firm)\s*(?:name|ka\s+naam|ka\s+name)?\s*[:\-]?\s*(.+)$/i;
+const NAME_THEN = /^(.+?)\s+(?:ki|ka|ke)\s+(?:detail|details|info|information|jankari|jaankari|account|profile|due|balance|baaki|baki|outstanding)\b[\s\S]*$/i;
+function nameAsked(text) {
+  const t = String(text || '').trim().replace(/[?.!]+$/, '');
+  const m = t.match(SEARCH_LEAD) || t.match(TYPE_LEAD) || t.match(NAME_THEN);
+  if (!m) return null;
+  const name = m[1].replace(/\b(ki|ka|ke|details?|info|please|pls|bhejo|batao|dikhao|chahiye)\b/gi, ' ').replace(/\s+/g, ' ').trim();
+  if (!name || isGenericName(name) || findKeyIn(name) || PART_LIKE.test(name) || name.length < 3) return null;
+  // "show cart", "check stock", "search order status" are not names.
+  if (/\b(order|orders|cart|stock|rate|price|mrp|list|report|ledger|discount|bill|bills|invoice|status|part|parts|payment|dispatch|challan)\b/i.test(name)) return null;
+  return name;
+}
+
+// A customer found by name, shown to the agent: one -> the card; several ->
+// the list, and picking one shows its card; none exactly -> the near misses
+// ("kalara" -> Kalra Motors). `quiet`: say nothing when there is no match
+// (a bare name that might be something else).
+async function showByName(m, name, reply, t, { quiet = false } = {}) {
+  let found;
+  try {
+    found = await findCustomers(name);
+    if (!found.total) found = await findCustomersFuzzy(name);
+  } catch (e) {
+    store.log('sales', 'customer search failed: ' + String((e && e.message) || e).slice(0, 140));
+    if (quiet) return false;
+    return reply(t("I can't open the customer list right now - try again in a minute?", 'Customer list abhi khul nahi rahi - ek minute mein phir bhejiye?'));
+  }
+  if (!found.total) {
+    if (quiet) return false;
+    return reply(
+      t(
+        'No customer or shop called "' + name + '". Try their phone number or GST number, or another part of the name.',
+        '"' + name + '" naam se koi customer / shop nahi mila. Phone number ya GST number bhejiye, ya naam ka dusra hissa.',
+      ),
+    );
+  }
+  store.log('sales', m.from + ' searched the customer "' + name + '": ' + found.total + ' match(es)');
+  if (found.top.length === 1) {
+    start(m.chatId, found.top, null);
+    const card = await customerCard(found.top[0], t);
+    return reply(card + '\n\n' + t('Is the order for this customer? (yes / no)', 'Order isi customer ke liye hai? (haan / nahi)'));
+  }
+  start(m.chatId, found.top, null, 'card');
+  const listed = found.top.map((r, i) => i + 1 + '. ' + label(r)).join('\n');
+  const more = found.total > found.top.length ? t('\n...and more - send more of the name.', '\n...aur bhi hain - naam thoda aur bataiye.') : '';
+  return reply(t('Which one? Send the number.\n', 'Kaunsa wala? Number bhejiye.\n') + listed + more);
+}
+// A bare name counts only when every word IS a word of a customer's name —
+// "Kalra Motors" yes, "swift headlight" (a part) no.
+async function bareName(text) {
+  const tt = String(text || '').trim();
+  if (!looksLikeName(tt) || tt.split(/\s+/).length < 2) return null;
+  const found = await findCustomers(tt).catch(() => ({ top: [] }));
+  const q = words(tt);
+  const exact = (found.top || []).filter((r) => q.every((w) => words(r.name).includes(w)));
+  return exact.length ? tt : null;
+}
+
+// PARTS SENT BEFORE THE CUSTOMER. A salesman sends the parts and is asked
+// whose order it is; the parts are kept here (as the lines he would have
+// typed) and become that customer's draft the moment he answers.
+const heldItems = chatState.slot('salesOrder.heldItems'); // chatId -> { text, at }
+const HELD_TTL_MS = 60 * 60 * 1000;
+function holdItems(chatId, lines) {
+  const add = (lines || [])
+    .map((l) => ((l.partNo || l.item) ? (l.partNo || l.item) + ' ' + (Number(l.qty) || 1) : null))
+    .filter(Boolean);
+  if (!add.length) return;
+  const was = heldItems.get(chatId);
+  const keep = was && Date.now() - was.at < HELD_TTL_MS ? String(was.text).split('\n').filter(Boolean) : [];
+  const parts = new Map(keep.map((x) => [x.split(' ')[0].toUpperCase(), x]));
+  for (const x of add) parts.set(x.split(' ')[0].toUpperCase(), x);
+  heldItems.set(chatId, { text: [...parts.values()].join('\n'), at: Date.now() });
+}
+function takeItems(chatId) {
+  const h = heldItems.get(chatId);
+  heldItems.delete(chatId);
+  return h && Date.now() - h.at < HELD_TTL_MS ? h.text : null;
+}
+function heldCount(chatId) {
+  const h = heldItems.get(chatId);
+  return h && Date.now() - h.at < HELD_TTL_MS ? String(h.text).split('\n').filter(Boolean).length : 0;
+}
+
 // Enough to tell two "Anuj"s apart: where they are, and whose customer.
 // "M/S Maan Motors (Babarpur, Haryana · agent Seema)".
 function place(row) {
@@ -181,6 +365,45 @@ function agentOf(row) {
 function label(row) {
   const extra = [place(row), agentOf(row) ? 'agent ' + agentOf(row) : ''].filter(Boolean).join(' · ');
   return extra ? row.name + ' (' + extra + ')' : row.name;
+}
+
+// EVERYTHING ABOUT ONE CUSTOMER, for the agent to check before acting on
+// the account (founder, 25 Sep: "show complete detail about the customer to
+// agent and after that agent say yes"). The portal's account row carries the
+// credit terms and balance; a row that came from the phone lookup is filled
+// in from the name search. The discounts are the ones that apply today.
+async function customerCard(row, t) {
+  const portal = require('../integrations/dealerPortal');
+  let full = row;
+  if (row && row.credit_limit === undefined && row.name) {
+    const rows = await portal.searchAccounts(row.name).catch(() => []);
+    full = { ...row, ...(rows.find((r) => Number(r.id) === Number(row.id)) || {}) };
+  }
+  const money = (v) => (v === null || v === undefined || v === '' ? null : '₹' + Number(v).toLocaleString('en-IN', { maximumFractionDigits: 2 }));
+  const discounts = await portal.activeDiscounts(full.id).catch(() => []);
+  const lines = [
+    `*${full.name}*`,
+    full.phone || full.mobile ? 'Phone: ' + (full.phone || full.mobile) : null,
+    full.gst_no ? 'GSTIN: ' + full.gst_no : null,
+    full.address || full.state_name ? 'Address: ' + [full.address, full.state_name].filter(Boolean).join(', ') : null,
+    full.person ? 'Contact: ' + full.person : null,
+    agentOf(full) ? 'Agent: ' + agentOf(full) : null,
+    full.credit_limit != null ? `Credit: ${money(full.credit_limit)}${full.credit_days != null ? ' · ' + full.credit_days + ' day(s)' : ''}` : null,
+    // What they owe — Odoo's receivable, as the portal reads it live.
+    full.balance != null
+      ? Number(full.balance) >= 1
+        ? t('Due balance: ', 'Due balance: ') + money(full.balance) + t(' (to be settled before a new order)', ' (naye order se pehle settle karna hai)')
+        : t('Due balance: nil (settled)', 'Due balance: nil (settle hai)')
+      : null,
+    full.home_branch_dealer_id || full.home_branch_dealer
+      ? 'Home branch: ' + require('./dataEntryRequests').branchName(full.home_branch_dealer_id || full.home_branch_dealer)
+      : null,
+    'Portal id: ' + full.id,
+    discounts.length
+      ? t('Discounts now: ', 'Abhi discount: ') + discounts.map((d) => `${d.on} ${d.percent}%${d.validTill ? ' (till ' + d.validTill + ')' : ''}`).join('; ')
+      : t('Discounts now: none', 'Abhi discount: koi nahi'),
+  ];
+  return lines.filter(Boolean).join('\n');
 }
 
 // The same shape customers.resolve() returns, so the order and confirm paths
@@ -542,10 +765,137 @@ function inr(v) {
   return Number.isFinite(n) ? n.toLocaleString('en-IN', { maximumFractionDigits: 2 }) : '-';
 }
 
+// THE CUSTOMER'S LEDGER AS A PDF (founder, 25 Sep): every posted entry on
+// their account in Odoo for the last 90 days, the opening and closing
+// balance, sent as a document into the agent's chat. -> true when it went.
+async function sendLedgerPdf(bot, m, row, t) {
+  const portal = require('../integrations/dealerPortal');
+  const odoo = require('../integrations/odoo');
+  let full = row;
+  if (!full.odoo_partner_id && full.name) {
+    const rows = await portal.searchAccounts(full.name).catch(() => []);
+    full = { ...full, ...(rows.find((r) => Number(r.id) === Number(full.id)) || {}) };
+  }
+  if (!odoo.enabled() || !full.odoo_partner_id) {
+    store.log('sales', 'no ledger PDF for ' + full.name + ': ' + (odoo.enabled() ? 'no Odoo partner' : 'Odoo not configured'));
+    return false;
+  }
+  try {
+    const st = await odoo.statement(full.odoo_partner_id);
+    const buf = await require('./pdf').ledgerPdf(st, {
+      name: full.name,
+      phone: full.phone || full.mobile || null,
+      gst: full.gst_no || null,
+      address: [full.address, full.state_name].filter(Boolean).join(', ') || null,
+      portalId: full.id,
+      creditLimit: full.credit_limit != null ? Number(full.credit_limit) : null,
+      creditDays: full.credit_days != null ? full.credit_days : null,
+    });
+    const safe = String(full.name || 'customer').replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
+    const due = st.closing >= 1 ? 'due ' + require('./pdf').rs(st.closing) : 'nothing due';
+    await bot.transport.sendDocument(
+      m.chatId,
+      buf,
+      'Ledger-' + safe + '-' + st.to + '.pdf',
+      'application/pdf',
+      t(full.name + ' — ledger ' + st.from + ' to ' + st.to + ' (' + due + ')', full.name + ' — ledger ' + st.from + ' se ' + st.to + ' (' + due + ')'),
+    );
+    store.log('sales', m.from + ' was sent the ledger PDF of ' + full.name + ' (' + st.lines.length + ' entries, ' + due + ')');
+    return true;
+  } catch (e) {
+    store.log('sales', 'ledger PDF for ' + full.name + ' failed: ' + String((e && e.message) || e).slice(0, 140));
+    return false;
+  }
+}
+const LEDGER_RE = /\b(ledger|khata|statement|hisab|hisaab|account\s*statement)\b/i;
+
+// THE CUSTOMER'S INVOICES AS PDFs (founder, 25 Sep). Odoo lists them; each is
+// sent as the portal's own bill PDF — the file the desk downloads — found
+// through the portal order carrying that invoice number (CT-DL-26-27/3234 ->
+// order 44900001), else the Odoo SO number, else the invoice's ref, which on
+// newer invoices IS the portal order id.
+const INVOICE_RE = /\b(invoice|invoices|bill|bills)\b/i;
+const INVOICE_OF = /^(.+?)\s+(?:ka|ki|ke)\s+(?:(?:latest|last|pichla|pichhla|sab|saare|all)\s+)?(?:invoice|invoices|bill|bills)\b/i;
+
+async function withOdooPartner(row) {
+  if (row.odoo_partner_id || !row.name) return row;
+  const rows = await require('../integrations/dealerPortal').searchAccounts(row.name).catch(() => []);
+  return { ...row, ...(rows.find((r) => Number(r.id) === Number(row.id)) || {}) };
+}
+
+async function sendInvoicePdf(bot, m, row, inv, t) {
+  const portal = require('../integrations/dealerPortal');
+  const orders = await portal.recentOrders(row.name, { limit: 60 }).catch(() => []);
+  const hit =
+    orders.find((o) => String(o.invoice_no || '') === inv.name) ||
+    orders.find((o) => inv.orderId && String(o.odoo_so_name || '') === String(inv.orderId)) ||
+    null;
+  const orderId = hit ? hit.order_id : inv.orderId;
+  let pdf = null;
+  if (orderId) pdf = await portal.invoicePdf(orderId).catch(() => null);
+  if (!pdf) {
+    store.log('sales', 'no bill PDF for ' + inv.name + ' (' + row.name + ', order ' + orderId + ')');
+    return false;
+  }
+  const clean = (x) => String(x || '').replace(/[\\/:*?"<>|]+/g, '-').replace(/\s+/g, ' ').trim();
+  const pdfLib = require('./pdf');
+  await bot.transport.sendDocument(
+    m.chatId,
+    pdf,
+    ('Invoice ' + clean(inv.name) + ' - ' + clean(row.name)).slice(0, 80) + '.pdf',
+    'application/pdf',
+    row.name + ' · ' + inv.name + ' · ' + (inv.date || '') + ' · ' + pdfLib.rs(inv.total) + (inv.paid ? ' · paid' : ' · pending ' + pdfLib.rs(inv.pending)),
+  );
+  store.log('sales', m.from + ' was sent invoice ' + inv.name + ' of ' + row.name + ' (portal order ' + orderId + ')');
+  return true;
+}
+
+// The customer's latest invoices: one is sent; several are listed to pick.
+async function invoicesFor(bot, m, row, reply, t) {
+  const odoo = require('../integrations/odoo');
+  const full = await withOdooPartner(row);
+  if (!odoo.enabled() || !full.odoo_partner_id) {
+    return reply(t(full.name + ' is not linked to Odoo, so their invoices cannot be read.', full.name + ' Odoo se linked nahi hai, isliye invoice nahi mil rahe.'));
+  }
+  let list = [];
+  try {
+    list = await odoo.invoices(full.odoo_partner_id, { limit: 5 });
+  } catch (e) {
+    store.log('sales', 'invoices of ' + full.name + ' failed: ' + String((e && e.message) || e).slice(0, 120));
+    return reply(t('The invoices could not be read right now — try again in a minute.', 'Invoice abhi nahi mil rahe — ek minute mein dobara bhejiye.'));
+  }
+  if (!list.length) return reply(t(full.name + ' has no invoice yet.', full.name + ' ka abhi koi invoice nahi hai.'));
+  if (list.length === 1) {
+    await reply(t('Sending invoice ' + list[0].name + ' of ' + full.name + '…', full.name + ' ka invoice ' + list[0].name + ' bhej raha hoon…'));
+    if (!(await sendInvoicePdf(bot, m, full, list[0], t))) return reply(t('The PDF of ' + list[0].name + ' is not available on the portal yet.', list[0].name + ' ka PDF portal pe abhi nahi hai.'));
+    return true;
+  }
+  const pdfLib = require('./pdf');
+  sessions.set(m.chatId, { stage: 'pickInvoice', customer: { id: full.id, name: full.name, odoo_partner_id: full.odoo_partner_id }, invoices: list, at: Date.now() });
+  const NL = String.fromCharCode(10);
+  const rows = list.map((v, i) => (i + 1) + '. ' + v.name + ' · ' + (v.date || '') + ' · ' + pdfLib.rs(v.total) + (v.paid ? ' · paid' : ' · pending ' + pdfLib.rs(v.pending)));
+  return reply(
+    t(full.name + ' — latest invoices:' + NL + rows.join(NL) + NL + NL + 'Which one? Send the number (e.g. 1 or 1,3) — or "all".', full.name + ' ke latest invoice:' + NL + rows.join(NL) + NL + NL + 'Kaunsa bhejun? Number bhejiye (jaise 1 ya 1,3) — ya "sab".'),
+  );
+}
+
+// What an agent asked for, once the customer is known.
+async function deliverFor(bot, m, row, intent, reply, t) {
+  if (intent === 'invoice') return invoicesFor(bot, m, row, reply, t);
+  await reply(t('Sending the ledger of ' + row.name + '…', row.name + ' ka ledger bhej raha hoon…'));
+  if (!(await sendLedgerPdf(bot, m, row, t))) return reply(await lookup.answer(row, 'ledger', t).catch(() => t('The ledger could not be made right now.', 'Ledger abhi nahi ban paya.')));
+  return true;
+}
+
 async function answerAbout(bot, m, row, about, reply, t) {
   const portal = require('../integrations/dealerPortal');
   store.log('sales', m.from + ' asked about ' + row.name + ' (' + about.intent + (about.part ? ' ' + about.part : '') + ')');
-  if (about.intent === 'ledger' || about.intent === 'credit' || about.intent === 'status') {
+  if (about.intent === 'ledger') {
+    await reply(await lookup.answer(row, about.intent, t));
+    await sendLedgerPdf(bot, m, row, t);
+    return true;
+  }
+  if (about.intent === 'credit' || about.intent === 'status') {
     return reply(await lookup.answer(row, about.intent, t));
   }
   const ctx = await enrich(ctxFor(row), row);
@@ -1079,15 +1429,185 @@ function afterPunch(chatId, result, t) {
 
 // Everything a salesman's message can mean here. true = answered; false = let
 // the normal flow have it.
+// A name: one account -> its card and "this one?"; several -> the list; none
+// -> say so, and how else to find them.
+async function searchByName(m, name, items, reply, t) {
+  let found;
+  try {
+    found = await findCustomers(name);
+  } catch (e) {
+    store.log('sales', 'customer search failed: ' + String((e && e.message) || e).slice(0, 140));
+    return reply(t("I can't open the customer list right now - try again in a minute?", 'Customer list abhi khul nahi rahi - ek minute mein phir bhejiye?'));
+  }
+  if (!found.total) {
+    sessions.set(m.chatId, { stage: 'askCustomer', items: items || null, at: Date.now() });
+    return reply(
+      t(
+        'No customer called "' + name + '". Send their phone number or GST number, or more of the name.',
+        '"' + name + '" naam se koi customer nahi mila. Unka phone number ya GST number bhejiye, ya naam thoda aur.',
+      ),
+    );
+  }
+  start(m.chatId, found.top, items || null);
+  store.log('sales', m.from + ' searched "' + name + '": ' + found.total + ' match(es)');
+  if (found.top.length === 1) {
+    const card = await customerCard(found.top[0], t);
+    return reply(card + '\n\n' + t('Is the order for this customer? (yes / no)', 'Order isi customer ke liye hai? (haan / nahi)'));
+  }
+  const listed = found.top.map((r, i) => i + 1 + '. ' + label(r)).join('\n');
+  const more = found.total > found.top.length ? t('\n...and a few more - give me a bit more of the name.', '\n...aur bhi hain, thoda poora naam bata dijiye.') : '';
+  return reply(t('Which one?\n' + listed + more, 'Kaunsa wala?\n' + listed + more));
+}
+
 async function handle(bot, m, text, reply, t) {
   const orders = require('./orders');
   const s = session(m.chatId);
+
+  // 0. WHICH INVOICE, from the list just shown: "2", "1,3", "1 2", "sab".
+  if (s && s.stage === 'pickInvoice') {
+    const said = String(text || '').trim().toLowerCase();
+    const all = /^(sab|saare|sare|all|sabhi|every)/.test(said);
+    const nums = all ? s.invoices.map((_, i) => i + 1) : (said.match(/\d{1,2}/g) || []).map(Number).filter((n) => n >= 1 && n <= s.invoices.length);
+    if (nums.length && (all || /^[\d\s,&and]+$/.test(said.replace(/aur/g, '')))) {
+      clear(m.chatId);
+      const row = s.customer;
+      let sent = 0;
+      for (const n of [...new Set(nums)]) if (await sendInvoicePdf(bot, m, row, s.invoices[n - 1], t)) sent++;
+      if (!sent) return reply(t('Those PDFs are not available on the portal yet.', 'Inke PDF portal pe abhi nahi hain.'));
+      if (sent < nums.length) return reply(t('The others are not available as PDF on the portal yet.', 'Baaki ke PDF portal pe abhi nahi hain.'));
+      return true;
+    }
+  }
 
   // The second OK - "Sahi hai?" on the draft SO - is answered in
   // core/soReview, which confirms it and sends the confirmed document.
 
   // 1b. The customer's name for parts sent in a file, sent on its own.
   if (await fileAnalysisName(bot, m, text, reply, t)) return true;
+
+  // 1b2. A LEDGER or an INVOICE, by phone / GST number, by name, or for the
+  //      customer just shown: "9654078241 ka ledger", "Kalra Motors ka
+  //      invoice", "invoice bhejo", "is customer ka khata". ("486 ka bill" —
+  //      a portal order number — is answered further down, as before.)
+  const want = LEDGER_RE.test(text) ? 'ledger' : INVOICE_RE.test(text) && !lookup.parseBill(text) ? 'invoice' : null;
+  if (want && (findKeyIn(text) || want === 'invoice' || !lookup.parse(text))) {
+    const k = findKeyIn(text);
+    let rows = k ? await findByKey(k).catch(() => []) : [];
+    if (!k && want === 'invoice') {
+      const nm = (String(text).trim().match(INVOICE_OF) || [])[1];
+      if (nm && !isGenericName(nm) && looksLikeName(nm.replace(/\b(is|us|mere|mera)\b/gi, '').trim() || 'x')) {
+        const found = await findCustomers(nm).catch(() => ({ top: [] }));
+        rows = found.top && found.top.length ? found.top : (await findCustomersFuzzy(nm).catch(() => ({ top: [] }))).top || [];
+      }
+    }
+    if (!k && !rows.length) {
+      const shown = s && s.stage === 'choose' && s.candidates && s.candidates.length === 1 ? s.candidates[0] : null;
+      const active = !shown && activeCustomer(m.chatId);
+      if (shown) rows = [shown];
+      else if (active) rows = [{ ...(active.raw || {}), id: active.buyerId, name: active.name }];
+    }
+    if (rows.length === 1) {
+      if (s && s.stage === 'choose') clear(m.chatId);
+      return deliverFor(bot, m, rows[0], want, reply, t);
+    }
+    if (rows.length > 1) {
+      start(m.chatId, rows.slice(0, MAX_CANDIDATES), null, want);
+      return reply(t('Which one?' + String.fromCharCode(10), 'Kaunsa wala?' + String.fromCharCode(10)) + rows.slice(0, MAX_CANDIDATES).map((r, i) => i + 1 + '. ' + label(r)).join(String.fromCharCode(10)));
+    }
+    if (k) return reply(t('No customer on the portal with that number.', 'Is number pe portal mein koi customer nahi mila.'));
+    sessions.set(m.chatId, { stage: 'askCustomer', intent: want, items: null, at: Date.now() });
+    return reply(
+      want === 'invoice'
+        ? t("Whose invoice? Send the customer's phone number or GST number (or name).", 'Kiska invoice? Customer ka phone number ya GST number bhejiye (ya naam).')
+        : t("Whose ledger? Send the customer's phone number or GST number (or name).", 'Kiska ledger? Customer ka phone number ya GST number bhejiye (ya naam).'),
+    );
+  }
+
+  // 1b3. A CUSTOMER BY NAME / SHOP NAME: "search Vinod automobiles", "Kalra
+  //      Motors ki detail", "customer Miya ji motors" — or just the name.
+  if (!(s && s.stage === 'choose' && readChoice(text, s.candidates.length) !== null) && !parseOrderFor(text)) {
+    const asked = nameAsked(text);
+    if (asked) return showByName(m, asked, reply, t);
+    if (!(s && s.stage === 'askCustomer') && !lookup.parse(text)) {
+      const bare = await bareName(text);
+      if (bare) return showByName(m, bare, reply, t, { quiet: true });
+    }
+  }
+
+  // 1c0. ASKING ABOUT A CUSTOMER — "customer ki detail", "check customer
+  // 9654078241", "mere number pe koi account hai". The phone or GSTIN in it is
+  // looked up below; without one, whose is asked.
+  let infoKey = null;
+  if (INFO_RE.test(text) && !parseOrderFor(text)) {
+    infoKey = findKeyIn(text) || (/\b(mere|mera|my)\s+(number|no\.?)\b/i.test(text) ? { phone: store.normPhone(m.from) } : null);
+    if (!infoKey) {
+      sessions.set(m.chatId, { stage: 'askCustomer', items: null, at: Date.now() });
+      return reply(
+        t(
+          "Send the customer's phone number or GST number (or their name) — I'll show you their full details and due balance.",
+          'Customer ka phone number ya GST number bhejiye (ya naam) — poori detail aur due balance bata deta hoon.',
+        ),
+      );
+    }
+  }
+
+  // 1c1. The customer's NAME, after "kis customer ke liye?".
+  if (s && s.stage === 'askCustomer' && !readCustomerKey(text) && !findKeyIn(text) && looksLikeName(text)) {
+    if (s.intent === 'ledger' || s.intent === 'invoice') {
+      const found = await findCustomers(text).catch(() => ({ top: [] }));
+      if (found.top.length === 1) {
+        clear(m.chatId);
+        return deliverFor(bot, m, found.top[0], s.intent, reply, t);
+      }
+      if (found.top.length > 1) {
+        start(m.chatId, found.top, null, s.intent);
+        return reply(t('Which one?\n', 'Kaunsa wala?\n') + found.top.map((r, i) => i + 1 + '. ' + label(r)).join('\n'));
+      }
+      return reply(t('No customer called "' + text + '". Send the phone number or GST number.', '"' + text + '" naam ka customer nahi mila. Phone number ya GST number bhejiye.'));
+    }
+    return searchByName(m, text, s.items || takeItems(m.chatId), reply, t);
+  }
+
+  // 1c. THE CUSTOMER BY PHONE OR GSTIN. Not while a list is open: "2" there is
+  // a pick, and a list answer never looks like a phone number anyway.
+  const key = infoKey || (!(s && s.stage === 'choose' && readChoice(text, s.candidates.length) !== null) ? readCustomerKey(text) : null);
+  if (key) {
+    let rows = [];
+    try {
+      rows = await findByKey(key);
+    } catch (e) {
+      store.log('sales', 'customer by ' + (key.phone ? 'phone' : 'GST') + ' failed: ' + String((e && e.message) || e).slice(0, 120));
+      return reply(t("I can't reach the customer list right now - try again in a minute?", 'Customer list abhi khul nahi rahi - ek minute mein phir bhejiye?'));
+    }
+    const what = key.phone ? key.phone.slice(-10) : key.gst;
+    if (!rows.length) {
+      return reply(
+        t(
+          'No customer on the portal with ' + what + '. To open a new account for them, write "customer bana do".',
+          what + ' pe portal mein koi customer nahi mila. Naya account kholna hai to "customer bana do" likhiye.',
+        ),
+      );
+    }
+    if (s && s.stage === 'askCustomer' && (s.intent === 'ledger' || s.intent === 'invoice')) {
+      if (rows.length === 1) {
+        clear(m.chatId);
+        return deliverFor(bot, m, rows[0], s.intent, reply, t);
+      }
+      start(m.chatId, rows.slice(0, MAX_CANDIDATES), null, s.intent);
+      return reply(t('Which one?' + String.fromCharCode(10), 'Kaunsa wala?' + String.fromCharCode(10)) + rows.slice(0, MAX_CANDIDATES).map((r, i) => i + 1 + '. ' + label(r)).join(String.fromCharCode(10)));
+    }
+    const items = takeItems(m.chatId);
+    start(m.chatId, rows.slice(0, MAX_CANDIDATES), items);
+    store.log('sales', m.from + ' picked the customer by ' + (key.phone ? 'phone' : 'GST') + ' ' + what + ': ' + rows.length + ' account(s)' + (items ? ', with held parts' : ''));
+    // One account: everything about it — its due balance included — and
+    // whether the order is for them. The card answers "what does X owe?" too.
+    if (rows.length === 1) {
+      const card = await customerCard(rows[0], t);
+      return reply(card + '\n\n' + t('Is the order for this customer? (yes / no)', 'Order isi customer ke liye hai? (haan / nahi)'));
+    }
+    const listed = rows.slice(0, MAX_CANDIDATES).map((r, i) => i + 1 + '. ' + label(r)).join('\n');
+    return reply(t('Which one?\n' + listed, 'Kaunsa wala?\n' + listed));
+  }
 
   // 2. Picking the customer.
   if (s && s.stage === 'choose') {
@@ -1099,6 +1619,19 @@ async function handle(bot, m, text, reply, t) {
     if (typeof pick === 'number') {
       // The desk asked ABOUT this customer (orders, ledger, credit notes)
       // rather than ordering for them: answer, and close the picker.
+      // (A ledger is answered by the path below, which keeps the list for
+      // "2", a swiped "3." or the list's own label next.)
+      if (s.intent === 'invoice') {
+        const row = s.candidates[pick];
+        clear(m.chatId);
+        return deliverFor(bot, m, row, 'invoice', reply, t);
+      }
+      if (s.intent === 'card') {
+        const row = s.candidates[pick];
+        start(m.chatId, [row], null);
+        const card = await customerCard(row, t);
+        return reply(card + '\n\n' + t('Is the order for this customer? (yes / no)', 'Order isi customer ke liye hai? (haan / nahi)'));
+      }
       if (s.intent && s.intent !== 'order') {
         const row = s.candidates[pick];
         const about = s.about || null;
@@ -1106,7 +1639,9 @@ async function handle(bot, m, text, reply, t) {
         clear(m.chatId);
         if (about) return about.many ? answerAboutMany(bot, m, row, about, reply, t) : answerAbout(bot, m, row, about, reply, t);
         store.log('sales', m.from + ' asked about ' + row.name + ' (' + s.intent + ')');
-        return reply(await lookup.answer(row, s.intent, t));
+        await reply(await lookup.answer(row, s.intent, t));
+        if (s.intent === 'ledger') await sendLedgerPdf(bot, m, row, t);
+        return true;
       }
       const chosen = await choose(m.chatId, pick);
       const c = chosen.customer;
@@ -1134,8 +1669,19 @@ async function handle(bot, m, text, reply, t) {
     // Not an answer. A new "X ka SO" starts over; anything else gets the
     // question again. Never a fall-through: a stray "haan" here would reach
     // the order confirm and punch whatever cart was open.
+    // A different name typed instead of a number: search that one.
+    // With a real list open, a name-like reply is a new search; with one card
+    // shown, only a customer's exact name is ("swift headlight" after a card
+    // is not a customer).
+    if (!parseOrderFor(text) && !lookup.parse(text)) {
+      const nm = nameAsked(text) || (s.candidates.length > 1 && looksLikeName(text) ? text : await bareName(text));
+      if (nm) return searchByName(m, nm, s.items || null, reply, t);
+    }
     if (!parseOrderFor(text) && !lookup.parse(text)) {
       const n = s.candidates.length;
+      if (n === 1) {
+        return reply(t(s.candidates[0].name + ' — is the order for this customer? (yes / no)', s.candidates[0].name + ' — order isi customer ke liye hai? (haan / nahi)'));
+      }
       return reply(t('Which customer first - ' + oneOf(n, 'or') + '?', 'Pehle ye bata dijiye kaunsa customer - ' + oneOf(n, 'ya') + '?'));
     }
   }
@@ -1485,6 +2031,17 @@ async function handle(bot, m, text, reply, t) {
   // 4. "X ka SO bana do".
   const req = parseOrderFor(text);
   if (!req) return false;
+  // "Customer ka order punch karna hai": nobody named — ask whose.
+  if (isGenericName(req.customer)) {
+    sessions.set(m.chatId, { stage: 'askCustomer', items: null, at: Date.now() });
+    store.log('sales', m.from + ' wants to order for a customer not yet named');
+    return reply(
+      t(
+        "Which customer is it for? Send the customer's phone number or GST number (or their full name).",
+        'Kis customer ke liye? Customer ka phone number ya GST number bhejiye (ya poora naam).',
+      ),
+    );
+  }
   let found;
   try {
     found = await findCustomers(req.customer);
@@ -1512,10 +2069,11 @@ async function handle(bot, m, text, reply, t) {
     if (same) return punchAnalysed(bot, m, d, reply, t);
   }
 
-  start(m.chatId, found.top, req.items);
+  start(m.chatId, found.top, req.items || takeItems(m.chatId));
   store.log('sales', m.from + ' asked to order for "' + req.customer + '": ' + found.total + ' match(es)');
   if (found.top.length === 1) {
-    return reply(t(label(found.top[0]) + ' - this one?', label(found.top[0]) + ' - yahi wale?'));
+    const card = await customerCard(found.top[0], t);
+    return reply(card + '\n\n' + t('Is the order for this customer? (yes / no)', 'Order isi customer ke liye hai? (haan / nahi)'));
   }
   const listed = found.top.map((r, i) => i + 1 + '. ' + label(r)).join('\n');
   const more =
@@ -1533,6 +2091,12 @@ function _resetDirectory() {
 }
 
 module.exports = {
+  customerCard,
+  readCustomerKey,
+  findByKey,
+  holdItems,
+  takeItems,
+  heldCount,
   isSalesPerson,
   parseOrderFor,
   findCustomers,

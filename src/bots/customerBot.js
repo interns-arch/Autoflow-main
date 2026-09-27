@@ -20,9 +20,13 @@ const orders = require('../core/orders');
 const knowledge = require('../core/knowledge');
 const inquiries = require('../core/inquiries');
 const customers = require('../core/customers');
+const agent = require('../agent');
+const incoming = require('../agent/incoming');
 const customerCreate = require('../core/customerCreate');
 const portal = require('../integrations/dealerPortal');
 const escalation = require('../core/escalation');
+const parts = require('../core/parts');
+const kb = require('../core/kb');
 const clarify = require('../core/clarify');
 const lang = require('../core/lang');
 const askQty = require('../core/askQty');
@@ -46,7 +50,7 @@ const punchRefused = require('../core/punchRefused');
 const partish = require('../core/partish');
 const { createTransport } = require('../wa/transport');
 const route = require('../pipeline/route');
-const { handleMedia, NOT_MEDIA } = require('../pipeline/media');
+const { handleMedia, readForAgent, NOT_MEDIA } = require('../pipeline/media');
 
 // How this trade says hello. Kept here rather than in the chat layer because
 // it is the single most common opening message and must never depend on a
@@ -83,6 +87,18 @@ const nudges = new Map();
 // On disk (core/chatState): a restart between the question and the yes must
 // not turn that yes into an order.
 const pendingCancel = require('../core/chatState').slot('cancelAsk');
+// "You already have an account — is this one for someone else?", just asked.
+//
+// That question used to carry two buttons, and the button carried the meaning:
+// a tap on "Nahi, rehne do" was the only "no" ever read as an answer to it,
+// because a bare "nahi" typed into a chat is an answer to whatever ELSE is open
+// — a cart, a closest-match part — and stealing it here would break those.
+// There are no buttons any more; the customer just answers. So the question is
+// remembered for a few minutes, and "haan" / "nahi" typed while it is the open
+// question are read as the answer to it. Any other message means they have
+// moved on, and the question is dropped.
+const createAsk = require('../core/chatState').slot('createAsk');
+const CREATE_ASK_MS = 10 * 60 * 1000;
 
 // Every message of a chat by its WhatsApp id, for a while - the last 40 each
 // way. WhatsApp tells us WHICH message a swipe-reply quotes, never what it
@@ -94,6 +110,8 @@ const quotable = require('../core/chatState').slot('quotable');
 // it. chatId -> { base, parts: [{ partNo, name }], at }
 const rateOptions = require('../core/chatState').slot('rateOptions');
 const discountSetup = require('../core/discountSetup');
+const approvalLog = require('../core/approvalLog');
+const payments = require('../core/payments');
 // The car a customer last NAMED in words, for the half hour after. "Swift
 // Dzire bumper price", then "mera gaadi 2018 model hai, kaun sa rear bumper"
 // - the second never says the car again, and searching "rear bumper" alone
@@ -138,6 +156,50 @@ function withSpokenCar(chatId, item) {
 const PART_INFO_RE = /\b(naam|name)\b.*\b(kya|batao|bataiye|hai|is)\b|\bkaun\s*sa\s+part\b|\bkaunsa\s+part\b|\bwhat\s+(is\s+)?(this|the)\s+part\b/i;
 // Words that make a short message its own question, never a pick.
 const NOT_A_PICK_RE = /\b(price|rate|mrp|daam|kitne|kitna|kitni|naam|name|kya|kyu|kaise|kab|account|customer|order|cancel|status)\b|\?/i; // chatId -> { at, items: [{ id, dir, text }] }
+// Is this inbound message one of OUR recent messages, sent back?
+//
+// Compared on the words, not the characters, because forwarding adds
+// decoration and WhatsApp rewraps long lines. The test is containment in both
+// directions: nearly all of our message is in theirs, and nearly all of
+// theirs is in ours. A customer quoting one line of a sixty-item list fails
+// the second half and is handled normally, which is what picking from a list
+// looks like.
+const ECHO_MIN_CHARS = 40; // shorter than this is a real reply, not a forward
+const ECHO_OVERLAP = 0.85;
+
+function echoWords(s) {
+  return String(s || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .split(' ')
+    .filter(Boolean);
+}
+
+function isOurOwnMessageBack(chatId, body) {
+  const text = String(body || '').trim();
+  if (text.length < ECHO_MIN_CHARS) return false;
+  const theirs = echoWords(text);
+  if (theirs.length < 8) return false;
+  const theirSet = new Set(theirs);
+
+  for (const turn of conversation.turns(chatId)) {
+    if (turn.role !== 'us') continue;
+    const ours = echoWords(turn.text);
+    if (ours.length < 8) continue;
+    const ourSet = new Set(ours);
+    let shared = 0;
+    for (const w of ourSet) if (theirSet.has(w)) shared++;
+    // nearly all of ours inside theirs, AND nearly all of theirs inside ours
+    const coversOurs = shared / ourSet.size;
+    let back = 0;
+    for (const w of theirSet) if (ourSet.has(w)) back++;
+    const coversTheirs = back / theirSet.size;
+    if (coversOurs >= ECHO_OVERLAP && coversTheirs >= ECHO_OVERLAP) return true;
+  }
+  return false;
+}
+
 function rememberMsg(chatId, id, dir, text) {
   if (!chatId || !id || typeof id !== 'string') return;
   const row = quotable.get(chatId) || { at: 0, items: [] };
@@ -254,6 +316,59 @@ class CustomerBot {
     return route.listensTo(m);
   }
 
+  // WHAT THE HISTORY SUGGESTS THIS IS ABOUT — and nothing more.
+  //
+  // Years of exported chats tell us what a dealer calls a part ("barek oil
+  // cap", "wiper bottel") and which part number our people gave them. They do
+  // NOT tell us what is in stock today: an example saying "4 pcs hai" is from
+  // June and its numbers are stripped before storage (core/history/extract,
+  // responsePattern).
+  //
+  // So history is allowed to do exactly one thing here: name the part. The
+  // portal then answers for it, through the same availability path as every
+  // other line, and the customer hears today's answer.
+  //
+  // -> true when the customer has been answered, false to carry on to a person
+  async historyPart(m, text, reply) {
+    const history = require('../core/history');
+    if (!history.enabled()) return null;
+    let matches = [];
+    try {
+      matches = await history.similar(text, {
+        customerId: store.normPhone(m.from),
+        agentId: this.inquiryOnly(store.normPhone(m.from), m.chatId) ? store.normPhone(m.from) : null,
+      });
+    } catch (err) {
+      store.log(this.key, 'history lookup failed: ' + String((err && err.message) || err).slice(0, 80));
+      return null;
+    }
+    const withPart = matches.find((x) => x.partNo);
+    if (!withPart) return null;
+
+    const availability = require('../core/availability');
+    let line = null;
+    try {
+      const resolved = await availability.resolve([{ item: withPart.partNo, qty: 1 }]);
+      line = resolved && resolved[0];
+    } catch (err) {
+      store.log(this.key, 'history part could not be priced: ' + String((err && err.message) || err).slice(0, 80));
+      return null;
+    }
+    // The portal does not recognise it either. History was a lead, not a fact,
+    // and a lead that does not check out goes to a person like anything else.
+    if (!line || line.source === 'unknown' || line.source === 'unidentified') return null;
+
+    store.log(
+      this.key,
+      `history example #${withPart.id} (${withPart.similarity.toFixed(2)}) suggested ${withPart.partNo} - portal answered`,
+    );
+    // The phrase is now worth keeping in the bot's own store, so the next
+    // customer does not need the history lookup at all.
+    knowledge.learnAlias(text.slice(0, 80), line.partNo || withPart.partNo, 'historical_chat');
+    await reply(availability.describe(line, m.chatId));
+    return true;
+  }
+
   inquiryOnly(phone, chatId) {
     return route.inquiryOnly(phone, chatId);
   }
@@ -266,6 +381,10 @@ class CustomerBot {
     // For the bot at all? A chat it listens to, not one of our own numbers,
     // not a Cartrends person talking in a group (pipeline/route).
     if (!route.forBot(m)) return false;
+
+    // They wrote, so their 24h window is open: an approval sent to them in
+    // the next day goes as plain text, with no template in front of it.
+    if (!m.isGroup) escalation.noteInbound(m.from);
 
     // Whatever recording the last message left behind is finished with. A
     // voice note's clip is held only for as long as its own words are being
@@ -289,9 +408,29 @@ class CustomerBot {
     lang.note(m.chatId, m.body || '');
     const t = lang.for(m.chatId);
 
+    // OUR OWN WORDS, SENT BACK TO US.
+    //
+    // 23 Sep: the bot listed sixty wiper blades, the customer forwarded that
+    // list straight back, and the bot read its own message as an order and
+    // put two of them in the cart. Whatever they meant by forwarding it, they
+    // did not type it, and it is not an instruction.
+    //
+    // Only a WHOLE message of ours counts. Quoting one line to choose it —
+    // "1. CTWBSI26P-24INCH" — is how a customer picks from a list, and that
+    // has to keep working.
+    if (isOurOwnMessageBack(m.chatId, m.body)) {
+      store.log(this.key, `ignored an echo of our own message from ${m.from}`);
+      return true;
+    }
+
     // Both sides of the thread are remembered, so "pakka?" and "This also"
     // mean something on the next message instead of arriving out of nowhere.
-    conversation.record(m.chatId, 'customer', m.body || `(${m.mediaType || 'media'})`);
+    // Said as what it was — "(photo) 3pise", "(reacted 👍)", "(edited a message)
+    // 25 pcs" — not as bare words, so a caption is never mistaken for a typed
+    // message later on. `receivedAt` marks where this message sits in that
+    // record, so the agent's catch-up can leave it out (it is being answered).
+    m.receivedAt = Date.now();
+    conversation.record(m.chatId, 'customer', incoming.forLog(m));
     rememberMsg(m.chatId, m.id, 'customer', m.body || '');
 
     // They carried on talking, so the "send me a part number" nudge is no
@@ -311,6 +450,34 @@ class CustomerBot {
       rememberMsg(m.chatId, sentId, 'us', out);
       return true;
     };
+
+    // CUSTOMERS TALK TO THE AGENT — AND ONLY TO THE AGENT.
+    //
+    // Every word a customer reads is written by the model, from what its tools
+    // return. There is no template path for them any more: a photo, a voice
+    // note, an order list, a number plate, an account form, a greeting — all
+    // of it reaches the agent as facts, and the agent writes the reply. The
+    // agent's words go out as it wrote them, without the style post-processing
+    // (profiles.polish) the templates were run through.
+    //
+    // EVERYTHING BELOW THIS LINE IS STAFF TOOLING: admins, the helper, the
+    // Sales Heads approving accounts, salesmen punching orders for a customer,
+    // the sales team asking on a customer's behalf. Those are commands with
+    // powers — ledgers, approvals, any customer's orders — that the customer's
+    // agent must never have, and they stay exactly as they were.
+    if (!this.isOperator(m)) {
+      const asWritten = async (text) => {
+        const sentId = await this.transport.sendToChat(m.chatId, text);
+        conversation.record(m.chatId, 'us', text);
+        rememberMsg(m.chatId, sentId, 'us', text);
+        return true;
+      };
+      // DISCOUNTS ARE SET UP BY THE SALES TEAM, not by customers (founder,
+      // 25 Sep). A customer asking for one is answered by the agent, which
+      // passes it to a person; a setup left open from before is dropped.
+      if (discountSetup.pending(m.chatId)) discountSetup.cancel(m.chatId);
+      return this.answerCustomer(m, asWritten, t);
+    }
 
     // A CUSTOMER FORM IN PROGRESS owns every message until it is finished,
     // and that has to be decided BEFORE anything else reads them. Two of its
@@ -344,15 +511,20 @@ class CustomerBot {
     // so every reader below (DM, group, sales desk) sees the same order line.
     if (m.body) m.body = ai.normalizeOrderText(m.body);
     const text = (m.body || '').trim();
+
     if (!text) return false;
 
     // AN APPROVER SAYING YES. "OK WA-ABC123" from a Sales Head is the only
     // thing that creates an account — checked before everything else, since
     // a request id is not a part number and must never be looked up as one.
     {
+      // THE ACCOUNTANT on a payment: "OK PAY-… <amount>" / "NO PAY-…".
+      const payDecision = payments.readDecision(text);
+      if (payDecision && payments.isAccountant(m.from)) return this.decidePayment(m, payDecision, reply, t);
       const decision = customerCreate.readDecision(text);
       if (decision && customerCreate.isApprover(m.from)) {
         if (/^DSC-/.test(decision.requestId)) return this.decideDiscount(m, decision, reply, t);
+        if (/^ORD-/.test(decision.requestId)) return this.decideOrder(m, decision, reply, t);
         return this.decideNewCustomer(m, decision, reply, t);
       }
       if (decision) {
@@ -369,6 +541,19 @@ class CustomerBot {
       }
     }
 
+    // The "someone else's account?" question, if it is the one open.
+    const askedCreate = createAsk.get(m.chatId);
+    let createAnswer = null;
+    if (askedCreate) {
+      if (Date.now() - (askedCreate.at || 0) > CREATE_ASK_MS) createAsk.delete(m.chatId);
+      else if (customerCreate.wantsSomeoneElse(text) || NEAR_YES.test(text)) createAnswer = 'yes';
+      else if (customerCreate.declinedCreate(text) || NEAR_NO.test(text)) createAnswer = 'no';
+      // Anything else: they have moved on. A "haan" ten messages later is
+      // about something else entirely.
+      else createAsk.delete(m.chatId);
+    }
+
+
     // "CREATE CUSTOMER". Asked for in words, rather than waiting for an
     // unregistered order to trigger it. 21 Sep, live: "Create coustomer"
     // was searched in the catalogue and answered with sixty headlight
@@ -376,16 +561,18 @@ class CustomerBot {
     // The other button on "you already have an account". Only meaningful
     // when we just asked - "nahi" on its own is an answer to whatever else
     // is open, and stealing it here would break every other question.
-    if (m.buttonId && customerCreate.declinedCreate(text)) {
-      return reply(t('Theek hai sir. Part number bhejiye, check kar deta hoon.', 'Theek hai sir. Part number bhejiye, check kar deta hoon.'));
+    if ((m.buttonId && customerCreate.declinedCreate(text)) || createAnswer === 'no') {
+      createAsk.delete(m.chatId);
+      return reply(t('No problem. Send me a part number whenever you need one.', 'Theek hai. Jab bhi koi part chahiye, bata dijiye.'));
     }
 
-    if (customerCreate.wantsToStart(text) || customerCreate.wantsSomeoneElse(text)) {
+    if (createAnswer === 'yes' || customerCreate.wantsToStart(text) || customerCreate.wantsSomeoneElse(text)) {
+      createAsk.delete(m.chatId);
       // A SALES AGENT is never told they already have an account: opening
       // one for a customer standing at their counter is their job, and the
       // account goes on the portal under their name.
-      const agent = customerCreate.agentName(m.from);
-      const forElse = customerCreate.wantsSomeoneElse(text);
+      const agent = customerCreate.agentName(m.from) || (salesOrder.isSalesPerson(m.from) ? 'sales team' : null);
+      const forElse = createAnswer === 'yes' || customerCreate.wantsSomeoneElse(text);
 
       if (!agent && !forElse) {
         const already = await customers.resolve(m.from).catch(() => ({ found: null }));
@@ -409,18 +596,15 @@ class CustomerBot {
           // Saying only "you already have one" ends a conversation that
           // was about to open an account.
           store.log(this.key, `${m.from} asked to create an account but already has one (${already.name})`);
-          const msg = t(
-            `You already have an account with us${already.name ? ' — ' + already.name : ''}. Opening one for someone else?`,
-            `Aapka account already hai${already.name ? ' — ' + already.name : ''}. Kisi aur ka account banana hai kya?`,
+          // Asked as a question and answered in words: "haan" or "nahi" in the
+          // next few minutes is read as the answer (see createAsk above).
+          createAsk.set(m.chatId, { at: Date.now() });
+          return reply(
+            t(
+              `You already have an account with us${already.name ? ' — ' + already.name : ''}. Is this one for someone else?`,
+              `Aapka account pehle se hai${already.name ? ' — ' + already.name : ''}. Kisi aur ke liye banana hai?`,
+            ),
           );
-          if (this.transport.sendButtons) {
-            await this.transport.sendButtons(m.from, msg, [
-              { id: 'CREATE_FOR_OTHER', title: 'Kisi aur ka' },
-              { id: 'CREATE_NO', title: 'Nahi, rehne do' },
-            ]);
-            return true;
-          }
-          return reply(msg + t('\n\nReply "kisi aur ka" to open one.', '\n\n"kisi aur ka" likh dijiye to bana dete hain.'));
         }
       }
       store.log(this.key, `${m.from} asked to open an account${forElse ? ' for someone else' : ''}${agent ? ' (agent: ' + agent + ')' : ''}`);
@@ -429,7 +613,7 @@ class CustomerBot {
 
     // AN EXISTING CUSTOMER'S DISCOUNT, CHANGED. Asked for in words; the
     // change goes to the Sales Head before the portal is touched.
-    if (discountSetup.CHANGE_RE.test(text) && !discountSetup.pending(m.chatId)) {
+    if (discountSetup.wantsSetup(text) && !discountSetup.pending(m.chatId)) {
       store.log(this.key, `${m.from} asked to change a discount: "${text.slice(0, 60)}"`);
       return this.startDiscountChange(m, text, reply, t);
     }
@@ -481,9 +665,15 @@ class CustomerBot {
         );
       }
       let greetingReply = mirrorGreeting(text);
-      const cHit = store.customers().find((c) => store.normPhone(c.phone) === store.normPhone(m.from));
-      if (cHit && cHit.name) {
-        greetingReply += ' ' + cHit.name;
+      // Staff by their own name. Prateek sir's number is also on a customer
+      // account (Fixit Auto), and greeting a Sales Head as "Fixit Auto Private
+      // Limited" is wrong. Only a customer is greeted by their account's name.
+      const staffName = (customerCreate.isApprover(m.from) && customerCreate.approverName(m.from)) || customerCreate.agentName(m.from);
+      if (staffName) {
+        greetingReply += ' ' + staffName;
+      } else if (!this.isOperator(m)) {
+        const cHit = store.customers().find((c) => store.normPhone(c.phone) === store.normPhone(m.from));
+        if (cHit && cHit.name) greetingReply += ' ' + cHit.name;
       }
       await reply(greetingReply);
       // In a group the Cartrends people carry it on from here: no nudge.
@@ -706,6 +896,7 @@ class CustomerBot {
         await escalation.create(this, {
           chatId: m.chatId,
           customerPhone: m.from,
+          customerMessageId: m.id || null,
           item: 'voice note',
           qty: 1,
           kind: 'order',
@@ -1039,10 +1230,13 @@ class CustomerBot {
           } catch (e) {
             store.log(this.key, 'rate: catalogue lookup failed for "' + item + '": ' + String((e && e.message) || e).slice(0, 80));
           }
-          if (top.length === 1) {
+          if (top.length === 1 && availability.matchTrustworthy(item, top[0])) {
             store.log(this.key, `rate: "${item}" -> ${top[0].partNo} by name (only match)`);
+        // Keep what it cost us to find. The next customer asking this way
+        // is a vector lookup, not another search (core/parts.remember).
+        parts.remember({ partNo: top[0].partNo, name: top[0].name }).catch(() => {});
             found.push({ partNo: top[0].partNo, name: top[0].name, requested: item });
-          } else if (top.length > 1) {
+          } else if (top.length >= 1) {
             // Front or rear, which car: ask the way the counter would, and
             // remember it was a price they wanted.
             store.log(this.key, `rate: "${item}" -> ${top.length} catalogue matches; showing them priced`);
@@ -1097,11 +1291,30 @@ class CustomerBot {
           return reply(quoted);
         }
 
+        // The portal could not price it. Before a person is asked, check
+        // whether one has already answered this — payment terms, a standing
+        // discount, "what is the rate for X" answered last week. A rate
+        // question was the one give-up path that never consulted what the bot
+        // had been taught.
+        if (kb.enabled()) {
+          // Not `known` — that is the list of parts in this scope.
+          const taught = await kb.answer(text, {
+            chatId: m.chatId,
+            customerId: store.normPhone(m.from),
+            agentId: this.inquiryOnly(store.normPhone(m.from), m.chatId) ? store.normPhone(m.from) : null,
+          });
+          if (taught.answered) {
+            store.log(this.key, `rate question answered from knowledge #${taught.entry.id}`);
+            return reply(taught.text);
+          }
+        }
+
         // Rates come from a person who knows the account. Send it to the
         // same helper everything else goes to, with the parts attached.
         const raised = await escalation.create(this, {
           chatId: m.chatId,
           customerPhone: m.from,
+          customerMessageId: m.id || null,
           item: known.slice(0, 5).join(", "),
           qty: 1,
           kind: 'inquiry',
@@ -1240,6 +1453,7 @@ class CustomerBot {
             await escalation.create(this, {
               chatId: m.chatId,
               customerPhone: m.from,
+              customerMessageId: m.id || null,
               item: phrase,
               partNo: availability.extractPartNo(phrase),
               qty: 1,
@@ -1466,6 +1680,28 @@ class CustomerBot {
           store.log(this.key, 'actor lookup failed: ' + String((e && e.message) || e).slice(0, 90));
         }
 
+        // ONE INVOICE ON CREDIT (founder, 26 Sep): a salesman's order for a
+        // customer who still owes Rs 1 or more is held — the customer gets the
+        // amount and the QR, the accountant confirms the payment, and then the
+        // order goes on by itself (to the Sales Heads while placing is off).
+        const heldFor = salesOrder.activeCustomer(m.chatId);
+        if (heldFor && order.portalCustomer && order.portalCustomer.buyerId) {
+          const pc = order.portalCustomer;
+          const custPhone = String(pc.phone || (pc.raw && (pc.raw.phone || pc.raw.mobile)) || '').replace(/\D/g, '').slice(-10);
+          const hold = await this.holdForPayment(order, pc, {
+            customerPhone: custPhone.length === 10 ? '91' + custPhone : null,
+            agent: customerCreate.agentName(m.from) || null,
+          }).catch(() => null);
+          if (hold) {
+            return reply(
+              t(
+                `${heldFor.name} still owes ${payments.money(hold.due)} — with one invoice on credit, no new order until it is paid. ${order.id} is on hold${custPhone.length === 10 ? '; the amount and the payment QR went to the customer' : ''}. Once our accountant confirms the payment it goes for approval, and you get the order number here.`,
+                `${heldFor.name} ka ${payments.money(hold.due)} abhi baaki hai — ek invoice credit billing hai, isliye pay hone tak naya order nahi. ${order.id} hold pe hai${custPhone.length === 10 ? '; amount aur payment QR customer ko bhej diya' : ''}. Accountant ke confirm karte hi approval ke liye jayega aur order number yahin milega.`,
+              ),
+            );
+          }
+        }
+
         try {
           const result = await orders.confirm(order);
 
@@ -1475,10 +1711,30 @@ class CustomerBot {
           if (result.busy) {
             return reply(t('One moment — I am placing it now.', 'Ek minute — laga raha hoon.'));
           }
+          // No customer on the order: the portal would bill nobody.
+          if (result.noCustomer) {
+            return reply(t('Which customer is this order for? Send their name first.', 'Ye order kis customer ka hai? Pehle customer ka naam bhejiye.'));
+          }
 
           // Testing mode: the draft is kept exactly as it is, so the same YES
           // will place it the moment ORDER_CONFIRM_ENABLED is turned on.
           if (result.blocked) {
+            // A SALESMAN'S ORDER while placing is switched off goes to the
+            // Sales Heads, like a customer's: "OK ORD-…" places it and the
+            // portal order number comes back here. 26 Sep, live: it was
+            // answered "abhi testing chal rahi hai" and dropped.
+            const forCustomer = salesOrder.activeCustomer(m.chatId);
+            if (forCustomer && order.portalCustomer && order.portalCustomer.buyerId) {
+              const sent = await this.requestOrderApproval(order, { by: customerCreate.agentName(m.from) || m.from });
+              if (sent) {
+                return reply(
+                  t(
+                    `${forCustomer.name}'s order (${order.id}) has gone to the Sales Head for approval. Once approved it is placed on the portal and you get the order number here.`,
+                    `${forCustomer.name} ka order (${order.id}) Sales Head ko approval ke liye bhej diya. Approve hote hi portal pe place hoga aur order number yahin milega.`,
+                  ),
+                );
+              }
+            }
             const salesNote = salesOrder.whenBlocked(m.chatId, order, t);
             if (salesNote) return reply(salesNote);
             return reply(
@@ -1932,7 +2188,7 @@ class CustomerBot {
   // what they did before.
   async modelReading(m) {
     const understandMod = require('../pipeline/understand');
-    if (!config.ai.apiKey && !understandMod._stubbed()) return null;
+    if (!require('../core/ai').modelAvailable() && !understandMod._stubbed()) return null;
     try {
       const r = await require('../pipeline/shadow').decide(m);
       return r.decision;
@@ -2009,22 +2265,9 @@ class CustomerBot {
       `*${q.partNo}*${packNote}${q.name ? ' — ' + q.name : ''}\n` +
       `${price ? price + ' · ' : ''}${stock}\n\n` +
       t(`${q.qty} ${unit} of this one?`, `Yahi chahiye, ${q.qty} ${unit}?`);
-    const text = lead ? lead + '\n\n' + body : body;
-    const group = String(m.chatId || '').endsWith('@g.us') || m.isGroup;
-    if (this.transport.sendButtons && !group) {
-      try {
-        const id = await this.transport.sendButtons(m.from, text, [
-          { id: 'NEAR_YES', title: t('Yes', 'Haan') },
-          { id: 'NEAR_NO', title: t('No', 'Nahi') },
-        ]);
-        conversation.record(m.chatId, 'us', text);
-        rememberMsg(m.chatId, id, 'us', text);
-        return true;
-      } catch (e) {
-        store.log(this.key, 'near-match buttons failed, sending text: ' + String((e && e.message) || e).slice(0, 80));
-      }
-    }
-    return reply(text + '\n\n' + t('Reply Yes or No', 'Haan ya Nahi likhiye'));
+    // It already ends in the question ("Yahi chahiye, 5 pcs?"), and a person
+    // answers a question: no "Reply Yes or No" under it, and no buttons.
+    return reply(lead ? lead + '\n\n' + body : body);
   }
 
   async answerNear(m, yes, reply, t) {
@@ -2208,6 +2451,8 @@ class CustomerBot {
     const text = customerCreate.summary(form, t);
     for (const phone of approvers) {
       try {
+        // Outside the 24h window a plain text is silently dropped (escalation.ensureWindow).
+        await escalation.ensureWindow(this.transport, phone, 'Account approval coming — details follow');
         const sentId =
           form._photo && this.transport.sendImage
             ? await this.transport.sendImage(phone, Buffer.from(form._photo, 'base64'), form.answers.shopPhoto.mime, text)
@@ -2218,19 +2463,42 @@ class CustomerBot {
       }
     }
     store.log(this.key, `${form.answers.requestId} sent to ${approvers.length} approver(s)`);
+    approvalLog.record({ kind: 'account', id: form.answers.requestId, event: 'requested', by: form.byName || form.answers.createdByName || 'customer (' + m.from + ')', ...approvalLog.accountFacts(form.answers) });
     await reply(
       t(
         `Thank you — sent for approval (${form.answers.requestId}). You will hear as soon as it is open.`,
         `Shukriya — approval ke liye bhej diya (${form.answers.requestId}). Account khulte hi bata dunga.`,
       ),
     );
-    // An AGENT opened it: their customer's discount is theirs to set up, now,
-    // while the approval runs. A customer registering themselves is not asked
-    // to name their own discount.
-    if (form.byName) return this.startDiscountSetup(m, form, t);
+    // A SALES-TEAM AGENT who opened it sets its discount now, while the
+    // approval runs (founder, 25 Sep: only the sales team sets discounts). A
+    // customer registering themselves is not asked. Every rule still goes to
+    // the Sales Head before the portal is touched.
+    if (form.byName) return this.startDiscountSetup(m, form, reply, t);
     return true;
   }
 
+
+  // The Odoo partner the portal linked to this number's account. The portal
+  // links it within seconds of creating the account, so it is asked a few
+  // times before being reported missing.
+  // -> { partnerId } or { partnerId: null, why }
+  async odooLinkOf(phone, { tries = 4, waitMs = 5000 } = {}) {
+    let why = null;
+    for (let i = 0; i < tries; i++) {
+      if (i) await new Promise((r) => setTimeout(r, waitMs));
+      try {
+        customers.forget(phone);
+        const c = await portal.lookupCustomer(phone);
+        const id = c && c.raw && Number(c.raw.odoo_partner_id);
+        if (id > 0) return { partnerId: id };
+        why = c && c.found ? 'no odoo_partner_id on the account' : 'the account is not found by its number yet';
+      } catch (e) {
+        why = String((e && e.message) || e).slice(0, 80);
+      }
+    }
+    return { partnerId: null, why };
+  }
 
   // A GSTIN that would not verify. Nothing is created and the customer is
   // not left arguing with a form — the Sales Heads are told what was tried
@@ -2246,6 +2514,8 @@ class CustomerBot {
     const text = customerCreate.summary(form, t);
     for (const phone of approvers) {
       try {
+        // Outside the 24h window a plain text is silently dropped (escalation.ensureWindow).
+        await escalation.ensureWindow(this.transport, phone, 'Account approval coming — details follow');
         customerCreate.noteSummary(await this.transport.sendText(phone, text), form.answers.requestId);
       } catch (e) {
         store.log(this.key, `could not reach approver ${phone}: ${String((e && e.message) || e).slice(0, 90)}`);
@@ -2271,6 +2541,7 @@ class CustomerBot {
       customerCreate.unpark(decision.requestId);
       if (!decision.yes) {
         store.log(this.key, decision.requestId + ' (GST review) rejected by ' + who);
+        approvalLog.record({ kind: 'account', id: decision.requestId, event: 'rejected', by: who, note: 'GST review', ...approvalLog.accountFacts(req.answers) });
         await this.transport.sendText(
           req.answers.phone,
           t(
@@ -2293,6 +2564,7 @@ class CustomerBot {
       customerCreate.unpark(decision.requestId);
       for (const r of discountSetup.forAccount(decision.requestId)) discountSetup.drop(r.id);
       store.log(this.key, `${decision.requestId} rejected by ${who}`);
+      approvalLog.record({ kind: 'account', id: decision.requestId, event: 'rejected', by: who, ...approvalLog.accountFacts(req.answers) });
       await this.transport.sendText(
         req.answers.phone,
         t(
@@ -2350,7 +2622,54 @@ class CustomerBot {
           /* a notification nobody received must not fail the creation */
         }
       }
-      return reply(t(`Done — ${req.answers.name} is open (${account.username}).`, `Ho gaya — ${req.answers.name} ka account khul gaya (${account.username}).`));
+      // ON ODOO TOO. The portal creates the Odoo partner itself when it opens
+      // an account (MIYA JI MOTORS: partner 51815, six seconds before the
+      // account; SHREE SHYAM ENTERPRISES: 51818). An account with no partner
+      // can take orders that never become an Odoo SO, so it is checked here
+      // and the Sales Head is told plainly if it is missing.
+      let odoo = await this.odooLinkOf(req.answers.phone);
+      // The portal did not make it: the bot makes it — or finds the one that
+      // is already there by GSTIN or phone — and asks the portal again, which
+      // links a partner it can match on its own.
+      if (!odoo.partnerId) {
+        try {
+          const made = await require('../integrations/odoo').ensurePartner(account);
+          store.log(this.key, `${decision.requestId}: Odoo partner ${made.id} ${made.created ? 'created by the bot' : 'found by ' + made.matchedBy}`);
+          const again = await this.odooLinkOf(req.answers.phone, { tries: 3 });
+          odoo = again.partnerId
+            ? again
+            : { partnerId: null, made: made.id, why: `created on Odoo as partner ${made.id}, but the portal has not linked it to the account yet` };
+        } catch (e) {
+          odoo.why = 'Odoo: ' + String((e && e.message) || e).slice(0, 80);
+        }
+      }
+      const odooNote = odoo.partnerId
+        ? t(` On Odoo as partner ${odoo.partnerId}.`, ` Odoo pe bhi hai (partner ${odoo.partnerId}).`)
+        : t(
+            `\n⚠️ Not on Odoo yet — the portal has not linked an Odoo customer to it${odoo.why ? ` (${odoo.why})` : ''}. Orders will not reach Odoo until it is linked.`,
+            `\n⚠️ Odoo pe abhi nahi hai — portal ne Odoo customer link nahi kiya${odoo.why ? ` (${odoo.why})` : ''}. Link hone tak order Odoo tak nahi jayenge.`,
+          );
+      store.log(this.key, `${decision.requestId}: Odoo ${odoo.partnerId ? 'partner ' + odoo.partnerId : 'NOT linked' + (odoo.why ? ' — ' + odoo.why : '')}`);
+      // HOME BRANCH, from the location (founder, 25 Sep): Rajasthan ->
+      // Mansarovar, anywhere else -> Bijwasan. The account was opened with it;
+      // checked on the portal and set there if it did not take.
+      let branchNote = '';
+      try {
+        const want = account.branchId || dataEntry.branchFor(req.answers);
+        const created = (await portal.searchAccounts(req.answers.name).catch(() => [])).find((r) => String(r.phone || '').slice(-10) === String(req.answers.phone || '').slice(-10));
+        if (created && want) {
+          let now = await portal.homeBranchOf(created.id, created.name).catch(() => null);
+          if (now && now.id !== Number(want)) {
+            const fixed = await portal.setHomeBranch(created.id, created.name, want).catch(() => null);
+            now = (fixed && fixed.now) || now;
+          }
+          branchNote = t(` Home branch: ${dataEntry.branchName(now ? now.id : want)}.`, ` Home branch: ${dataEntry.branchName(now ? now.id : want)}.`);
+        }
+      } catch (e) {
+        store.log(this.key, `${decision.requestId}: home branch not checked: ${String((e && e.message) || e).slice(0, 80)}`);
+      }
+      approvalLog.record({ kind: 'account', id: decision.requestId, event: 'approved', by: who, username: account.username, odooPartner: odoo.partnerId || null, ...approvalLog.accountFacts(req.answers) });
+      return reply(t(`Done — ${req.answers.name} is open (${account.username}).`, `Ho gaya — ${req.answers.name} ka account khul gaya (${account.username}).`) + branchNote + odooNote);
     } catch (e) {
       // The request STAYS parked: a failed create is worth another try, and
       // losing the form would mean asking the customer everything again.
@@ -2400,10 +2719,39 @@ class CustomerBot {
     }
 
     store.log(this.key, `${who} wrote on ${requestId} without a decision: "${text.slice(0, 80)}"`);
+
+    // THE SECOND NUDGE DROPS THE BOLD.
+    //
+    // 24 Sep: the first nudge asked for "*OK WA-MUF9D6Q6*". He copied what he
+    // was shown — which is what anybody does — and copying bold text brings
+    // the asterisks with it. The reply was refused, so the same bolded nudge
+    // went again, and he copied it again. Three rounds, nine minutes, a
+    // customer's account unopened, over punctuation the bot had added itself.
+    //
+    // The parser now strips the markup (core/waText), so that loop cannot
+    // recur. This is the other half: once asking nicely has failed once, show
+    // the command as PLAIN TEXT, with nothing in it that can be copied wrong.
+    //
+    // The count lives on the parked request and is written through, so it
+    // survives a restart — otherwise the third message after a deploy would
+    // be the bolded one again.
+    const nudges = customerCreate.noteNudge(requestId);
+
+    if (nudges <= 1) {
+      return reply(
+        t(
+          `${requestId} (${firm}) is still waiting. Reply *OK ${requestId}* to create, *NO ${requestId}* to reject, or "already hai" if they have an account.`,
+          `${requestId} (${firm}) abhi pending hai. Banane ke liye *OK ${requestId}*, reject ke liye *NO ${requestId}*, ya account pehle se hai to "already hai" likhiye.`,
+        ),
+      );
+    }
+
+    // Plain. No asterisks, no underscores, nothing WhatsApp will render —
+    // so whatever comes back is exactly what was shown.
     return reply(
       t(
-        `${requestId} (${firm}) is still waiting. Reply *OK ${requestId}* to create, *NO ${requestId}* to reject, or "already hai" if they have an account.`,
-        `${requestId} (${firm}) abhi pending hai. Banane ke liye *OK ${requestId}*, reject ke liye *NO ${requestId}*, ya account pehle se hai to "already hai" likhiye.`,
+        `${requestId} (${firm}) is still waiting.\n\nCopy one of these exactly:\n\nOK ${requestId}\nNO ${requestId}\n\nOr say "already hai" if they already have an account.`,
+        `${requestId} (${firm}) abhi pending hai.\n\nInme se ek exactly copy kar dijiye:\n\nOK ${requestId}\nNO ${requestId}\n\nYa "already hai" likhiye agar account pehle se hai.`,
       ),
     );
   }
@@ -2495,6 +2843,7 @@ class CustomerBot {
       await escalation.create(this, {
         chatId: m.chatId,
         customerPhone: m.from,
+        customerMessageId: m.id || null,
         item: partNos.join(', '),
         qty: 1,
         kind: 'inquiry',
@@ -2519,22 +2868,174 @@ class CustomerBot {
   // portal is touched (founder, 22 Sep). A part-wise rule is set by the
   // lowest price the part may be sold at: the portal's MRP is shown, the
   // price is asked, and the percentage is worked out from the two.
-  async askDiscount(m, text, buttons, t) {
-    const group = String(m.chatId || '').endsWith('@g.us') || m.isGroup;
-    if (buttons && this.transport.sendButtons && !group) {
+  // STAFF, NOT CUSTOMERS. Admins, the helper and the voice helper, the
+  // Sales Heads who approve accounts, the account-opening team, salesmen, the
+  // sales team who ask on a customer's behalf. Their messages are commands to
+  // the staff tooling; everyone else is a customer, and talks to the agent.
+  isOperator(m) {
+    const p = store.normPhone(m.from);
+    if (!p) return false;
+    return Boolean(
+      route.isStaff(p) ||
+        (config.salesTeamNumbers || []).includes(p) ||
+        (config.inquiryOnlyNumbers || []).includes(p) ||
+        salesOrder.isSalesPerson(p) ||
+        customerCreate.isApprover(p) ||
+        payments.isAccountant(p) ||
+        customerCreate.agentName(p),
+    );
+  }
+
+  // A CUSTOMER'S MESSAGE, start to finish. Read whatever came with it —
+  // photo, document, voice note — into facts (pipeline/media.readForAgent,
+  // which answers nothing), and give the whole thing to the agent.
+  async answerCustomer(m, reply, t) {
+    const read = await readForAgent(this, m);
+    let text = String(read.text || '').trim();
+    // "26300_02752 40 pcs", "16510m68k10.48 pcs" — straightened out the same
+    // way it always was, so the part-number tools read the same thing.
+    if (text) text = ai.normalizeOrderText(text);
+    if (!text && !read.attachment && !incoming.isEvent(m)) return false;
+
+    if (agent.enabled()) {
+      const done = await this.askAgent(m, text, reply, t, read.attachment);
+      if (done !== null) return done;
+    }
+    return this.agentUnavailable(m, text, reply, t, read.attachment);
+  }
+
+  // THE ONE FIXED LINE A CUSTOMER CAN STILL GET. The model could not run at
+  // all — no key, Gemini down — or wrote a price no tool gave it. There is no
+  // template path behind the agent any more, so a person is asked, with the
+  // message (and its photo), and the customer is told so in one line. When he
+  // answers, escalation gives his words to the customer.
+  async agentUnavailable(m, text, reply, t, attachment) {
+    // THE MODEL IS DOWN (credits, quota, key): the admins are told once, with
+    // why — not Prateek sir once per customer message. 26 Sep, live: Gemini
+    // answered 402 "prepayment credits are depleted" and every "Hi" became a
+    // question to him.
+    await this.alertModelDown().catch(() => {});
+
+    // A GREETING or a courtesy is answered here, never sent to a person.
+    const said = String(text || '').trim();
+    if (!attachment && said && (GREETING.test(said) || /^(ok+|okay|thik|theek|theek hai|thik hai|thanks?|thank you|thx|dhanyawad|shukriya|haan|ha|ji|hmm+|👍)[\s!.]*$/i.test(said))) {
+      store.log(this.key, `agent could not answer ${m.from} — greeting answered without it: "${said.slice(0, 30)}"`);
+      return reply(
+        GREETING.test(said)
+          ? t('Hello! Send me the part number and quantity — I will check it for you.', 'Namaste! Part number aur quantity bhejiye — main check karke batata hoon.')
+          : t('👍', '👍'),
+      );
+    }
+
+    const what = text || (attachment ? incoming.describeAttachment(attachment) : incoming.forLog(m));
+    store.log(this.key, `agent could not answer ${m.from} — handed to a person: "${String(what).slice(0, 60)}"`);
+    try {
+      await escalation.create(this, {
+        chatId: m.chatId,
+        customerPhone: m.from,
+        customerName: m.profileName || null,
+        customerMessageId: m.id || null,
+        item: String(what).slice(0, 300),
+        qty: 1,
+        kind: 'inquiry',
+        reason: 'NOT_A_PART',
+        photo: incoming.heldPhoto(m.chatId) || undefined,
+      });
+    } catch (e) {
+      store.log(this.key, 'could not hand the message to a person: ' + String((e && e.message) || e).slice(0, 80));
+    }
+    return reply(t('One moment — let me get someone to check this for you.', 'Ek minute — main kisi se check karwa ke batata hoon.'));
+  }
+
+  // Once per 6 hours while the model cannot run: the admins, with the reason.
+  async alertModelDown() {
+    const f = agent.lastFailure && agent.lastFailure();
+    if (!f || !f.down) return;
+    const slot = require('../core/chatState').slot('agent.downAlert');
+    const last = slot.get('last') || 0;
+    if (Date.now() - last < 6 * 60 * 60 * 1000) return;
+    slot.set('last', Date.now());
+    const credits = /credits? (are )?depleted|402|billing|prepay/i.test(f.message);
+    const text = [
+      '⚠️ *The bot\'s AI is down* — customers are not getting proper answers.',
+      credits ? 'Reason: the Gemini account is out of credit (HTTP 402 "prepayment credits are depleted").' : 'Reason: ' + f.message.slice(0, 200),
+      credits ? 'Fix: add credits at https://ai.studio/projects (Billing).' : 'Check the Gemini key / quota.',
+      'Until then: greetings are answered by the bot; other messages go to a person.',
+    ].join('\n');
+    for (const n of config.adminNumbers || []) {
       try {
-        const id = await this.transport.sendButtons(m.from, text, buttons);
-        conversation.record(m.chatId, 'us', text);
-        rememberMsg(m.chatId, id, 'us', text);
-        return true;
+        await escalation.ensureWindow(this.transport, n, 'Bot alert — details follow');
+        await this.transport.sendText(n, text);
       } catch (e) {
-        store.log(this.key, 'discount buttons failed, sending text: ' + String((e && e.message) || e).slice(0, 80));
+        store.log(this.key, `model-down alert to ${n} failed: ${String((e && e.message) || e).slice(0, 80)}`);
       }
     }
-    const out = buttons ? text + '\n\n' + buttons.map((b) => '• ' + b.title).join('\n') : text;
-    const id = await this.transport.sendToChat(m.chatId, out);
-    conversation.record(m.chatId, 'us', out);
-    rememberMsg(m.chatId, id, 'us', out);
+    store.log(this.key, 'model is down — admins alerted: ' + f.message.slice(0, 120));
+  }
+
+  // ONE MESSAGE TO THE AGENT, and whatever it says back.
+  //
+  // -> the reply's result when the agent answered (the caller returns it), or
+  //    null when it could not run.
+  async askAgent(m, text, reply, t, attachment) {
+    const who = await customers.resolve(m.from).catch(() => null);
+    const res = await agent.handle({
+      bot: this,
+      chatId: m.chatId,
+      phone: m.from,
+      customer: who && who.found ? who : null,
+      // The words WITH what WhatsApp said about them — a swipe-reply and what
+      // it quoted, a caption, a reaction, an edit — what an attachment
+      // contained, and anything said in the chat since the agent last spoke
+      // (agent/incoming).
+      text: incoming.forAgent(m, { text, quoted: (id) => quotedMsg(m.chatId, id), before: m.receivedAt, attachment }),
+      // The message itself, for the tools that need more than its words: the
+      // account form takes a shop photo or a dropped pin straight from it.
+      message: m,
+    });
+    if (!res.handled) return null;
+
+    let out = true;
+    // THE AGENT IS WAITING FOR THE SPECIALIST. The conversation is parked
+    // mid-turn and checkpointed. The customer gets the line the MODEL wrote
+    // when it asked — sent from here, because the model is not running any
+    // more. The fixed line is only for a model that left it out. The answer
+    // goes out when he replies (agent.resume).
+    if (res.paused) {
+      out = await reply(
+        res.holding ||
+          t(
+            'Let me get this checked by our specialist — I will confirm shortly.',
+            'Ye main apne specialist se check karwa leta hoon — thodi der mein confirm karta hoon.',
+          ),
+      );
+    } else if (res.reply) {
+      out = await reply(res.reply);
+    }
+    // Everything up to and including this reply is in the agent's own memory
+    // now; the next catch-up starts after it.
+    incoming.markSeen(m.chatId);
+    return out;
+  }
+
+  // A message sent outside a customer's turn — the agent's answer once the
+  // specialist has replied — recorded like every other reply, so it is in the
+  // chat's history and a swipe-reply onto it can be read.
+  recordOutgoing(chatId, id, text) {
+    conversation.record(chatId, 'us', text);
+    rememberMsg(chatId, id, 'us', text);
+  }
+
+  // Every question in this flow already asks itself in words — "Brand wise ya
+  // Part wise?", "Ye rule approval ke liye bhejun?" — and every step reads a
+  // typed answer. So the question goes out as it is: no buttons, and no menu
+  // of bullet points under it. Callers still pass `buttons`; it is ignored
+  // here, so the step logic, and a tap on an old button still sitting in
+  // someone's chat, keep working.
+  async askDiscount(m, text) {
+    const id = await this.transport.sendToChat(m.chatId, text);
+    conversation.record(m.chatId, 'us', text);
+    rememberMsg(m.chatId, id, 'us', text);
     return true;
   }
 
@@ -2550,6 +3051,8 @@ class CustomerBot {
     let sent = 0;
     for (const phone of Object.keys(config.creation.approvers)) {
       try {
+        // Outside the 24h window a plain text is silently dropped (escalation.ensureWindow).
+        await escalation.ensureWindow(this.transport, phone, 'Discount approval coming — details follow');
         await this.transport.sendText(phone, text);
         sent++;
       } catch (e) {
@@ -2559,53 +3062,69 @@ class CustomerBot {
     return sent;
   }
 
-  // A NEW ACCOUNT, just sent for approval: its agent sets the discount now.
-  async startDiscountSetup(m, form, t) {
+  // A NEW ACCOUNT, just sent for approval: whoever filled the form sets the
+  // discount now. Asked through `reply`, so on the agent's path the question
+  // comes back to the agent as a fact and it asks it in its own words.
+  async startDiscountSetup(m, form, reply, t) {
+    const by = form.byName || `customer (${m.from})`;
     discountSetup.save(m.chatId, {
       mode: 'new',
       accountRequestId: form.answers.requestId,
       phone: form.answers.phone,
       customer: form.answers.name || form.answers.phone,
-      setBy: form.byName,
+      setBy: by,
       step: 'type',
       draft: {},
       count: 0,
     });
-    store.log(this.key, `${form.answers.requestId}: asking ${form.byName} for the discount rule`);
-    return this.askDiscount(
-      m,
+    store.log(this.key, `${form.answers.requestId}: asking ${by} for the discount rule`);
+    return reply(
       t(
         `Now the discount for ${form.answers.name || 'this customer'}. Brand-wise or part-wise? It is sent for approval, and starts the day it is approved.`,
         `Ab ${form.answers.name || 'is customer'} ka discount rule set kar lete hain. Brand wise ya Part wise? Approval ke baad lagu hoga.`,
       ),
-      this.discountTypeButtons(t),
-      t,
     );
   }
 
   // AN EXISTING CUSTOMER'S DISCOUNT, changed. The customer asks for their own;
   // an agent or the desk says whose.
+  // ONLY THE SALES TEAM SETS UP A DISCOUNT, and only for a customer that
+  // exists (founder, 25 Sep). The agent names the customer by phone or GST
+  // number (or name), is shown everything the portal has on them, and says
+  // yes before the setup starts. A customer that is not on the portal yet is
+  // opened first ("customer bana do"), which asks for its discount at the end.
   async startDiscountChange(m, text, reply, t) {
     const agent = customerCreate.agentName(m.from);
     const staff = Boolean(agent) || salesOrder.isSalesPerson(m.from) || this.isOwnTeam(m);
-    const st = { mode: 'change', step: 'customer', draft: {}, count: 0, setBy: staff ? agent || m.profileName || m.from : 'customer (' + m.from + ')' };
     if (!staff) {
-      const me = await customers.resolve(m.from).catch(() => null);
-      if (!me || !me.found) {
-        return reply(t('Your number is not on our system yet, so there is no discount to change.', 'Aapka number abhi system mein nahi hai, isliye discount change nahi ho sakta.'));
-      }
-      st.dealerId = me.buyerId;
-      st.customer = me.name;
-      return this.showDiscountRules(m, st, reply, t);
+      return reply(
+        t(
+          'Discounts are set up by our sales team — please speak to your sales representative.',
+          'Discount hamari sales team set karti hai — apne sales representative se baat kijiye.',
+        ),
+      );
     }
+    const st = { mode: 'change', step: 'customer', draft: {}, count: 0, setBy: agent || m.profileName || m.from };
     const picked = salesOrder.activeCustomer(m.chatId);
     if (picked && picked.buyerId) {
-      st.dealerId = picked.buyerId;
-      st.customer = picked.name;
-      return this.showDiscountRules(m, st, reply, t);
+      return this.confirmDiscountCustomer(m, st, { ...(picked.raw || {}), id: picked.buyerId, name: picked.name }, reply, t);
     }
     discountSetup.save(m.chatId, st);
-    return reply(t('Whose discount? Send the customer name.', 'Kis customer ka discount? Customer ka naam bhejiye.'));
+    return reply(
+      t(
+        "Whose discount? Send the customer's phone number or GST number (or the name).",
+        'Kis customer ka discount? Customer ka phone number ya GST number bhejiye (ya naam).',
+      ),
+    );
+  }
+
+  // The customer, in full, and one question: this one?
+  async confirmDiscountCustomer(m, st, row, reply, t) {
+    st.row = row;
+    st.step = 'confirmCustomer';
+    discountSetup.save(m.chatId, st);
+    const card = await salesOrder.customerCard(row, t);
+    return reply(card + '\n\n' + t('Set up the discount for this customer? (yes / no)', 'Isi customer ka discount setup karein? (haan / nahi)'));
   }
 
   async showDiscountRules(m, st, reply, t) {
@@ -2623,6 +3142,10 @@ class CustomerBot {
       partNo: r.part_no,
       value: Number(r.discount_value),
       mode: r.discount_mode,
+      minQty: r.min_qty || null,
+      maxQty: r.max_qty || null,
+      validFrom: r.valid_from || null,
+      validTo: r.valid_to || null,
     }));
     if (!st.rules.length) {
       st.step = 'type';
@@ -2643,6 +3166,31 @@ class CustomerBot {
       t(
         `${st.customer}'s discount rules:\n${list}\n\nWhich one to change? Send its number — or "new" for a new rule.`,
         `${st.customer} ke discount rules:\n${list}\n\nKaunsa change karna hai? Number bhejiye — ya naye rule ke liye "naya".`,
+      ),
+    );
+  }
+
+  // A CHANGE TO A RULE THAT EXISTS, sent as soon as the new figure is known.
+  // There used to be one more "Send for approval?" first, and a customer who
+  // wrote anything else next — "Maruti part btao" — had it read as a no: the
+  // change was dropped and the Sales Head never heard of it (25 Sep, live).
+  // The Sales Head's OK is the check; this one only lost requests.
+  async sendDiscountChange(m, st, submit, reply, t) {
+    const r = st.rule;
+    const d = st.draft;
+    discountSetup.cancel(m.chatId);
+    const askedByCustomer = /^customer/.test(String(st.setBy || ''));
+    const req = await submit('change', {
+      ruleId: r.id,
+      oldValue: r.value,
+      oldName: r.name,
+      oldRule: { minQty: r.minQty, maxQty: r.maxQty, validFrom: r.validFrom, validTo: r.validTo },
+      customerPhone: askedByCustomer ? m.from : null,
+    });
+    return reply(
+      t(
+        `${r.name || d.target}: ${r.value}% → ${d.value}%. Sent to the Sales Head for approval (${req.id}); the discount changes on the portal once it is approved.`,
+        `${r.name || d.target}: ${r.value}% → ${d.value}%. Sales Head ko approval ke liye bhej diya (${req.id}); approve hote hi portal pe discount update ho jayega.`,
       ),
     );
   }
@@ -2696,6 +3244,7 @@ class CustomerBot {
       });
       await this.toApprovers(discountSetup.approvalText(req));
       store.log(this.key, `${req.id}: discount ${type} for ${st.customer} sent for approval (${d.target || ''} ${d.value}%)`);
+      approvalLog.record({ kind: 'discount', id: req.id, event: 'requested', by: st.setBy || null, customer: st.customer, detail: `${type === 'change' ? 'change ' + (extra && extra.oldValue) + '% → ' : ''}${d.kind || ''} ${d.target || ''} ${d.value}%`.trim() });
       return req;
     };
 
@@ -2705,18 +3254,51 @@ class CustomerBot {
         const n = /^(\d{1,2})[.)]?$/.exec(said);
         let row = n && st.candidates ? st.candidates[Number(n[1]) - 1] : null;
         if (!row) {
-          const found = await salesOrder.findCustomers(said).catch(() => ({ top: [] }));
-          const top = found.top || [];
-          if (!top.length) return next('customer', t(`No customer called "${said}". Send the name again.`, `"${said}" naam ka customer nahi mila. Naam dobara bhejiye.`));
-          if (top.length > 1) {
-            st.candidates = top.slice(0, 6).map((r) => ({ id: r.id, name: r.name, label: salesOrder.label(r) }));
-            return next('customer', t('Which one?', 'Kaunsa?') + '\n' + st.candidates.map((c, i) => `${i + 1}. ${c.label}`).join('\n'));
+          // By phone or GST number first — one account — and by name otherwise.
+          const key = salesOrder.readCustomerKey(said);
+          let rows = [];
+          if (key) rows = await salesOrder.findByKey(key).catch(() => []);
+          else rows = ((await salesOrder.findCustomers(said).catch(() => ({ top: [] }))).top || []);
+          if (!rows.length) {
+            return next(
+              'customer',
+              key
+                ? t(
+                    `No customer on the portal with ${key.phone ? key.phone.slice(-10) : key.gst}. Open the account first ("customer bana do") — its discount is asked for at the end — or send another number.`,
+                    `${key.phone ? key.phone.slice(-10) : key.gst} pe portal mein koi customer nahi hai. Pehle customer banaiye ("customer bana do") — discount wahi end mein poochha jayega — ya dusra number bhejiye.`,
+                  )
+                : t(`No customer called "${said}". Send the phone number or GST number.`, `"${said}" naam ka customer nahi mila. Phone number ya GST number bhejiye.`),
+            );
           }
-          row = { id: top[0].id, name: top[0].name };
+          if (rows.length > 1) {
+            st.candidates = rows.slice(0, 6);
+            return next('customer', t('Which one?', 'Kaunsa?') + '\n' + st.candidates.map((c, i) => `${i + 1}. ${salesOrder.label(c)}`).join('\n'));
+          }
+          row = rows[0];
         }
-        st.dealerId = row.id;
-        st.customer = row.name;
         delete st.candidates;
+        return this.confirmDiscountCustomer(m, st, row, reply, t);
+      }
+      // ---- the agent has seen the customer's details: this one? ----
+      case 'confirmCustomer': {
+        if (discountSetup.NO.test(said) || m.buttonId === 'DSC_NO') {
+          delete st.row;
+          return next('customer', t("Then send the right customer's phone number or GST number.", 'Theek hai — sahi customer ka phone number ya GST number bhejiye.'));
+        }
+        if (!discountSetup.YES.test(said) && m.buttonId !== 'DSC_YES') {
+          // Another phone or GST number here is another customer.
+          if (salesOrder.readCustomerKey(said)) {
+            st.step = 'customer';
+            delete st.row;
+            discountSetup.save(m.chatId, st);
+            return this.answerDiscount(m, said, reply, t);
+          }
+          return next('confirmCustomer', t(`Set up the discount for ${st.row.name}? yes or no`, `${st.row.name} ka discount setup karein? haan ya nahi`));
+        }
+        st.dealerId = st.row.id;
+        st.customer = st.row.name;
+        delete st.row;
+        store.log(this.key, `${m.from} confirmed ${st.customer} (${st.dealerId}) for a discount setup`);
         return this.showDiscountRules(m, st, reply, t);
       }
       // ---- which rule ----
@@ -2755,37 +3337,25 @@ class CustomerBot {
         if (pct === null) return next('changePrice', t(`A price below the MRP (${money(d.mrp)}), in ₹.`, `MRP (${money(d.mrp)}) se kam price, ₹ mein.`));
         d.value = pct;
         d.minPrice = price;
-        return next(
-          'confirmChange',
-          t(
-            `${st.rule.name || d.target}: ${st.rule.value}% → ${pct}% (sells at ${money(price)} against MRP ${money(d.mrp)}). Send for approval?`,
-            `${st.rule.name || d.target}: ${st.rule.value}% → ${pct}% (${money(price)} mein, MRP ${money(d.mrp)}). Approval ke liye bhejun?`,
-          ),
-          [{ id: 'DSC_YES', title: t('Yes', 'Haan') }, { id: 'DSC_NO', title: t('No', 'Nahi') }],
-        );
+        return this.sendDiscountChange(m, st, submit, reply, t);
       }
       case 'changeValue': {
         const v = discountSetup.readNumber(said);
         if (v === null || v <= 0 || v >= 100) return next('changeValue', t('Send the discount as a percentage, like 12.', 'Discount % mein bhejiye, jaise 12.'));
         d.value = v;
-        return next(
-          'confirmChange',
-          t(`${st.rule.name || d.target}: ${st.rule.value}% → ${v}%. Send for approval?`, `${st.rule.name || d.target}: ${st.rule.value}% → ${v}%. Approval ke liye bhejun?`),
-          [{ id: 'DSC_YES', title: t('Yes', 'Haan') }, { id: 'DSC_NO', title: t('No', 'Nahi') }],
-        );
+        return this.sendDiscountChange(m, st, submit, reply, t);
       }
+      // Only a setup left open by the build before this one still stops here.
+      // A yes sends it and a no drops it; anything else — "Maruti part btao"
+      // — is not an answer, goes on to be answered, and the change waits.
+      // (25 Sep, live: that message was read as a no and the change died.)
       case 'confirmChange': {
-        discountSetup.cancel(m.chatId);
-        if (!discountSetup.YES.test(said) && m.buttonId !== 'DSC_YES') {
+        if (discountSetup.NO.test(said) || m.buttonId === 'DSC_NO') {
+          discountSetup.cancel(m.chatId);
           return reply(t('Not sent. Nothing was changed.', 'Theek hai, nahi bheja. Kuch change nahi hua.'));
         }
-        const req = await submit('change', { ruleId: st.rule.id, oldValue: st.rule.value, oldName: st.rule.name });
-        return reply(
-          t(
-            `Sent to the Sales Head for approval (${req.id}). The discount changes on the portal only once it is approved.`,
-            `Approval ke liye bhej diya (${req.id}). Approve hote hi portal pe discount update ho jayega.`,
-          ),
-        );
+        if (!discountSetup.YES.test(said) && m.buttonId !== 'DSC_YES') return null;
+        return this.sendDiscountChange(m, st, submit, reply, t);
       }
 
       // ---- a new rule ----
@@ -2887,6 +3457,9 @@ class CustomerBot {
           st.draft = {};
           return next('type', t('Again, then — brand-wise or part-wise?', 'Theek hai, dobara — Brand wise ya Part wise?'), this.discountTypeButtons(t));
         }
+        // Anything longer than a word or two is a message of its own, not an
+        // answer: it goes on, and the rule waits for its yes.
+        if (!discountSetup.YES.test(said) && m.buttonId !== 'DSC_YES' && said.split(/\s+/).length > 2) return null;
         if (!discountSetup.YES.test(said) && m.buttonId !== 'DSC_YES') {
           return next('confirm', t('Send this rule for approval? Yes or no.', 'Ye rule approval ke liye bhejun? Haan ya Nahi.'), [
             { id: 'DSC_YES', title: t('Yes', 'Haan') },
@@ -2902,10 +3475,18 @@ class CustomerBot {
         ]);
       }
       case 'more': {
-        if (discountSetup.YES.test(said) || m.buttonId === 'DSC_MORE_YES') {
+        // "done", "bas", "itna hi" mean STOP here, even though "done" is a yes
+        // at the confirm step. With a button it never mattered which word was
+        // typed; answered in words, "done" would have started another rule.
+        const finished = /^(done|bas|bas itna|itna hi|that'?s all|no more|enough)\b/i.test(said) || m.buttonId === 'DSC_MORE_NO';
+        if (!finished && (discountSetup.YES.test(said) || m.buttonId === 'DSC_MORE_YES')) {
           return next('type', t('Brand-wise or part-wise?', 'Brand wise ya Part wise?'), this.discountTypeButtons(t));
         }
         discountSetup.cancel(m.chatId);
+        // "Maruti ka right headlight chahiye" is not an answer to "another
+        // rule?" (25 Sep, live: it was swallowed and answered "Ho gaya — 1
+        // discount rule…"). The setup is over; the message goes on.
+        if (!finished && !discountSetup.NO.test(said)) return null;
         return reply(
           t(
             `Done — ${st.count} discount rule(s) sent to the Sales Head. Each is created on the portal once approved${st.accountRequestId ? ' and the account is open' : ''}.`,
@@ -2938,7 +3519,13 @@ class CustomerBot {
     if (!dealerId) return { ok: false, name: req.rule.ruleName, why: 'customer not found on the portal yet' };
     const body = discountSetup.toPortal({ ...req.rule, requestId: req.id, setBy: req.by }, dealerId, name);
     try {
-      await portal.createDiscountRule(body);
+      const made = await portal.createDiscountRule(body);
+      // Approved here means approved there: a rule the portal parked as
+      // PENDING is put through its own review, or it never applies.
+      const id = made && (made.rule_id || made.id);
+      if (id && made.approval_status && String(made.approval_status).toUpperCase() !== 'APPROVED') {
+        await portal.reviewDiscountRule(id, 'approve').catch((e) => store.log(this.key, `rule ${id} created but left ${made.approval_status}: ${String((e && e.message) || e).slice(0, 80)}`));
+      }
       return { ok: true, name: body.rule_name };
     } catch (e) {
       return { ok: false, name: body.rule_name, why: String((e && e.message) || e).slice(0, 100) };
@@ -2963,16 +3550,32 @@ class CustomerBot {
     if (!decision.yes) {
       discountSetup.drop(req.id);
       store.log(this.key, `${req.id} (discount) rejected by ${who}`);
+      approvalLog.record({ kind: 'discount', id: req.id, event: 'rejected', by: who, customer: req.customer, detail: what });
       await tell(t(`Discount request ${req.id} (${what}) was not approved.`, `Discount request ${req.id} (${what}) approve nahi hua.`));
       return reply(t(`Rejected ${req.id}. ${req.by || 'They'} was told.`, `${req.id} reject kar diya. ${req.by || 'Unko'} bata diya.`));
     }
 
     if (req.type === 'change') {
       try {
-        await portal.updateDiscountRule(req.ruleId, {
-          discount_value: req.rule.value,
-          rule_name: discountSetup.ruleName(req.customer, req.rule.target, req.rule.value),
-        });
+        // THE SAME RULE, only its % changed — never a new rule. The rule as the
+        // portal has it now is sent back whole with the new value, so a PUT that
+        // treats a missing field as "clear it" cannot blank its brand, dates or
+        // limits.
+        const now = (await portal.listDiscountRules()).find((x) => String(x.rule_id || x.id) === String(req.ruleId));
+        if (!now) {
+          discountSetup.drop(req.id);
+          return reply(t(`Rule #${req.ruleId} is no longer on the portal — nothing was changed.`, `Rule #${req.ruleId} ab portal pe nahi hai — kuch change nahi kiya.`));
+        }
+        const keep = ['rule_type', 'part_no', 'brand', 'dealer_id', 'discount_mode', 'min_qty', 'max_qty', 'min_amount', 'max_amount', 'is_active', 'valid_from', 'valid_to', 'priority', 'rule_metadata'];
+        const body = {};
+        for (const k of keep) if (now[k] !== undefined) body[k] = now[k];
+        body.discount_value = req.rule.value;
+        body.rule_name = discountSetup.ruleName(req.customer, req.rule.target, req.rule.value);
+        body.rule_metadata = { ...(now.rule_metadata || {}), source: 'whatsapp-bot', requestId: req.id, changedFrom: req.oldValue, approvedBy: who };
+        const updated = await portal.updateDiscountRule(req.ruleId, body);
+        if (updated && updated.approval_status && String(updated.approval_status).toUpperCase() !== 'APPROVED') {
+          await portal.reviewDiscountRule(req.ruleId, 'approve').catch((e) => store.log(this.key, `rule ${req.ruleId} updated but left ${updated.approval_status}: ${String((e && e.message) || e).slice(0, 80)}`));
+        }
       } catch (e) {
         const why = String((e && e.message) || e).slice(0, 120);
         store.log(this.key, `${req.id} discount update FAILED: ${why}`);
@@ -2980,6 +3583,7 @@ class CustomerBot {
       }
       discountSetup.drop(req.id);
       store.log(this.key, `${req.id} approved by ${who} — rule ${req.ruleId} now ${req.rule.value}%`);
+      approvalLog.record({ kind: 'discount', id: req.id, event: 'approved', by: who, customer: req.customer, detail: `${what} (rule #${req.ruleId} updated)` });
       await tell(t(`✅ Approved: ${what}. Updated on the portal.`, `✅ Approve ho gaya: ${what}. Portal pe update kar diya.`));
       return reply(t(`Done — ${what}.`, `Ho gaya — ${what}.`));
     }
@@ -2990,6 +3594,7 @@ class CustomerBot {
       req.status = 'approved';
       discountSetup.requests.set(req.id, req);
       store.log(this.key, `${req.id} approved by ${who} — waits for account ${req.accountRequestId}`);
+      approvalLog.record({ kind: 'discount', id: req.id, event: 'approved', by: who, customer: req.customer, detail: `${what} (created when ${req.accountRequestId} opens)` });
       return reply(t(`Approved. It is created as soon as ${req.accountRequestId} is approved.`, `Approve ho gaya. ${req.accountRequestId} approve hote hi portal pe ban jayega.`));
     }
     const made = await this.createDiscountFor(req);
@@ -2999,8 +3604,369 @@ class CustomerBot {
     }
     discountSetup.drop(req.id);
     store.log(this.key, `${req.id} approved by ${who} — created ${made.name}`);
+    approvalLog.record({ kind: 'discount', id: req.id, event: 'approved', by: who, customer: req.customer, detail: `${made.name} (created on the portal)` });
     await tell(t(`✅ Discount rule approved and created: ${made.name}`, `✅ Discount rule approve ho gaya, portal pe ban gaya: ${made.name}`));
     return reply(t(`Done — ${made.name}.`, `Ho gaya — ${made.name}.`));
+  }
+
+  // ---- payment before a new order (core/payments) ----
+
+  // At the order's "yes": does this customer still owe money? -> null when
+  // the order may go on, or { req, due, qrSent } when it is held.
+  // `opts.customerPhone`: the order is a SALESMAN'S (founder, 26 Sep: credit
+  // billing is one invoice — no new order until the balance is paid, whoever
+  // places it). The payment request, the QR and "your balance is settled" go
+  // to the CUSTOMER's WhatsApp; the agent hears when the order goes on.
+  async holdForPayment(order, customer, opts = {}) {
+    const due = await payments.dueOf(customer).catch(() => null);
+    if (!due || payments.settled(due.due)) return null;
+    const custChat = opts.customerPhone ? store.normPhone(opts.customerPhone) + '@cloud' : null;
+    if (custChat) {
+      const ct = lang.for(custChat);
+      const text = ct(
+        `Hello ${customer.name}. Your previous balance of ${payments.money(due.due)} is unpaid, so the new order${opts.agent ? ' placed by ' + opts.agent : ''} is on hold. Please pay it with the QR below and reply "payment done" — the order goes ahead as soon as it is confirmed.`,
+        `Namaste ${customer.name}. Aapka pichla ${payments.money(due.due)} baaki hai, isliye naya order${opts.agent ? ' (' + opts.agent + ' ne lagaya)' : ''} ruka hua hai. Neeche QR se pay karke "payment kar diya" likhiye — confirm hote hi order aage badh jayega.`,
+      );
+      try {
+        await escalation.ensureWindow(this.transport, store.normPhone(opts.customerPhone), 'Payment due — details follow', customer.name);
+        const id = await this.transport.sendToChat(custChat, text);
+        this.recordOutgoing(custChat, id, text);
+      } catch (e) {
+        store.log(this.key, `${order.id}: could not tell ${customer.name} about the due: ${String((e && e.message) || e).slice(0, 80)}`);
+      }
+    }
+    const req = payments.open({
+      chatId: custChat || order.chatId,
+      phone: custChat ? store.normPhone(opts.customerPhone) : String(order.chatId || '').split('@')[0],
+      customer: customer.name,
+      buyerId: customer.buyerId,
+      due: due.due,
+      orderId: order.id,
+    });
+    order.status = 'awaitingPayment';
+    order.paymentId = req.id;
+    store.save();
+    store.log(this.key, `${order.id} held: ${customer.name} owes ${payments.money(due.due)} (${req.id})`);
+    approvalLog.record({ kind: 'payment', id: req.id, event: 'requested', by: 'bot (order ' + order.id + ')', customer: customer.name, phone: req.phone, detail: 'due ' + payments.money(due.due) + ' before ' + order.id, amount: due.due });
+    const qrSent = await this.sendPaymentQr(req, due.due);
+    return { req, due: due.due, qrSent };
+  }
+
+  // The QR for the amount, into the customer's chat. -> true when one went.
+  async sendPaymentQr(req, amount) {
+    const q = await payments.qr(amount, `${req.customer} ${req.id}`).catch(() => null);
+    if (!q || !this.transport.sendImage) return false;
+    const t = lang.for(req.chatId);
+    const caption = t(`Pay ${payments.money(amount)} — scan to pay (${req.id})`, `${payments.money(amount)} pay kijiye — scan karke (${req.id})`);
+    try {
+      const id = await this.transport.sendImage(req.chatId, q.buffer, q.mime, caption);
+      this.recordOutgoing(req.chatId, id, caption);
+      return true;
+    } catch (e) {
+      store.log(this.key, `${req.id}: payment QR not sent: ${String((e && e.message) || e).slice(0, 80)}`);
+      return false;
+    }
+  }
+
+  // The customer says they have paid: the accountant is asked to check.
+  // -> { sent, req } | { nothingDue } | { unknown }
+  async paymentClaimed(chatId, phone, customer, claim) {
+    let req = payments.forChat(chatId);
+    if (!req) {
+      // No held order, but they are paying what they owe: check it anyway.
+      const due = await payments.dueOf(customer).catch(() => null);
+      if (!due) return { unknown: true };
+      if (payments.settled(due.due)) return { nothingDue: true };
+      req = payments.open({ chatId, phone: store.normPhone(phone), customer: customer.name, buyerId: customer.buyerId, due: due.due, orderId: null });
+    }
+    req.status = 'checking';
+    req.claim = claim || null;
+    payments.save(req);
+    const text = payments.accountantText(req, claim);
+    const photo = incoming.heldPhoto(chatId); // a payment screenshot, if they sent one
+    let sent = 0;
+    for (const acc of Object.keys(config.payments.accountants || {})) {
+      try {
+        await escalation.ensureWindow(this.transport, acc, 'Payment to check — details follow');
+        if (photo && this.transport.sendImage) await this.transport.sendImage(acc, Buffer.from(photo.base64, 'base64'), photo.mime, text);
+        else await this.transport.sendText(acc, text);
+        sent++;
+      } catch (e) {
+        store.log(this.key, `${req.id}: could not reach accountant ${acc}: ${String((e && e.message) || e).slice(0, 80)}`);
+      }
+    }
+    store.log(this.key, `${req.id}: ${req.customer} says paid — sent to ${sent} accountant(s)`);
+    approvalLog.record({ kind: 'payment', id: req.id, event: 'claimed', by: 'customer (' + store.normPhone(phone) + ')', customer: req.customer, detail: claim ? String(claim).slice(0, 120) : 'says paid', amount: req.due });
+    return { sent: sent > 0, req };
+  }
+
+  // "OK PAY-7F3K 22002" / "NO PAY-7F3K" from the accountant.
+  async decidePayment(m, decision, reply, t) {
+    const req = payments.find(decision.requestId);
+    if (!req) return reply(t(`${decision.requestId} not found.`, `${decision.requestId} nahi mila.`));
+    if (req.status === 'settled') return reply(t(`${req.id} is already settled.`, `${req.id} pehle hi settle ho chuka hai.`));
+    const who = payments.accountantName(m.from);
+    const ct = lang.for(req.chatId);
+    const tell = async (text) => {
+      try {
+        const id = await this.transport.sendToChat(req.chatId, text);
+        this.recordOutgoing(req.chatId, id, text);
+      } catch (e) {
+        store.log(this.key, `${req.id}: could not tell the customer: ${String((e && e.message) || e).slice(0, 80)}`);
+      }
+    };
+
+    if (!decision.yes) {
+      req.status = 'waiting';
+      payments.save(req);
+      approvalLog.record({ kind: 'payment', id: req.id, event: 'rejected', by: who, customer: req.customer, detail: 'payment not received' });
+      await tell(
+        ct(
+          `We have not received the payment yet. ${payments.money(req.due)} is still due — please pay it and let us know.`,
+          `Payment abhi tak nahi aaya hai. ${payments.money(req.due)} abhi baaki hai — pay karke bata dijiye.`,
+        ),
+      );
+      await this.sendPaymentQr(req, req.due);
+      return reply(t(`Noted — ${req.customer} was told it has not come in.`, `Theek hai — ${req.customer} ko bata diya ki payment nahi aaya.`));
+    }
+
+    if (decision.amount) req.received.push({ amount: decision.amount, by: who, at: new Date().toISOString() });
+    // The balance as the portal has it NOW — after he recorded the receipt.
+    require('./../core/customers').forget(req.phone);
+    const now = await payments.dueOf({ name: req.customer, buyerId: req.buyerId }).catch(() => null);
+    const left = now ? now.due : null;
+    approvalLog.record({ kind: 'payment', id: req.id, event: 'approved', by: who, customer: req.customer, detail: `received ${decision.amount ? payments.money(decision.amount) : '(amount not given)'}; portal due now ${left === null ? 'unknown' : payments.money(left)}`, amount: decision.amount || null });
+
+    if (left === null) {
+      payments.save(req);
+      return reply(t(`Noted. I cannot read ${req.customer}'s balance on the portal right now — send OK ${req.id} again in a minute.`, `Note kar liya. ${req.customer} ka balance portal pe abhi nahi dikh raha — ek minute mein dobara OK ${req.id} bhejiye.`));
+    }
+    // Money came in, but the portal has not moved yet: the receipt is still to
+    // be recorded. The customer is not asked for the full amount again.
+    if (!payments.settled(left) && decision.amount && left >= req.due - 0.5) {
+      req.status = 'checking';
+      payments.save(req);
+      await tell(
+        ct(
+          `${payments.money(decision.amount)} received, thank you — your account is being updated. You will hear as soon as it is done.`,
+          `${payments.money(decision.amount)} mil gaya, shukriya — aapka account update ho raha hai. Hote hi bata denge.`,
+        ),
+      );
+      return reply(
+        t(
+          `Noted ${payments.money(decision.amount)}. The portal still shows ${payments.money(left)} due for ${req.customer} — record the receipt on the portal, then send *OK ${req.id}* again.`,
+          `${payments.money(decision.amount)} note kar liya. Portal pe ${req.customer} ka abhi bhi ${payments.money(left)} due hai — receipt portal pe update karke dobara *OK ${req.id}* bhejiye.`,
+        ),
+      );
+    }
+    if (!payments.settled(left)) {
+      req.due = left;
+      req.status = 'waiting';
+      payments.save(req);
+      await tell(
+        ct(
+          `${decision.amount ? payments.money(decision.amount) + ' received, thank you. ' : ''}${payments.money(left)} is still due — please pay it to settle your account before the new order.`,
+          `${decision.amount ? payments.money(decision.amount) + ' mil gaya, shukriya. ' : ''}Abhi ${payments.money(left)} baaki hai — naye order se pehle ise settle kar dijiye.`,
+        ),
+      );
+      await this.sendPaymentQr(req, left);
+      return reply(
+        t(
+          `The portal still shows ${payments.money(left)} due for ${req.customer}. The customer was asked for it. If the full amount has come in, record it on the portal and send *OK ${req.id}* again.`,
+          `Portal pe ${req.customer} ka abhi bhi ${payments.money(left)} due dikh raha hai. Customer ko bata diya. Agar poora amount aa gaya hai to portal pe update karke dobara *OK ${req.id}* bhejiye.`,
+        ),
+      );
+    }
+
+    // SETTLED. The customer is told, and the held order goes on.
+    req.status = 'settled';
+    req.due = left;
+    payments.save(req);
+    approvalLog.record({ kind: 'payment', id: req.id, event: 'settled', by: who, customer: req.customer, detail: 'balance settled' });
+    store.log(this.key, `${req.id}: ${req.customer} settled (portal due ${payments.money(left)}), confirmed by ${who}`);
+    const order = req.orderId ? store.orders().find((o) => o.id === req.orderId) : null;
+    let next = '';
+    if (order && order.status === 'awaitingPayment') {
+      const went = await this.releaseHeldOrder(order);
+      next = went;
+      // A salesman's order: the agent hears it is moving again.
+      if (order.chatId && order.chatId !== req.chatId) {
+        const at = lang.for(order.chatId);
+        const msg = at(
+          `✅ ${req.customer} has paid — balance settled. ${order.id} ${went ? 'has gone on (' + went.en + ')' : 'can go ahead now'}.`,
+          `✅ ${req.customer} ne pay kar diya — balance settle ho gaya. ${order.id} ${went ? 'aage badh gaya (' + went.hi + ')' : 'ab aage ja sakta hai'}.`,
+        );
+        try {
+          const id = await this.transport.sendToChat(order.chatId, msg);
+          this.recordOutgoing(order.chatId, id, msg);
+        } catch (e) {
+          store.log(this.key, `${order.id}: could not tell the agent: ${String((e && e.message) || e).slice(0, 80)}`);
+        }
+      }
+    }
+    await tell(
+      ct(`✅ Your balance is settled. Thank you!${next ? ' ' + next.en : ''}`, `✅ Aapka balance settle ho gaya. Shukriya!${next ? ' ' + next.hi : ''}`),
+    );
+    return reply(t(`Settled — ${req.customer}.${order ? ' Their order ' + order.id + ' has gone on.' : ''}`, `Settle ho gaya — ${req.customer}.${order ? ' Unka order ' + order.id + ' aage bhej diya.' : ''}`));
+  }
+
+  // The order that waited on the payment: placed, or — while placing is off —
+  // sent to the Sales Heads for approval. -> the words for the customer.
+  async releaseHeldOrder(order) {
+    order.status = 'draft';
+    // A salesman's order says so on the approval (not the agent's number as
+    // the customer's).
+    const placer = String(order.chatId || '').split('@')[0];
+    const byAgent = salesOrder.isSalesPerson(placer) ? { by: customerCreate.agentName(placer) || placer } : {};
+    store.save();
+    let res = null;
+    try {
+      res = await orders.confirm(order);
+    } catch (e) {
+      store.log(this.key, `${order.id}: placing after the payment failed: ${String((e && e.message) || e).slice(0, 100)}`);
+      const sent = await this.requestOrderApproval(order, byAgent);
+      return sent ? { en: `Your order ${order.id} has gone for approval.`, hi: `Aapka order ${order.id} approval ke liye bhej diya hai.` } : null;
+    }
+    if (res && res.blocked) {
+      const sent = await this.requestOrderApproval(order, byAgent);
+      return sent ? { en: `Your order ${order.id} has gone for approval.`, hi: `Aapka order ${order.id} approval ke liye bhej diya hai.` } : null;
+    }
+    if (res && res.soNumber) return { en: `Your order is placed — order no. ${res.soNumber}.`, hi: `Aapka order place ho gaya — order no. ${res.soNumber}.` };
+    return null;
+  }
+
+  // ---- orders approved by the Sales Head ----
+  //
+  // While ORDER_CONFIRM_ENABLED is off, a customer's "yes" to their cart does
+  // not place it: the cart goes to the Sales Heads as "Order approval —
+  // ORD-…", and "OK ORD-…" places it on the dealer portal (core/orders.confirm
+  // with approvedBy). 25 Sep, live: the order was handed to a person as a
+  // question instead, he answered "Allow", nothing reached the portal, and the
+  // customer was told "Order place ho gaya".
+
+  // -> how many approvers it reached. The cart is taken out of the draft
+  // state while it waits, so what the customer adds next starts a new cart.
+  async requestOrderApproval(order, opts = {}) {
+    const inStock = (l) => l.source !== 'unidentified' && l.source !== 'unknown' && l.source !== 'unavailable' && (Number(l.available) || 0) > 0;
+    const pc = order.portalCustomer || {};
+    // order.customer is the agent's customer RECORD, not a name — printed as
+    // is it read "Customer: [object Object]" (25 Sep, live).
+    const oc = order.customer && typeof order.customer === 'object' ? order.customer.name : order.customer;
+    // The CUSTOMER's number: for a salesman's order the chat is the agent's,
+    // so the account's own phone is used when there is one.
+    const chatPhone = String(order.chatId || '').split('@')[0];
+    const acctPhone = String(pc.phone || (pc.raw && (pc.raw.phone || pc.raw.mobile)) || '').replace(/\D/g, '');
+    const phone = opts.by ? acctPhone : chatPhone;
+    const custName = pc.name || oc || phone;
+    // What they still owe, for the Sales Head to weigh (Odoo's receivable).
+    const due = await payments.dueOf(pc).catch(() => null);
+    const rows = order.lines.map((l, i) => {
+      const got = Math.min(Number(l.qty) || 0, Number(l.available) || 0);
+      const stock = inStock(l) ? (got < l.qty ? `${got} in stock, rest on order` : 'in stock') : 'on order — not punched';
+      return `${i + 1}. ${l.partNo || l.item} × ${l.qty}${availability.priceOf(l)} — ${stock}`;
+    });
+    const punchable = order.lines.filter(inStock);
+    const total = punchable.reduce((s, l) => s + (Number(l.rate) || Number(l.mrp) || 0) * Math.min(Number(l.qty) || 0, Number(l.available) || 0), 0);
+    const text = [
+      `*Order approval* — ${order.id}`,
+      `Customer: ${custName}${phone ? ` (+${phone})` : ''}`,
+      opts.by ? `Requested by: ${opts.by} (sales team)` : null,
+      due ? (payments.settled(due.due) ? 'Due balance: nil' : `⚠️ Due balance: ${payments.money(due.due)} unpaid`) : null,
+      '',
+      ...rows,
+      '',
+      punchable.length
+        ? `In-stock lines go to the portal: ₹${Math.round(total).toLocaleString('en-IN')} incl. GST.`
+        : 'Nothing in this cart is in stock — an OK will not place anything yet.',
+      `Reply *OK ${order.id}* to place it on the portal, or *NO ${order.id}* to reject.`,
+    ]
+      .filter((l) => l !== null)
+      .join('\n');
+    const was = order.status;
+    order.status = 'approval';
+    order.approvalAskedAt = new Date().toISOString();
+    store.save();
+    const sent = await this.toApprovers(text);
+    if (!sent) {
+      order.status = was;
+      store.save();
+    }
+    store.log(this.key, `${order.id} sent to ${sent} approver(s) for approval`);
+    if (sent) approvalLog.record({ kind: 'order', id: order.id, event: 'requested', by: opts.by ? opts.by + ' (sales team)' : 'customer (' + phone + ')', customer: custName, phone, detail: `${order.lines.length} line(s)`, amount: Math.round(total) });
+    return sent;
+  }
+
+  // "OK ORD-12" / "NO ORD-12" from a Sales Head.
+  async decideOrder(m, decision, reply, t) {
+    const order = store.orders().find((o) => String(o.id).toUpperCase() === decision.requestId);
+    if (!order) return reply(t(`${decision.requestId} not found.`, `${decision.requestId} nahi mila.`));
+    if (order.status === 'confirmed') return reply(t(`${order.id} is already placed — portal order ${order.soNumber}.`, `${order.id} pehle hi place ho chuka hai — portal order ${order.soNumber}.`));
+    if (order.status !== 'approval') return reply(t(`${order.id} is not waiting for approval (${order.status}).`, `${order.id} approval ke liye nahi ruka hai (${order.status}).`));
+    const who = customerCreate.approverName(m.from);
+    const ct = lang.for(order.chatId);
+    const tell = async (text) => {
+      try {
+        const id = await this.transport.sendToChat(order.chatId, text);
+        this.recordOutgoing(order.chatId, id, text);
+      } catch (e) {
+        store.log(this.key, `${order.id}: could not tell the customer: ${String((e && e.message) || e).slice(0, 80)}`);
+      }
+    };
+
+    if (!decision.yes) {
+      order.status = 'rejected';
+      order.rejectedBy = who;
+      store.save();
+      store.log(this.key, `${order.id} rejected by ${who}`);
+      approvalLog.record({ kind: 'order', id: order.id, event: 'rejected', by: who, customer: (order.portalCustomer && order.portalCustomer.name) || null });
+      await tell(ct(`Your order ${order.id} was not approved. Please call us if you want to talk about it.`, `Aapka order ${order.id} approve nahi hua. Baat karni ho to humein call kijiye.`));
+      return reply(t(`Rejected ${order.id}. The customer was told.`, `${order.id} reject kar diya. Customer ko bata diya.`));
+    }
+
+    let res;
+    try {
+      res = await orders.confirm(order, { approvedBy: who });
+    } catch (e) {
+      const full = String((e && e.message) || e);
+      store.log(this.key, `${order.id} approved by ${who} but the portal refused it: ${full.slice(0, 600)}`);
+      approvalLog.record({ kind: 'order', id: order.id, event: 'failed', by: who, customer: (order.portalCustomer && order.portalCustomer.name) || null, detail: /credit control/i.test(full) ? 'portal: customer on credit control' : 'portal refused: ' + full.slice(0, 120) });
+      // 25 Sep: MIYA JI MOTORS's order came back 409 "Customer credit control
+      // blocked order confirmation" — a credit limit or overdue bills. That
+      // is for the Sales Head to clear on the portal, so it is named as such.
+      if (/credit control/i.test(full)) {
+        const cc = (full.match(/"credit_control":\s*(\{[\s\S]*?\})\s*\}/) || [])[1] || '';
+        const reason = (cc.match(/"(?:reason|message)":\s*"([^"]+)"/) || [])[1] || '';
+        return reply(
+          t(
+            `The portal blocked ${order.id}: this customer is on *credit control*${reason ? ` (${reason})` : ''} — credit limit or overdue bills. Nothing was placed. Clear it on the portal, then send *OK ${order.id}* again.`,
+            `Portal ne ${order.id} rok diya: customer *credit control* pe hai${reason ? ` (${reason})` : ''} — credit limit ya overdue. Kuch place nahi hua. Portal pe clear karke dobara *OK ${order.id}* bhejiye.`,
+          ),
+        );
+      }
+      const why = full.slice(0, 300);
+      return reply(t(`The portal did not take it: ${why}\nNothing was placed — send *OK ${order.id}* again to retry.`, `Portal ne nahi liya: ${why}\nKuch place nahi hua — dobara *OK ${order.id}* bhejiye.`));
+    }
+    if (res && res.busy) return reply(t(`${order.id} is being placed right now.`, `${order.id} abhi place ho raha hai.`));
+    if (res && res.noCustomer) return reply(t(`${order.id} has no customer account attached, so the portal cannot bill it. Nothing was placed.`, `${order.id} pe customer account nahi hai, portal bill nahi kar sakta. Kuch place nahi hua.`));
+    if (res && res.nothingInStock) {
+      store.log(this.key, `${order.id} approved by ${who} — nothing in stock, nothing placed`);
+      return reply(t(`Nothing in ${order.id} is in stock now, so nothing was placed on the portal. It stays waiting — *OK ${order.id}* again once stock is in.`, `${order.id} mein abhi kuch stock mein nahi hai, isliye portal pe kuch place nahi hua. Stock aane pe dobara *OK ${order.id}* bhejiye.`));
+    }
+
+    order.approvedBy = who;
+    store.save();
+    const so = (res.placed || []).map((p) => p.soNumber).filter(Boolean).join(', ') || res.soNumber;
+    const punched = (res.punchedLines || []).map((l) => `${l.partNo} × ${l.qty}`).join('\n');
+    const later = [...(res.skipped || []).map((l) => l.partNo || l.item), ...(res.short || []).map((l) => `${l.partNo} (${l.asked - l.punched} more)`)];
+    store.log(this.key, `${order.id} approved by ${who} — placed on the portal as ${so}`);
+    approvalLog.record({ kind: 'order', id: order.id, event: 'approved', by: who, customer: (order.portalCustomer && order.portalCustomer.name) || null, detail: `portal order ${so}` });
+    await tell(
+      ct(
+        `✅ Your order is placed — order no. ${so}.\n${punched}${later.length ? `\n\nOn order, not in this one yet: ${later.join(', ')}` : ''}`,
+        `✅ Aapka order place ho gaya — order no. ${so}.\n${punched}${later.length ? `\n\nYe abhi order pe hain, is order mein nahi: ${later.join(', ')}` : ''}`,
+      ),
+    );
+    return reply(t(`Placed — ${order.id} is portal order ${so}.\n${punched}`, `Place ho gaya — ${order.id} portal order ${so} hai.\n${punched}`));
   }
 
   whereWeAre(m, t, { unclear = false } = {}) {
@@ -3018,13 +3984,26 @@ class CustomerBot {
       return (
         sorry +
         t(
-          'To place an order, pick the customer first - like: Kalra Motors ka SO bana do',
-          'Order ke liye pehle customer chuniye - jaise: Kalra Motors ka SO bana do',
+          "To place an order, pick the customer first: send the customer's phone number or GST number (or \"Kalra Motors ka SO bana do\").",
+          'Order ke liye pehle customer chuniye: customer ka phone number ya GST number bhejiye (ya "Kalra Motors ka SO bana do").',
         )
       );
     }
+    // "Kitni quantity chahiye?" is over once those parts are in the cart with
+    // a quantity. 26 Sep, live: it was asked again after "72321M76M01 2pcs,
+    // 71822M75L00 4 pcs" had gone into the draft, on every stray message.
     const waitingQty = askQty.get(m.chatId);
-    if (waitingQty && waitingQty.items && waitingQty.items.length) {
+    const inCart = orders.findDraft(m.chatId);
+    const norm = (x) => String(x || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (
+      waitingQty &&
+      waitingQty.items &&
+      inCart &&
+      inCart.lines.length &&
+      waitingQty.items.every((i) => inCart.lines.some((l) => norm(l.partNo || l.item) === norm(i.partNo || i.item)))
+    ) {
+      askQty.clear(m.chatId);
+    } else if (waitingQty && waitingQty.items && waitingQty.items.length) {
       const names = waitingQty.items.map((i) => i.partNo || i.item).join(', ');
       return sorry + t(`How many do you need - ${names}?`, `${names} - kitni quantity chahiye?`);
     }
@@ -3111,11 +4090,45 @@ class CustomerBot {
         return false;
       }
 
+      // Has a person already answered this, or one just like it? The whole
+      // point of the knowledge base: the second customer to ask about returns
+      // gets the answer Prateek sir gave the first one, and he is not asked
+      // again (founder: "agli baar usse koi same sawal poochhe to vapas
+      // mujhse na poochhe").
+      //
+      // A miss here is never a guess — it falls through to the same person it
+      // always did.
+      if (kb.enabled()) {
+        const known = await kb.answer(text, {
+          chatId: m.chatId,
+          customerId: store.normPhone(m.from),
+          // When the sales team asks on a customer's behalf, THEY are the
+          // agent — so anything scoped to that salesman is in play too.
+          agentId: this.inquiryOnly(store.normPhone(m.from), m.chatId) ? store.normPhone(m.from) : null,
+        });
+        if (known.answered) {
+          store.log(this.key, `answered from knowledge #${known.entry.id}: "${text.slice(0, 50)}"`);
+          return reply(known.text);
+        }
+      }
+
+      // Nothing learned covers it. Has anyone been asked this BEFORE, in the
+      // years of chat history we imported?
+      //
+      // What comes back is context, never an answer: which part the question
+      // is probably about. The part is then priced and counted by the portal
+      // exactly like any other, so a customer hears today's stock and never
+      // the figure somebody typed last June. A history example that names no
+      // part teaches us nothing we can act on here, so it is skipped rather
+      // than paraphrased at the customer.
+      if (await this.historyPart(m, text, reply)) return true;
+
       // Money, billing, returns, complaints — real business the bot must not
       // answer for itself. Before this it vanished; now a person sees it.
       const asked = await escalation.create(this, {
         chatId: m.chatId,
         customerPhone: m.from,
+        customerMessageId: m.id || null,
         item: text.slice(0, 80),
         qty: 1,
         kind: 'inquiry',
@@ -3188,11 +4201,36 @@ class CustomerBot {
         lines.push(l);
         continue;
       }
+      // THE CATALOGUE INDEX FIRST, when one has been imported.
+      //
+      // The portal search is a literal phrase match, which is how "Cartend
+      // wiper blade 17 number" ended up quoting a Fortuner blade: the brand
+      // was dropped and one row was taken as proof. The index matches on
+      // meaning instead, so the customer's words reach the right part number.
+      //
+      // It answers WHICH PART and nothing else — price and stock are still
+      // read from the portal below, every time.
+      const indexed = await parts.find(l.item).catch(() => null);
+      if (indexed && indexed.partNo) {
+        store.log(this.key, `"${l.item}" -> ${indexed.partNo} from the catalogue index`);
+        lines.push({ ...l, item: indexed.partNo, requested: l.item });
+        continue;
+      }
+
       const hits = await availability.byName(vehicle.narrow(m.chatId, l.item));
-      if (hits.top.length === 1) {
+      // One row is only an answer when it does not contradict the question.
+      // "Cartend wiper blade 17 number" matched a Fortuner blade and was
+      // quoted, because the brand was dropped from the search and "only one
+      // match" was doing all the work. Untrusted now means SHOWN, not
+      // guessed: the customer picks instead of being told the wrong thing.
+      const trusted = hits.top.length === 1 && availability.matchTrustworthy(l.item, hits.top[0]);
+      if (trusted) {
         store.log(this.key, `"${l.item}" -> ${hits.top[0].partNo} by name (only match)`);
+        // Keep what it cost us to find. The next customer asking this way
+        // is a vector lookup, not another search (core/parts.remember).
+        parts.remember({ partNo: hits.top[0].partNo, name: hits.top[0].name }).catch(() => {});
         lines.push({ ...l, item: hits.top[0].partNo, requested: l.item });
-      } else if (hits.top.length > 1) {
+      } else if (hits.top.length >= 1) {
         choices.push({ asked: l.item, total: hits.total, top: hits.top, qty: l.qty, ref: l.ref, key: l.key });
       } else {
         lines.push(l); // nothing in the catalogue — falls through to a human
@@ -3268,6 +4306,7 @@ class CustomerBot {
       await escalation.create(this, {
         chatId: m.chatId,
         customerPhone: m.from,
+        customerMessageId: m.id || null,
         item: u.requested || u.item,
         // What the bot actually extracted, which is what the reader needs to
         // see. Passing only the raw line meant a photo of a label arrived as
@@ -3372,6 +4411,19 @@ class CustomerBot {
       const shown = usable.map((l) => availability.describe(l, m.chatId)).join(String.fromCharCode(10));
       store.log(this.key, `inquiry-only number ${m.from}: answered ${usable.length} line(s), no draft`);
       const NL = String.fromCharCode(10, 10);
+      // A SALESMAN with no customer picked yet: the parts are kept, and he
+      // is asked whose order it is — by phone or GST number, so the portal
+      // and Odoo know who is billed and where it ships (founder, 25 Sep).
+      // Answered, the parts become that customer's draft.
+      if (salesOrder.isSalesPerson(m.from) && !(config.inquiryOnlyNumbers || []).includes(store.normPhone(m.from))) {
+        salesOrder.holdItems(m.chatId, usable);
+        const n = salesOrder.heldCount(m.chatId);
+        const ask = t(
+          `To order ${n > 1 ? 'these ' + n + ' parts' : 'this'}, which customer is it for? Send the customer's phone number or GST number.`,
+          `Order karna hai to ${n > 1 ? 'ye ' + n + ' parts' : 'ye'} kis customer ke liye hai? Customer ka phone number ya GST number bhejiye.`,
+        );
+        return reply([shown, askText, ask].filter(Boolean).join(NL));
+      }
       return reply(askText ? shown + NL + askText : shown);
     }
     const checking = resolved.filter((l) => l.source === 'unknown');
@@ -3540,20 +4592,29 @@ class CustomerBot {
       // bare "Stock check: 13780M55R50 - hai" told them nothing they could
       // order from (22 Sep, live).
       const asText = async (x) => x;
-      if (items.length === 1 && m && top.length === 1) {
+      // Same rule as the order path: one row that contradicts the question
+      // is shown, not quoted (see availability.matchTrustworthy).
+      const trustedOne = top.length === 1 && availability.matchTrustworthy(item, top[0]);
+      if (items.length === 1 && m && trustedOne) {
         store.log(this.key, `"${item}" -> ${top[0].partNo} by name (only match)`);
+        // Keep what it cost us to find. The next customer asking this way
+        // is a vector lookup, not another search (core/parts.remember).
+        parts.remember({ partNo: top[0].partNo, name: top[0].name }).catch(() => {});
         return this.quoteForOrder(m, [{ partNo: top[0].partNo, name: top[0].name, requested: item }], asText, t);
       }
-      if (items.length === 1 && m && top.length > 1) {
+      if (items.length === 1 && m && top.length >= 1) {
         store.log(this.key, `"${item}" -> ${top.length} catalogue matches; showing them priced`);
         return this.offerPriced(m, { base: item, qty: 1, rate: true }, top, top.length, asText, t);
       }
-      if (top.length === 1) {
+      if (top.length === 1 && availability.matchTrustworthy(item, top[0])) {
         store.log(this.key, `"${item}" -> ${top[0].partNo} by name (only match)`);
+        // Keep what it cost us to find. The next customer asking this way
+        // is a vector lookup, not another search (core/parts.remember).
+        parts.remember({ partNo: top[0].partNo, name: top[0].name }).catch(() => {});
         lines.push({ item: top[0].partNo, qty: 1, requested: item });
         continue;
       }
-      if (top.length > 1 && chatId) {
+      if (top.length >= 1 && chatId) {
         // Several parts carry that name — front or rear, which car. Ask the
         // way the counter would rather than quoting one of them at random.
         store.log(this.key, `"${item}" -> ${top.length} catalogue matches; asking which`);
@@ -3605,6 +4666,7 @@ class CustomerBot {
         await escalation.create(this, {
           chatId: m.chatId,
           customerPhone: m.from,
+          customerMessageId: m.id || null,
           item: l.requested || l.item,
           partNo: ai.partNumberIn(String(l.requested || l.item || '')) || null,
           reason: ai.partNumberIn(String(l.requested || l.item || '')) ? 'NOT_IN_CATALOGUE' : 'NO_PART_NUMBER',

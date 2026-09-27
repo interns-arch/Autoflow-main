@@ -57,15 +57,6 @@ class SimTransport {
     store.log(this.botKey, `SIM send -> ${number}: ${text.slice(0, 120).replace(/\n/g, ' | ')}`);
     return id;
   }
-  // Buttons, for a transport that has none. The linked (QR) client cannot
-  // send interactive messages, so the choices are written out and the
-  // customer types one — which the caller has to accept anyway, because a
-  // customer on any transport may ignore the buttons and type.
-  async sendButtons(number, text, buttons) {
-    const list = (buttons || []).map((b) => `• ${b.title}`).join('\n');
-    return this.sendText(number, list ? `${text}\n\n${list}` : text);
-  }
-
   async sendImage(chatId, buffer, mime, caption) {
     const id = 'sim-wamid-' + (++simMsgSeq);
     this.outbox.push({ ts: new Date().toISOString(), to: store.normPhone(chatId), text: caption || '', photo: true, id });

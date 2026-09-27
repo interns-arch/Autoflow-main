@@ -12,7 +12,7 @@ Two very different PDFs arrive in this trade:
     render the pages and let vision read them.
 
 So: try text first, and when there is none, hand the pages back as PNGs for
-the caller to send to Claude vision — the same path a photo already takes.
+the caller to send to Gemini vision — the same path a photo already takes.
 
     python read_pdf.py FILE.pdf [--render-dir DIR]
 

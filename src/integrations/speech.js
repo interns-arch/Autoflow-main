@@ -2,8 +2,7 @@
 // Turning a customer's voice note into text, so the person answering it can
 // READ it instead of listening to it.
 //
-// Why Gemini and not Claude: the Claude API takes text, images and PDFs. It
-// has no audio content block at all, so there is nothing to send it. Gemini
+// Why Gemini: it takes audio, which a text-and-image model does not, and it
 // accepts audio/ogg, which is exactly the codec WhatsApp records in — no
 // conversion step.
 //

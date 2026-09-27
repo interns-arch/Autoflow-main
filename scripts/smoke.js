@@ -28,18 +28,18 @@ process.env.GST_API_KEY = '';
 // Odoo and assert the fallback, and a real value in .env would quietly send
 // them down the portal path instead.
 process.env.DEALER_PORTAL_ACCOUNT_ID = '';
-process.env.ANTHROPIC_API_KEY = ''; // deterministic parsers only
+process.env.GEMINI_API_KEY = ''; // deterministic parsers only
 process.env.ODOO_URL = ''; // no live ERP either - MRP and ledgers are stubbed below
 process.env.ODOO_DB = '';
 process.env.ODOO_USERNAME = '';
 process.env.ODOO_API_KEY = '';
 process.env.GEMINI_API_KEY = ''; // voice notes are not transcribed in the suite
-// The photo tests read the fixture with LOCAL OCR — with both AI keys blanked
-// above there is no vision path, so this is the only reader left. It used to
-// be inherited: config defaults ai.ocr to true on win32, so the suite passed
-// here and would have failed on Linux. Pinned so the result no longer depends
-// on the machine, or on whatever AI_OCR happens to say in .env.
-process.env.AI_OCR = 'on';
+// The photo tests have no reader: both AI keys are blanked above and the
+// local character recogniser is gone (it was Windows-only and never ran in
+// production). So parseOrderImage is stood in for where a photo has to be
+// read — exactly as section [48] already did — with what the old reader
+// actually returned for scripts/fixtures/test_order.png. The suite is about
+// what the bot does with the lines, not about who read them off the picture.
 process.env.ORDER_CONFIRM_ENABLED = 'true'; // mock portal — safe to punch here
 
 const path = require('path');
@@ -126,6 +126,19 @@ async function main() {
   });
 
   const customer = new CustomerBot();
+  // THE FLOWS BELOW ARE STAFF TOOLING NOW.
+  //
+  // A customer's message goes to the agent and nothing else — every reply is
+  // written by the model from what its tools return (bots/customerBot,
+  // answerCustomer). The command flows this suite drives — orders punched from a
+  // list, close matches offered one by one, quantity asks, the account form,
+  // approvals, rates — are what STAFF use: the sales team asking for a
+  // customer, salesmen punching an SO, the Sales Head approving. So the sim
+  // numbers here are treated as staff, and every check below keeps testing
+  // that tooling exactly as it was. Section [70] at the end restores the real
+  // split and tests the customer path itself: the agent, and only the agent.
+  const realIsOperator = customer.isOperator.bind(customer);
+  customer.isOperator = () => true;
   const bots = { customer };
   require('../src/core/admin').attach(bots);
   const escalation = require('../src/core/escalation');
@@ -472,6 +485,17 @@ async function main() {
   // "2pc" / "3pise". The part is in the image, the number in the caption.
   console.log('\n[5d] photo + caption');
   const png = fs.readFileSync(path.join(__dirname, 'fixtures', 'test_order.png')).toString('base64');
+  // What the reader gives back for THIS fixture, recorded from the real thing
+  // while it still existed: "Brake Pad - 5 / Oil Filter - 10 / Air Filter - 2".
+  // Vision reads the same picture in production; here it is pinned so the
+  // result cannot depend on a key, a network, or which machine this runs on.
+  const ai5d = require('../src/core/ai');
+  const readWas5d = ai5d.parseOrderImage;
+  ai5d.parseOrderImage = async () => [
+    { item: 'Brake Pad', qty: 5 },
+    { item: 'Oil Filter', qty: 10 },
+    { item: 'Air Filter', qty: 2 },
+  ];
   customer.transport.outbox.length = 0;
   await customer.transport.injectIncoming({
     from: CUST, chatId: 'sim-' + CUST, chatName: '', isGroup: false,
@@ -484,6 +508,7 @@ async function main() {
   // caption must NOT overwrite them — a number the customer wrote inside the
   // picture beats a loose one in the caption.
   check('image quantities win over the caption', /Brake Pad x ?5/i.test(photoMsg));
+  ai5d.parseOrderImage = readWas5d;
   // And the caption-only path is unit-tested directly:
   check('bare caption quantities parsed', ai.bareQty('3pise') === 3 && ai.bareQty('2pc') === 2 && ai.bareQty('Ye hai ji') === null);
 
@@ -598,7 +623,7 @@ async function main() {
   console.log('\n[7f] conversation quality');
   const clarify2 = require('../src/core/clarify');
 
-  // (a) OCR reading the same label twice, one character apart, must not put
+  // (a) the same label read twice, one character apart, must not put
   //     two lines in the cart once the portal has named them the same part.
   const dupOrder = { id: 'ORD-DUP', lines: [] };
   orders.addLines(dupOrder, [{ item: '17521m52TOO', partNo: '17521M52T00', qty: 10, source: 'unavailable', available: 0 }], { replace: true });
@@ -705,7 +730,7 @@ async function main() {
   });
   const askMsg = customer.transport.outbox.map((o) => o.text).join('\n');
   check('the customer number is on the question', /\+91 98919 89965/.test(askMsg));
-  // The reader needs the number the bot extracted, not the raw OCR line it
+  // The reader needs the number the bot extracted, not the raw line it
   // came from — doing that extraction again is the bot's job, not theirs.
   check('the extracted part number is shown', /33400M68K31/.test(askMsg));
   check('the raw wording is shown too, for a misread digit', /COIL ASSY IGNITION/.test(askMsg));
@@ -859,7 +884,7 @@ async function main() {
   console.log('\n[7l] unreadable photo -> the helper, with the photo attached');
   const PCUST = '919845008800';
   const PCHAT = 'sim-' + PCUST;
-  // 1x1 png. No OCR and no AI key in this suite, so this is unreadable by
+  // 1x1 png. No reader and no AI key in this suite, so this is unreadable by
   // definition — exactly the case being tested.
   const tinyPng = Buffer.from(
     'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
@@ -1252,7 +1277,21 @@ async function main() {
     'the ask arrives once they go quiet',
     customer.transport.outbox.map((o) => o.text).join(' ').match(/confirm/i) !== null,
   );
-  check('...and never quotes a price', !/₹|\brs\.?\s*\d|\b\d+\.\d{2}\b/i.test(lastOut(customer)));
+  // Rates ARE quoted now (founder, 23 Sep: the price must go out with the
+  // stock, without the customer asking). What must never happen is quoting a
+  // rate that is not this customer's — the portal prices against an ACCOUNT,
+  // and the rate for a number it does not know belongs to whoever the bot is
+  // logged in as. The mock portal prices for the asking customer, so their
+  // own rate is expected here.
+  check('...and the price goes out with the stock', /rs\.?\s*\d/i.test(lastOut(customer)));
+  check(
+    '...but a rate that is NOT theirs is never quoted',
+    (() => {
+      const l = { source: 'portal', item: 'BP-1001', qty: 1, available: 1, rate: 528, mrp: 600, pricedForCustomer: false };
+      const out = require('../src/core/orders').lineText(l, (en) => en);
+      return /MRP\s*Rs\.\s*600/i.test(out) && !/528/.test(out);
+    })(),
+  );
 
   // ---- 7bb. a retired cart is announced, not silently dropped ----
   console.log('\n[7bb] stale cart is closed WITH a word to the customer');
@@ -2311,6 +2350,10 @@ async function main() {
   check('...a number with no match goes to a person', /71799Z99Z99/.test(asked20) && /Checking 71799Z99Z99|71799Z99Z99 check kar raha/i.test(near20.said));
   check('...who sees the customer\'s name and the whole list', /Mock Customer/.test(asked20) && /_Their message:_[\s\S]*71761m67LA0 4 pcs/.test(asked20));
   check('...and the part that WAS found is already in the order', (orders.findDraft('sim-919000000210') || { lines: [] }).lines.length === 1);
+  check(
+    '...asked as a plain question — no "Reply Yes or No" under it',
+    !/Reply Yes or No|Haan ya Nahi likhiye/i.test(near20.said),
+  );
   const near20b = await rate20('919000000210', 'haan');
   check('"haan" adds the close match with the quantity asked', (orders.findDraft('sim-919000000210').lines.find((l) => /71761M67LA05PK/.test(l.partNo || l.item)) || {}).qty === 4);
   check('...and the next one is asked', /\(2\/2\)/.test(near20b.said) && /71791M85S005PK/.test(near20b.said));
@@ -2399,7 +2442,7 @@ async function main() {
       };
       cc20.park(form20);
       customer.transport.outbox.length = 0;
-      await customer.startDiscountSetup({ chatId: agentChat20, from: AGENT20 }, form20, tt20);
+      await customer.startDiscountSetup({ chatId: agentChat20, from: AGENT20 }, form20, (text) => customer.askDiscount({ chatId: agentChat20, from: AGENT20 }, text), tt20);
       check('the agent is asked for the discount: brand or part', /Brand wise ya Part wise/.test(text20(customer.transport.outbox)));
       await say20(AGENT20, 'Brand wise', 'DSC_BRAND');
       check('the brand is written as the portal writes it', /CARTRENDS — kitna discount/.test(text20(await say20(AGENT20, 'cartrend'))));
@@ -2427,7 +2470,7 @@ async function main() {
       portal.setMockStock([{ part_no: '16510M65L10', name: 'Oil Filter', quantity: 50, price: 90, mrp: 200, vendor: 'K' }]);
       const form21 = { chatId: agentChat20, byName: 'Shubham', answers: { ...form20.answers, requestId: 'WA-DSC21', phone: '919000000303' } };
       cc20.park(form21);
-      await customer.startDiscountSetup({ chatId: agentChat20, from: AGENT20 }, form21, tt20);
+      await customer.startDiscountSetup({ chatId: agentChat20, from: AGENT20 }, form21, (text) => customer.askDiscount({ chatId: agentChat20, from: AGENT20 }, text), tt20);
       await say20(AGENT20, 'Part wise', 'DSC_PART');
       const mrp21 = text20(await say20(AGENT20, '16510M65L10'));
       check('part-wise: the portal MRP is shown and the lowest price asked', /MRP ₹200/.test(mrp21) && /Minimum kitne mein bechna/.test(mrp21));
@@ -2443,30 +2486,72 @@ async function main() {
       await customer.decideNewCustomer({ chatId: 'sim-' + APPR20, from: APPR20 }, { yes: false, requestId: 'WA-DSC21' }, async () => true, tt20);
       check('a rejected account takes its discount rules with it', !ds20.find(id21));
 
-      // ---- an EXISTING customer changes their discount ----
+      // ---- an AGENT changes an EXISTING customer's discount ----
+      // Only the sales team sets discounts (founder, 25 Sep): the agent names
+      // the customer by phone, is shown the account, and says yes first.
       portal._setMockDiscountRules([
         { id: 501, rule_id: 501, rule_type: 'BRAND', brand: 'CARTRENDS', dealer_id: 1, discount_mode: 'PERCENT', discount_value: 12, is_active: true, rule_name: 'Mock Customer CARTRENDS 12%' },
         { id: 502, rule_id: 502, rule_type: 'BRAND', brand: 'BOSCH', dealer_id: 999, discount_mode: 'PERCENT', discount_value: 5, is_active: true, rule_name: 'Other BOSCH 5%' },
       ]);
+      portal.setMockCustomers([{ id: 1, name: 'Mock Customer', phone: '919000000304', gst_no: '07AAAAA0000A1Z5', address: 'Karol Bagh, Delhi', credit_limit: '50000.00', credit_days: 7, balance: '1200' }]);
+      const teamWas22 = cr20.team;
+      cr20.team = { ...(teamWas22 || {}), [AGENT20]: 'Shubham' };
       const CUST22 = '919000000304';
-      const list22 = text20(await say20(CUST22, 'mera discount change karna hai'));
-      check('an existing customer is shown their own rules only', /1\. Mock Customer CARTRENDS 12% — 12%/.test(list22) && !/BOSCH/.test(list22));
-      check('...and asked the new %', /Abhi 12% hai\. Naya discount %/.test(text20(await say20(CUST22, '1'))));
-      check('...shown the change before it is sent', /12% → 15%/.test(text20(await say20(CUST22, '15'))));
-      const sent22 = await say20(CUST22, 'Haan', 'DSC_YES');
+      check('a customer asking is not given a discount setup', !/Kis customer ka discount|discount rules/i.test(text20(await say20(CUST22, 'mera discount change karna hai'))));
+      check('an agent is asked for the customer by phone or GST', /phone number ya GST number/i.test(text20(await say20(AGENT20, 'discount change karna hai'))));
+      const card22 = text20(await say20(AGENT20, '9000000304'));
+      check('...shown the customer in full before anything starts', /\*Mock Customer\*/.test(card22) && /GSTIN: 07AAAAA0000A1Z5/.test(card22) && /Isi customer ka discount setup karein/.test(card22));
+      const list22 = text20(await say20(AGENT20, 'haan'));
+      check('...then shown their rules only', /1\. Mock Customer CARTRENDS 12% — 12%/.test(list22) && !/BOSCH/.test(list22));
+      check('...and asked the new %', /Abhi 12% hai\. Naya discount %/.test(text20(await say20(AGENT20, '1'))));
+      // The new % sends it: there is no "Send for approval?" any more (25 Sep,
+      // live — the next message was read as a no and the change was lost).
+      const sent22 = await say20(AGENT20, '15');
+      check('...shown the change as it is sent', /12% → 15%/.test(text20(sent22)));
       const id22 = dscIn20(sent22);
       check('the change goes to the Sales Head, not the portal', /\*Discount change\*/.test(sent22.filter((o) => o.to === APPR20).map((o) => o.text).join('\n')) && (await portal.listDiscountRules())[0].discount_value === 12);
       const ok22 = await say20(APPR20, 'OK ' + id22);
       const rule22 = (await portal.listDiscountRules())[0];
       check('"OK DSC-…" updates only the discount on the portal', rule22.discount_value === 15 && rule22.brand === 'CARTRENDS' && rule22.rule_name === 'Mock Customer CARTRENDS 15%');
-      check('...and the customer is told', ok22.some((o) => String(o.to).indexOf(CUST22) >= 0 && /12% → 15%/.test(o.text || '')));
+      check('...and the agent is told', ok22.some((o) => String(o.to).indexOf(AGENT20) >= 0 && /12% → 15%/.test(o.text || '')));
       // a NO leaves it as it was
-      await say20(CUST22, 'discount change karna hai');
-      await say20(CUST22, '1');
-      await say20(CUST22, '20');
-      const id23 = dscIn20(await say20(CUST22, 'Haan', 'DSC_YES'));
+      await say20(AGENT20, 'discount change karna hai');
+      await say20(AGENT20, '9000000304');
+      await say20(AGENT20, 'haan');
+      await say20(AGENT20, '1');
+      const id23 = dscIn20(await say20(AGENT20, '20'));
       await say20(APPR20, 'NO ' + id23);
       check('"NO DSC-…" changes nothing', (await portal.listDiscountRules())[0].discount_value === 15);
+      cr20.team = teamWas22;
+
+      // ---- the same flow with NOTHING TAPPED ----
+      // The bot sends no buttons any more, so every step above has to work
+      // typed. No buttonId anywhere below.
+      const AGENT24 = '919000000303';
+      const form24 = {
+        chatId: 'sim-' + AGENT24,
+        byName: 'Shubham',
+        answers: { requestId: 'WA-DSC24', phone: '919000000304', name: 'SHARMA AUTO', businessType: 'retailer', contactPerson: 'Sharma', email: 's@example.com', gstNo: '06CIYPK2053H1ZZ', city: 'Gurgaon', state: 'Haryana', pin: '122001', address: 'Shop 4' },
+      };
+      cc20.park(form24);
+      customer.transport.outbox.length = 0;
+      await customer.startDiscountSetup({ chatId: form24.chatId, from: AGENT24 }, form24, (text) => customer.askDiscount({ chatId: form24.chatId, from: AGENT24 }, text), tt20);
+      const ask24 = text20(customer.transport.outbox);
+      check('typed only: the question is a question, with no menu of bullets under it', /Brand wise ya Part wise/.test(ask24) && !/•/.test(ask24));
+      await say20(AGENT24, 'Brand wise');
+      // Only a "Brand wise" that was understood makes the next word a brand.
+      check('...typed "Brand wise" is understood', /CARTRENDS — kitna discount/.test(text20(await say20(AGENT24, 'cartrend'))));
+      await say20(AGENT24, '10');
+      for (let i = 0; i < 4; i++) await say20(AGENT24, 'skip');
+      await say20(AGENT24, '3 mahine');
+      const sent24 = await say20(AGENT24, 'haan');
+      check('...typed "haan" sends it for approval', Boolean(dscIn20(sent24)));
+      const done24 = text20(await say20(AGENT24, 'done'));
+      check(
+        '...and typed "done" at "another rule?" FINISHES — it does not start another',
+        /Ho gaya|Done —/.test(done24) && !/Brand wise ya Part wise/.test(done24),
+        done24.slice(0, 120),
+      );
     } finally {
       cr20.approvers = apprWas20;
       dpCfg20.listPriceAccountId = listWas20;
@@ -2477,6 +2562,48 @@ async function main() {
         { part_no: '71791M85S005PK', name: 'BUMPER | ERTIGA/SWIFT | FRONT LOWER', quantity: 26, price: 500, mrp: 560, vendor: 'K' },
       ]);
     }
+  }
+
+  // ---- [20c] no buttons: asked in words, answered in words ----
+  // The bot talks like the man at the counter. It sends no WhatsApp buttons,
+  // so a question that used to carry them has to understand a typed answer —
+  // and must not steal a "haan" that belongs to something else.
+  console.log('\n[20c] no buttons: asked in words, answered in words');
+  {
+    const { CloudTransport } = require('../src/wa/cloudTransport');
+    check(
+      'no transport can send a WhatsApp button',
+      typeof customer.transport.sendButtons === 'undefined' && typeof CloudTransport.prototype.sendButtons === 'undefined',
+    );
+    const cc20c = require('../src/core/customerCreate');
+    const say20c = async (from, body) => {
+      customer.transport.outbox.length = 0;
+      await customer.transport.injectIncoming({ from, chatId: 'sim-' + from, isGroup: false, body, mediaType: 'chat' });
+      return customer.transport.outbox.map((o) => o.text || '').join('\n');
+    };
+    // The mock portal knows every number, so each of these is "already a
+    // customer" — exactly the branch that used to send two buttons.
+    const U1 = '919000000401';
+    const q1 = await say20c(U1, 'create customer');
+    check(
+      'an existing customer asking for an account is asked in words',
+      /for someone else\?|Kisi aur ke liye banana hai\?/.test(q1) && !/•|likh dijiye|Reply "/.test(q1),
+      q1.slice(0, 120),
+    );
+    const no1 = await say20c(U1, 'nahi');
+    check('..."nahi" typed back is read as the answer to it', /part number whenever|Jab bhi koi part chahiye/.test(no1), no1.slice(0, 120));
+    await say20c(U1, 'create customer');
+    const yes1 = await say20c(U1, 'haan');
+    check('..."haan" typed back opens one for someone else', /Whose account|Kiska account/.test(yes1), yes1.slice(0, 120));
+    cc20c.cancel('sim-' + U1);
+
+    // They asked, then moved on. A "haan" later belongs to something else.
+    const U2 = '919000000402';
+    await say20c(U2, 'create customer');
+    await say20c(U2, 'kya aap sunday ko khule hain');
+    const late2 = await say20c(U2, 'haan');
+    check('...once they move on, a later "haan" does not open an account', !/Whose account|Kiska account/.test(late2), late2.slice(0, 120));
+    cc20c.cancel('sim-' + U2);
   }
 
   // "2 box" is two boxes, whatever each holds; "4 pcs" is four pieces.
@@ -2528,14 +2655,15 @@ async function main() {
     return sent(customer);
   };
   const maan21a = await say21(SALES21, 'Maan Motors ka SO bana do');
-  check('the salesman is asked whether it is this customer, by name', /Maan Motors/.test(maan21a) && /this one|yahi wale/i.test(maan21a));
+  check('the salesman is asked whether it is this customer, by name', /Maan Motors/.test(maan21a) && /this one|yahi wale|isi customer ke liye/i.test(maan21a));
   await say21(SALES21, 'haan');
   await say21(SALES21, '16510M65L10 2');
   const draft21a = orders.findDraft('sim-' + SALES21);
   check('the draft is for the customer picked (buyer 345), not the salesman number', !!draft21a && !!draft21a.portalCustomer && draft21a.portalCustomer.buyerId === 345);
   markAsked('sim-' + SALES21);
   const maan21b = await say21(SALES21, 'haan');
-  check('with punching off, the salesman is told the SO was not punched', /haven.t punched|punch nahi kiya/i.test(maan21b));
+  // Punching off: a salesman's order goes to the Sales Heads for approval (26 Sep).
+  check('with punching off, the salesman order goes to the Sales Head for approval', /Sales Head ko approval ke liye bhej diya|gone to the Sales Head/i.test(maan21b));
 
   const anuj21a = await say21(SALES21, 'Anuj ka SO: 13780M68P01 5');
   check('two Anujs are listed, and Tanuj is not', /1\. anuj/.test(anuj21a) && /2\. Anuj/.test(anuj21a) && !/Tanuj/.test(anuj21a));
@@ -3376,11 +3504,11 @@ async function main() {
   };
   const discuss37 = (items, chatId = C37) => chatState37.slot('focus').set(chatId, { at: Date.now(), items });
 
-  // The live model, as it behaved: every call goes through ai._claude.
-  const keyWas37 = config.ai.apiKey;
-  config.ai.apiKey = 'test-key';
+  // The live model, as it behaved: every call goes through ai._model.
+  const keyWas37 = config.gemini.apiKey;
+  config.gemini.apiKey = 'test-key';
   const live37 = { parse: null, chat: null, understand: null };
-  ai37._setClaude(async (system, user) => {
+  ai37._setModel(async (system, user) => {
     if (/^You parse WhatsApp messages/.test(system)) return live37.parse ? live37.parse(user) : { intent: 'other' };
     if (/^You answer WhatsApp messages for CARTRENDS/.test(system)) return live37.chat ? live37.chat(user) : { action: 'silent' };
     if (/^You are the counter person/.test(system)) return live37.understand ? live37.understand(user) : { intent: 'chat' };
@@ -3484,8 +3612,8 @@ async function main() {
   check('in a group "5 p" orders the part just discussed too', qtyOf37(P37, G37) === groupQtyBefore37 + 5);
   chatState37.slot('focus').delete(G37);
 
-  ai37._setClaude(null);
-  config.ai.apiKey = keyWas37;
+  ai37._setModel(null);
+  config.gemini.apiKey = keyWas37;
   reset37();
 
   // 13 Sep, live, after the fix: "Thik hai.. mt kro" was taken as a yes, "Ok
@@ -3519,14 +3647,14 @@ async function main() {
     check(`"${msg}" reads as ${want}`, r.intent === want);
   }
   // ...and the model cannot turn them back into a yes.
-  config.ai.apiKey = 'test-key';
-  ai37._setClaude(async () => ({ intent: 'confirm' }));
+  config.gemini.apiKey = 'test-key';
+  ai37._setModel(async () => ({ intent: 'confirm' }));
   for (const [msg, want] of INTENTS38.filter(([, w]) => w !== 'confirm')) {
     const r = await ai37.parseCustomerMessage(msg, []);
     check(`with the model saying yes, "${msg}" still reads as ${want}`, r.intent === want);
   }
-  ai37._setClaude(null);
-  config.ai.apiKey = keyWas37;
+  ai37._setModel(null);
+  config.gemini.apiKey = keyWas37;
 
   reset37();
   await dm(customer, CUST, P37 + ' 2');
@@ -3601,12 +3729,12 @@ async function main() {
   check('group customer: a part number with no quantity gets an answer that asks for one', customer.transport.outbox.length === 1 && /quantit|kitni|how many/i.test(lastOut(customer)));
 
   resetG38();
-  config.ai.apiKey = 'test-key';
-  ai37._setClaude(async (system) => (/^You answer WhatsApp messages for CARTRENDS/.test(system) ? { action: 'reply', text: 'Rate 450 hai sir' } : { intent: 'other' }));
+  config.gemini.apiKey = 'test-key';
+  ai37._setModel(async (system) => (/^You answer WhatsApp messages for CARTRENDS/.test(system) ? { action: 'reply', text: 'Rate 450 hai sir' } : { intent: 'other' }));
   await group(customer, GC38, 'acha bhai sunno');
   check('group customer: a refused chat reply is not silence', customer.transport.outbox.length === 1 && !/450/.test(lastOut(customer)));
-  ai37._setClaude(null);
-  config.ai.apiKey = keyWas37;
+  ai37._setModel(null);
+  config.gemini.apiKey = keyWas37;
 
   // Unchanged until the founder decides: a Cartrends person in a group is a
   // person talking to the customer, not the customer.
@@ -4102,10 +4230,10 @@ async function main() {
     { part_no: '22400M74L00', name: 'Clutch Plate Swift', quantity: 12, price: 1850, mrp: 2400, vendor: 'Northend' },
     { part_no: 'BP-1001', name: 'Brake Pad', quantity: 40, price: 450, mrp: 600, vendor: 'Northend' },
   ]);
-  const keyWas46 = config.ai.apiKey;
-  config.ai.apiKey = 'test-key';
+  const keyWas46 = config.gemini.apiKey;
+  config.gemini.apiKey = 'test-key';
   const live46 = { parse: null, chat: null, understand: null, calls: 0 };
-  ai46._setClaude(async (system, user) => {
+  ai46._setModel(async (system, user) => {
     if (/^You parse WhatsApp messages/.test(system)) return live46.parse ? live46.parse(user) : { intent: 'other' };
     if (/^You answer WhatsApp messages for CARTRENDS/.test(system)) return live46.chat ? live46.chat(system, user) : { action: 'silent' };
     if (/^You are the counter person/.test(system)) {
@@ -4258,8 +4386,8 @@ async function main() {
   } catch {}
   config.sharedDir = sharedWas46;
 
-  ai46._setClaude(null);
-  config.ai.apiKey = keyWas46;
+  ai46._setModel(null);
+  config.gemini.apiKey = keyWas46;
   reset37();
   resetG38();
 
@@ -4301,14 +4429,14 @@ async function main() {
   const st47 = sent(customer);
   check('"order kahan hai" is answered from the portal', /701/.test(st47) && /dispatch/i.test(st47) && /702/.test(st47) && /allocate/i.test(st47));
 
-  const keyWas47 = config.ai.apiKey;
-  config.ai.apiKey = 'test-key';
+  const keyWas47 = config.gemini.apiKey;
+  config.gemini.apiKey = 'test-key';
   const ai47 = require('../src/core/ai');
   const live47 = {
     understand: () => ({ intent: 'orderStatus' }),
     chat: (system) => (/NOT going to a person/.test(system) ? { action: 'reply', text: 'Theek hai sir.' } : { action: 'human' }),
   };
-  ai47._setClaude(async (system, user) => {
+  ai47._setModel(async (system, user) => {
     if (/^You parse WhatsApp messages/.test(system)) return { intent: 'other' };
     if (/^You answer WhatsApp messages for CARTRENDS/.test(system)) return live47.chat(system, user);
     if (/^You are the counter person/.test(system)) return live47.understand(user);
@@ -4334,8 +4462,8 @@ async function main() {
   await dm(customer, CUST, 'Please collect cheque tomorrow');
   check('...a customer DM still reaches a person', team46());
 
-  ai47._setClaude(null);
-  config.ai.apiKey = keyWas47;
+  ai47._setModel(null);
+  config.gemini.apiKey = keyWas47;
   portal._setMockOrderHistory(null);
   reset37();
 
@@ -4538,15 +4666,13 @@ async function main() {
 
   // 13 Sep, founder, a coil box: printed "33400 M", "68P10" written after it by
   // hand. Vision read "33400M" twice and it went to a person. "ye handwritten
-  // photo kyon nhi pd rha..claude api lagaya hi isliye hai".
+  // photo kyon nhi pd rha..AI lagaya hi isliye hai".
   console.log('\n[51] a label finished by hand: "33400 M" + "68P10"');
   const ai51 = require('../src/core/ai');
-  const keyWas51 = config.ai.apiKey;
-  const ocrWas51 = config.ai.ocr;
-  config.ai.apiKey = 'test-key';
-  config.ai.ocr = false;
+  const keyWas51 = config.gemini.apiKey;
+  config.gemini.apiKey = 'test-key';
   const calls51 = [];
-  ai51._setClaude(async (system, user) => {
+  ai51._setModel(async (system, user) => {
     if (!Array.isArray(user)) return { intent: 'other' };
     const text = (user.find((u) => u.type === 'text') || {}).text || '';
     calls51.push({ system, text });
@@ -4560,13 +4686,12 @@ async function main() {
     check('...and the whole number is used', (got51 || []).some((l) => /33400M68P10/.test(String(l.item || l.partNo || ''))));
 
     calls51.length = 0;
-    ai51._setClaude(async (system, user) => (Array.isArray(user) ? (calls51.push(1), { doc: 'order', lines: [{ item: '16510M65L10', qty: 5 }] }) : { intent: 'other' }));
+    ai51._setModel(async (system, user) => (Array.isArray(user) ? (calls51.push(1), { doc: 'order', lines: [{ item: '16510M65L10', qty: 5 }] }) : { intent: 'other' }));
     await ai51.parseOrderImage('iVBORw0KGgo=', 'image/jpeg');
     check('a whole number is not looked at twice', calls51.length === 1);
   } finally {
-    ai51._setClaude(null);
-    config.ai.apiKey = keyWas51;
-    config.ai.ocr = ocrWas51;
+    ai51._setModel(null);
+    config.gemini.apiKey = keyWas51;
   }
 
   // 13 Sep, 22:26-22:30, live, the founder testing as admin:
@@ -5014,11 +5139,11 @@ async function main() {
 
     // Anything else that sounds like a desk question goes to the model - and a
     // number the model names must really be in the message.
-    const keyWas61 = config.ai.apiKey;
-    config.ai.apiKey = 'test-key';
+    const keyWas61 = config.gemini.apiKey;
+    config.gemini.apiKey = 'test-key';
     const ai61 = require('../src/core/ai');
     let answer61 = null;
-    ai61._setClaude(async (system) => (/^You sort one WhatsApp message from the Cartrends sales desk/.test(system) ? answer61 : { intent: 'other' }));
+    ai61._setModel(async (system) => (/^You sort one WhatsApp message from the Cartrends sales desk/.test(system) ? answer61 : { intent: 'other' }));
     try {
       answer61 = { kind: 'track', orderId: '639' };
       const byModel61 = await say61('order number 639 ka delivery ka kya scene hai');
@@ -5028,8 +5153,8 @@ async function main() {
       answer61 = { kind: 'track', orderId: '639' };
       check('...and a message with no desk word never reaches the model', (await lookup61.classifyDesk('16510M65L10 50 pcs')) === null);
     } finally {
-      ai61._setClaude(null);
-      config.ai.apiKey = keyWas61;
+      ai61._setModel(null);
+      config.gemini.apiKey = keyWas61;
     }
   } finally {
     customer.transport.sendDocument = sendDocWas61;
@@ -5190,14 +5315,19 @@ async function main() {
       && cc64.pending(CH64).answers.email === 'rakesh@sharma.com');
 
     // THE PHOTO IS ASKED BEFORE THE PIN, because it may answer it.
-    check('a photo is required, words will not do', /Photo bhejiye/i.test((await say64('koi photo nahi hai')).reply));
+    // THE PHOTO AND THE PIN ARE REQUIRED (founder, 25 Sep): "no photo" is
+    // answered with why, and the form waits for one.
+    check('a photo is required, words will not do', /zaroori/i.test((await say64('koi photo nahi hai')).reply) && cc64.pending(CH64).answers.shopPhoto === undefined);
     check('...and a plain photo still leaves the pin to ask for',
       /location bhej/i.test((await say64('', { mediaBase64: 'QUJD', mediaMime: 'image/jpeg' })).reply));
+    check('the pin is required too', /zaroori/i.test((await say64('location nahi hai')).reply));
     // Typed coordinates are how a shop ends up in the sea.
     check('typed coordinates are refused, the pin is asked for', /Location attach/i.test((await say64('28.6139, 77.2090')).reply));
 
     const done64 = await say64('', { location: { lat: 28.61, lng: 77.2 } });
-    const final64 = done64.done ? done64 : await say64('skip');
+    // Then the optional ones: owner DOB, bank details, remarks — each skippable.
+    let final64 = done64;
+    for (let i = 0; i < 4 && !final64.done; i++) final64 = await say64('skip');
     check('the form completes', final64.done === true);
     // Six fields the customer never typed: firm, address, city, state, PIN
     // and PAN were all answered by the GSTIN.
@@ -5432,6 +5562,8 @@ async function main() {
     const CHDA = 'sim-create66-dup-agent';
     cc66.cancel(CHDA);
     cc66.start(CHDA, '919811100066', t66, { forSomeoneElse: false });
+    // An agent is always opening it for a customer: the customer's number first.
+    await cc66.answer(CHDA, {}, '9811100099', t66);
     const dupA66 = await cc66.answer(CHDA, {}, '33AAACC1206D1ZN', t66);
     check('an agent entering a registered GSTIN is told whose it is', /Existing Traders ke naam se/.test(dupA66.reply));
     check('...and no new account is opened', /Naya account nahi banega/.test(dupA66.reply) && !cc66.pending(CHDA));
@@ -5623,6 +5755,84 @@ async function main() {
     ai66.readShopPhoto = shopWas66;
     cfg66.team = teamWas66;
     portal66._setMockDuplicates([]);
+  }
+
+  // ---- [70] THE CUSTOMER PATH: the agent, and only the agent ----
+  //
+  // Everything above drove the staff tooling. Here the real split is back: a
+  // customer's message — typed, a photo, a greeting, a reaction — goes to the
+  // agent, and what the customer receives is the agent's own words and
+  // nothing else. The agent is a stand-in: this suite has no model key, and
+  // what is being tested is the routing, not the model's judgement.
+  console.log('\n[70] customers: the agent writes every reply — no template path');
+  {
+    customer.isOperator = realIsOperator;
+    const agent70 = require('../src/agent');
+    const ai70 = require('../src/core/ai');
+    const handleWas70 = agent70.handle;
+    const enabledWas70 = agent70.enabled;
+    const readWas70 = ai70.parseOrderImage;
+    const got70 = [];
+    agent70.enabled = () => true;
+    agent70.handle = async (a) => {
+      got70.push(a);
+      return { handled: true, reply: 'AGENT WROTE THIS #' + got70.length };
+    };
+    const C70 = '919000000701';
+    // The bot listens only to whitelisted DMs in this suite.
+    const dmsWas70 = config.customerDms.slice();
+    config.customerDms.push(C70, ...(config.adminNumbers || []).slice(0, 1));
+    const say70 = async (msg) => {
+      customer.transport.outbox.length = 0;
+      await customer.transport.injectIncoming({ from: C70, chatId: 'sim-' + C70, isGroup: false, mediaType: 'chat', ...msg });
+      return customer.transport.outbox.map((o) => o.text || '');
+    };
+    try {
+      check('a customer is not staff', !customer.isOperator({ from: C70 }));
+
+      const hi = await say70({ body: 'hi' });
+      check('a greeting goes to the agent — not the mirrored template', got70.length === 1 && /hi/.test(got70[0].text));
+      check('...and the customer receives exactly what the agent wrote', hi.length === 1 && hi[0] === 'AGENT WROTE THIS #1', JSON.stringify(hi));
+
+      const typed = await say70({ body: '13780M68P01 10 pcs' });
+      check('an order typed by a customer goes to the agent, not the order parser', got70.length === 2 && /13780M68P01/.test(got70[1].text));
+      check('...with nothing else sent alongside it', typed.length === 1 && /^AGENT WROTE THIS/.test(typed[0]), JSON.stringify(typed));
+
+      ai70.parseOrderImage = async () => [{ item: '72371M56R00', qty: 20 }, { item: '13780M68P01', qty: 5 }];
+      const photo = await say70({ body: '', hasMedia: true, mediaType: 'image', mediaBase64: 'iVBORw0KGgo=', mediaMime: 'image/png' });
+      const seen = got70[got70.length - 1];
+      check('a photo is READ, and what it says goes to the agent as facts', /Sent a PHOTO\. It reads as 2 order line/.test(seen.text) && /72371M56R00 x 20/.test(seen.text), seen.text);
+      check('...and no "part(s) found and added" template reaches the customer', photo.length === 1 && !/found and added|did not match exactly/i.test(photo.join('\n')), JSON.stringify(photo));
+      check('the message itself goes with it, for the tools that need a photo or a pin', seen.message && seen.message.mediaBase64 === 'iVBORw0KGgo=');
+
+      const react = await say70({ body: '', mediaType: 'reaction', reaction: { messageId: 'wamid.X', emoji: '👍' } });
+      check('a reaction reaches the agent too', /Reacted 👍/.test(got70[got70.length - 1].text) && react.length === 1);
+
+      // THE ONE FIXED LINE: the model could not run. A person is asked.
+      agent70.handle = async () => ({ handled: false, reply: null });
+      const down = await say70({ body: 'clutch plate swift chahiye' });
+      const toHelper70 = down.length;
+      check('with the agent down, the customer gets one plain line — not the old template path', down.filter((x) => x).length >= 1 && /check|Ek minute/i.test(down.join('\n')) && !/available|MRP|Rs\./i.test(down.join('\n')), JSON.stringify(down));
+      check('...and the message is handed to a person', toHelper70 >= 2 || customer.transport.outbox.some((o) => o.to === require('../src/store').normPhone(config.escalationNumber)), JSON.stringify(customer.transport.outbox.map((o) => o.to)));
+
+      // STAFF NEVER REACH THE CUSTOMER AGENT.
+      const before70 = got70.length;
+      agent70.handle = async (a) => {
+        got70.push(a);
+        return { handled: true, reply: 'AGENT' };
+      };
+      if (config.adminNumbers && config.adminNumbers[0]) {
+        customer.transport.outbox.length = 0;
+        await customer.transport.injectIncoming({ from: config.adminNumbers[0], chatId: 'sim-' + config.adminNumbers[0], isGroup: false, body: 'pending', mediaType: 'chat' });
+        check('an admin\'s message goes to the staff tooling, not the customer agent', got70.length === before70);
+      }
+    } finally {
+      agent70.handle = handleWas70;
+      agent70.enabled = enabledWas70;
+      ai70.parseOrderImage = readWas70;
+      customer.isOperator = () => true;
+      config.customerDms = dmsWas70;
+    }
   }
 
 

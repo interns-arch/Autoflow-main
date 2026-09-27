@@ -435,6 +435,9 @@ function remarksWith(fields) {
   if (fields.contactPhone && String(fields.contactPhone) !== String(fields.phone)) {
     bits.push('Contact phone: ' + fields.contactPhone);
   }
+  // No portal field for these: they travel here (core/customerCreate).
+  if (fields.dob) bits.push('Owner DOB: ' + fields.dob);
+  if (fields.bankDetails) bits.push('Bank: ' + fields.bankDetails);
   if (fields.gstVerified === false) bits.push('GST NOT verified' + (fields.gstWaiver ? ' (waived on ' + fields.gstWaiver + ')' : ''));
   return bits.join(' | ') || null;
 }
@@ -558,6 +561,62 @@ function invalidPartsFrom(err) {
   if (!err || err.code !== 'INVALID_PART_NO') return [];
   const details = (err.body && err.body.details) || [];
   return details.map((d) => String(d.part_no || '')).filter(Boolean);
+}
+
+// THE CUSTOMER'S DISCOUNT, on the price. commercial-analyze answers at MRP
+// with discount_percent 0 even where the customer has an approved rule
+// (core/discountSetup.ruleFor says which rule counts). The row is rewritten
+// the way the portal writes a discounted one — discount_percent, the price
+// after it, and the same on every allocation — so the quote, the cart and the
+// order the portal is sent (buildConfirmRequest echoes the row) all carry it.
+// MRP includes GST (18% on these rows), so the discounted price does too.
+const RULES_TTL_MS = 5 * 60 * 1000;
+let rulesCache = { at: 0, rows: null };
+async function discountRules() {
+  if (rulesCache.rows && Date.now() - rulesCache.at < RULES_TTL_MS) return rulesCache.rows;
+  const rows = await module.exports.listDiscountRules();
+  rulesCache = { at: Date.now(), rows };
+  return rows;
+}
+function forgetDiscountRules() {
+  rulesCache = { at: 0, rows: null };
+}
+async function withDiscountRules(rows, accountId, lines) {
+  let rules;
+  try {
+    rules = await discountRules();
+  } catch (e) {
+    store.log('portal', 'discount rules could not be read — prices left as the portal gave them: ' + String((e && e.message) || e).slice(0, 80));
+    return rows;
+  }
+  const { ruleFor } = require('../core/discountSetup');
+  const round2 = (v) => Math.round(v * 100) / 100;
+  for (const row of rows) {
+    const mrp = Number(row.mrp);
+    if (!(mrp > 0) || Number(row.discount_percent) > 0) continue; // the portal already priced it
+    const line = (lines || []).find((l) => norm(l.partNo || l.item) === norm(row.part_no));
+    const rule = ruleFor(rules, { dealerId: accountId, partNo: row.part_no, brand: row.brand, qty: Number(row.requested_qty) || (line && Number(line.qty)) || 1 });
+    if (!rule) continue;
+    const pct = Number(rule.discount_value);
+    const price = round2(mrp * (1 - pct / 100));
+    row.discount_percent = pct;
+    row.discount_amount = round2(mrp - price);
+    row.price = price;
+    row.discount_rule = { id: rule.rule_id || rule.id || null, name: rule.rule_name || null };
+    const qty = Number(row.requested_qty) || 1;
+    if (row.requested_billing_amount != null) row.requested_billing_amount = round2(price * qty);
+    if (row.available_billing_amount != null) {
+      const got = (row.allocations || []).reduce((s, a) => s + (Number(a.qty) || 0), 0);
+      row.available_billing_amount = round2(price * got);
+    }
+    for (const a of row.allocations || []) {
+      const am = Number(a.mrp) || mrp;
+      a.discount_percent = pct;
+      a.price = round2(am * (1 - pct / 100));
+      a.discount_amount = round2(am - a.price);
+    }
+  }
+  return rows;
 }
 
 // VERIFIED against the live OpenAPI spec:
@@ -870,6 +929,7 @@ module.exports = {
       ...(fields.address ? { address: fields.address } : {}),
       ...(fields.creditDays != null ? { credit_days: fields.creditDays } : {}),
       ...(fields.creditLimit != null ? { credit_limit: fields.creditLimit } : {}),
+      ...(fields.collectionDays != null ? { collection_days: fields.collectionDays } : {}),
       ...(fields.category ? { dealer_category: fields.category } : {}),
       ...(fields.branchId ? { home_branch_dealer_id: fields.branchId } : {}),
       // The API defaults this to 'dealer' for a customer account, which is
@@ -950,6 +1010,7 @@ module.exports = {
       return rule;
     }
     const data = await api('POST', '/discount-rules/', body, true, 'admin');
+    forgetDiscountRules();
     store.log('portal', `discount rule created: "${body.rule_name || ''}" (${body.rule_type}, ${body.discount_value}${body.discount_mode === 'percent' ? '%' : ''})`);
     return data;
   },
@@ -962,8 +1023,40 @@ module.exports = {
       return r;
     }
     const data = await api('PUT', '/discount-rules/' + encodeURIComponent(ruleId), body, true, 'admin');
+    forgetDiscountRules();
     store.log('portal', `discount rule ${ruleId} updated: ${JSON.stringify(body).slice(0, 120)}`);
     return data;
+  },
+  // A rule the portal is holding as PENDING, approved there too. The Sales
+  // Head has already said yes on WhatsApp ("OK DSC-…"); without this the rule
+  // would sit in the portal's own queue and never apply. `action` is a query
+  // parameter the spec does not enumerate, so the spellings are tried in turn.
+  async reviewDiscountRule(ruleId, decision = 'approve') {
+    if (isMock()) {
+      const r = mockDiscountRules.find((x) => x.id === ruleId || x.rule_id === ruleId);
+      if (r) r.approval_status = decision === 'approve' ? 'APPROVED' : 'REJECTED';
+      return r;
+    }
+    const tries = decision === 'approve' ? ['approve', 'APPROVE', 'APPROVED'] : ['reject', 'REJECT', 'REJECTED'];
+    let last;
+    for (const action of tries) {
+      try {
+        const data = await api('POST', `/discount-rules/${encodeURIComponent(ruleId)}/review?action=${action}`, null, true, 'admin');
+        store.log('portal', `discount rule ${ruleId} reviewed: ${action}`);
+        return data;
+      } catch (e) {
+        last = e;
+        if (e && e.status && e.status !== 400 && e.status !== 422) break;
+      }
+    }
+    throw last;
+  },
+  // The customer's discounts that apply today (core/discountSetup.activeRules),
+  // from the same five-minute copy of the rules the prices use.
+  async activeDiscounts(dealerId) {
+    if (!dealerId) return [];
+    const rules = isMock() ? mockDiscountRules.slice() : await discountRules();
+    return require('../core/discountSetup').activeRules(rules, dealerId);
   },
   _setMockDiscountRules: (list) => {
     mockDiscountRules.length = 0;
@@ -1160,6 +1253,72 @@ module.exports = {
       throw e;
     }
     return Array.isArray(data) ? data : (data && (data.items || data.data || data.results)) || [];
+  },
+
+  // The portal's credit control for one account: credit_days, collection_days,
+  // credit_limit, open invoices, whether billing is blocked and why.
+  async creditControl(accountId) {
+    if (isMock()) return { account_id: accountId, credit_days: 1, collection_days: 15, credit_limit: 100000, allowed: true };
+    return api('GET', '/accounts/' + encodeURIComponent(accountId) + '/credit-control', null, true, 'admin');
+  },
+
+  // A customer's HOME BRANCH (Bijwasan 23 / Mansarovar 1078), which decides
+  // the warehouse their orders are allocated from. It lives on the ACCOUNT,
+  // and the portal's own way to change it is the customer-branch mapping —
+  // keyed by AccountId. (/dealers/{id} is a different table: /dealers/8328
+  // is another company, not account 8328. Never used for this.)
+  // -> { id, name } as the portal has it now, or null.
+  async homeBranchOf(accountId, customerName) {
+    if (isMock()) return { id: 23, name: 'BIJWASAN WAREHOUSE' };
+    const data = await api('GET', '/account/update/customer-branch-mapping?limit=25&q=' + encodeURIComponent(customerName || ''), null, true, 'admin');
+    const row = ((data && data.items) || []).find((x) => Number(x.AccountId) === Number(accountId));
+    return row ? { id: Number(row.HomeBranchDealerId), name: row.HomeBranchDealerName || null } : null;
+  },
+  async setHomeBranch(accountId, customerName, branchId) {
+    if (isMock()) return { ok: true, mock: true };
+    const names = { 23: 'BIJWASAN WAREHOUSE', 1078: 'MAANSAROVAR WAREHOUSE' };
+    const q = (v) => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
+    const csv = 'AccountId,CustomerName,HomeBranchDealerId,HomeBranchDealerName\r\n' + [accountId, q(customerName), branchId, q(names[branchId] || '')].join(',') + '\r\n';
+    await ensureToken('admin');
+    const form = new FormData();
+    form.append('file', new Blob([csv], { type: 'text/csv' }), 'home-branch-' + accountId + '.csv');
+    const res = await fetch(dp.baseUrl + '/account/update/customer-branch-mapping/upload', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + sessions.admin.token },
+      body: form,
+    });
+    const text = await res.text().catch(() => '');
+    if (!res.ok) throw Object.assign(new Error('home branch upload HTTP ' + res.status + ' ' + text.slice(0, 200)), { status: res.status });
+    const now = await this.homeBranchOf(accountId, customerName).catch(() => null);
+    store.log('portal', 'account ' + accountId + ' home branch set to ' + branchId + ' (portal now ' + (now && now.id) + '): ' + text.slice(0, 120));
+    return { ok: Boolean(now && now.id === Number(branchId)), now, response: text.slice(0, 300) };
+  },
+
+  // A customer's details changed on the portal: only the fields sent (name,
+  // phone, email, gst_no, address, credit_days, credit_limit, dealer_category).
+  async updateCustomer(accountId, fields) {
+    if (isMock()) return { ok: true, mock: true };
+    const data = await api('PUT', '/users/customer/' + encodeURIComponent(accountId) + '/update', fields, true, 'admin');
+    store.log('portal', `customer ${accountId} updated: ${JSON.stringify(fields).slice(0, 120)}`);
+    return data;
+  },
+
+  // The same search, by the customer's MOBILE: a salesman ordering for a
+  // customer names them by their phone as often as by their name.
+  async searchAccountsByMobile(mobile) {
+    const ten = String(mobile || '').replace(/\D/g, '').slice(-10);
+    if (ten.length !== 10) return [];
+    if (isMock()) return mockCustomers.filter((r) => String(r.phone || r.mobile || '').replace(/\D/g, '').slice(-10) === ten);
+    let data;
+    try {
+      data = await api('GET', '/accounts/search?customer_mobile=' + encodeURIComponent(ten), null, true, 'sales', ACCOUNT_SEARCH_MS);
+    } catch (e) {
+      if (e && (e.status === 404 || /abort|timeout/i.test(String(e.message || e.name || '')))) return [];
+      throw e;
+    }
+    const rows = Array.isArray(data) ? data : (data && (data.items || data.data || data.results)) || [];
+    // The portal's filter is a "contains"; only the account with this number.
+    return rows.filter((r) => [r.phone, r.mobile].some((p) => String(p || '').replace(/\D/g, '').slice(-10) === ten));
   },
 
   // "Confirm SO": the step after the punch. The punch creates the SO with
@@ -1538,6 +1697,7 @@ module.exports = {
     const data = await api('POST', '/PUSH_ORDER/commercial-analyze', body);
     const rows = Array.isArray(data) ? data : (data && (data.items || data.data || data.results)) || [];
     if (!rows.length) return null;
+    await withDiscountRules(rows, accountId, lines);
 
     // Matched by part number, never by position: a reordered reply must not
     // hand one customer's line another line's price.
@@ -1596,6 +1756,7 @@ module.exports = {
       out.rate = numOrNull(row.price);
       out.mrp = numOrNull(row.mrp);
       out.discountPercent = numOrNull(row.discount_percent);
+      out.discountRule = row.discount_rule ? row.discount_rule.name : null;
       out.taxPercent = numOrNull(row.tax_percent);
       out.hsn = row.hsn_code || null;
       out.partName = row.part_name || null;

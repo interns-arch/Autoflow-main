@@ -43,6 +43,48 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 const PIN_RE = /^[1-9][0-9]{5}$/;
 
 const SKIP = /^(skip|nahi|nhi|no|na|-|n\/a|none|baad mein|later)$/i;
+
+// "15/08/1985", "15-8-85", "15.08.1985" -> "15/08/1985"; null when it is not
+// a real date for a living adult.
+function readDob(v) {
+  const m = String(v || '').trim().match(/^(\d{1,2})[\/\-. ](\d{1,2})[\/\-. ](\d{2}|\d{4})$/);
+  if (!m) return null;
+  const d = Number(m[1]);
+  const mo = Number(m[2]);
+  let y = Number(m[3]);
+  if (y < 100) y += y > (new Date().getFullYear() % 100) ? 1900 : 2000;
+  const dt = new Date(Date.UTC(y, mo - 1, d));
+  if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== mo - 1 || dt.getUTCDate() !== d) return null;
+  const age = new Date().getFullYear() - y;
+  if (age < 16 || age > 100) return null;
+  return `${String(d).padStart(2, '0')}/${String(mo).padStart(2, '0')}/${y}`;
+}
+
+// "A/C 50100123456789 HDFC0001234 HDFC Bank" -> "A/C 50100123456789 · IFSC
+// HDFC0001234 · HDFC Bank". Needs an account number or an IFSC at least; the
+// rest of what they wrote is kept as the bank's name.
+function readBank(v) {
+  const s = String(v || '').replace(/\s+/g, ' ').trim();
+  const ifsc = (s.toUpperCase().match(/\b[A-Z]{4}0[A-Z0-9]{6}\b/) || [])[0] || null;
+  const acct = (s.replace(/\b[A-Za-z]{4}0[A-Za-z0-9]{6}\b/, '').match(/\b\d{9,18}\b/) || [])[0] || null;
+  if (!ifsc && !acct) return null;
+  const name = s
+    .replace(/\b[A-Za-z]{4}0[A-Za-z0-9]{6}\b/, '')
+    .replace(/\b\d{9,18}\b/, '')
+    .replace(/\b(a\/?c|account|acct|no\.?|number|ifsc|code|bank\s*name)\b[:\-]?/gi, '')
+    .replace(/[,;:|]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return [acct ? 'A/C ' + acct : null, ifsc ? 'IFSC ' + ifsc : null, name || null].filter(Boolean).join(' · ');
+}
+
+// THE PHOTO OR THE PIN IS NOT TO BE HAD. Somebody opening an account for a
+// shop in Madurai from Delhi cannot photograph it or stand in it (25 Sep,
+// live: "Photo not available request come from jain sir" — the form waited
+// for a photo that was never coming, and nothing reached an approver). The
+// form goes on, the approver is told plainly that it has no photo / no pin,
+// and it is theirs to decide.
+const NOT_AVAILABLE = /\b(skip|not\s*available|unavailable|no\s*photo|without\s*photo|photo\s*(nahi|nhi|nahin)|location\s*(nahi|nhi|nahin)|nahi\s*hai|nhi\s*hai|nahin\s*hai|available\s*(nahi|nhi)|nahi\s*mil|nhi\s*mil|nahi\s*de\s*sakte|possible\s*nahi)\b/i;
 // A way OUT. Once the form is open every message is an answer to it, so
 // without this a customer who changed their mind would be filling in a shop
 // address to escape. Their cart is untouched — only the form closes.
@@ -65,6 +107,15 @@ function notAnAnswer(field, m, said) {
   if (media) {
     if (field.type === 'photo' && type === 'image') return false;
     if (field.type === 'location' && (type === 'location' || type === 'image')) return false;
+    // A PHOTOGRAPH OF THE GST CERTIFICATE is an answer to "GST number?".
+    //
+    // Nobody types fifteen characters correctly on a phone, so what a dealer
+    // actually sends is a picture of the certificate on the wall, or a
+    // letterhead, or one of their own bills. Refused here, that photo fell
+    // through to the parts handler, was read as a picture of a part, found
+    // nothing, and went to a person as an unidentified item — while the form
+    // sat waiting for a number that had just been sent.
+    if (field.type === 'gst' && type === 'image') return false;
     return true;
   }
   if (!said) return false;
@@ -182,8 +233,8 @@ const FIELDS = [
     req: true,
     type: 'photo',
     ask: [
-      'Shop ke saamne ki photo bhejiye — board/banner dikhna chahiye.',
-      'Shop ke saamne ki photo bhejiye — shop ka board ya banner dikhna chahiye.',
+      'Shop ke saamne ki photo bhejiye — board/banner dikhna chahiye. (GPS camera wali photo ho to location alag se nahi poochenge.)',
+      'Shop ke saamne ki photo bhejiye — shop ka board ya banner dikhna chahiye. (GPS camera wali photo ho to location alag se nahi poochenge.)',
     ],
   },
   {
@@ -201,6 +252,48 @@ const FIELDS = [
       'Shop ki location bhej dijiye — attach (📎) → Location → Send your current location.',
     ],
   },
+  // THE CREDIT TERMS, asked only of an AGENT opening the account (founder,
+  // 26 Sep). A customer opening their own gets Rs 1,00,000 and 15 days; credit
+  // billing is always one invoice (commercialDefaults).
+  {
+    key: 'creditLimit',
+    req: true,
+    when: (form) => Boolean(form.byName),
+    ask: ['Credit limit for this customer (Rs)?', 'Is customer ka credit limit kitna rakhein (Rs)?'],
+    check: (v) => (Number(String(v).replace(/[^0-9.]/g, '')) > 0 ? null : 'Credit limit Rs mein bhejiye, jaise 50000.'),
+    clean: (v) => Math.round(Number(String(v).replace(/[^0-9.]/g, ''))),
+  },
+  {
+    key: 'collectionDays',
+    req: true,
+    when: (form) => Boolean(form.byName),
+    ask: ['Bill (collection) days — how many days to pay each bill? (1 to 30)', 'Bill (collection) days — har bill kitne din mein pay karna hai? (1 se 30)'],
+    check: (v) => {
+      const n = Number(String(v).replace(/[^0-9]/g, ''));
+      return n >= 1 && n <= 30 ? null : '1 se 30 ke beech din bhejiye (30 se zyada nahi).';
+    },
+    clean: (v) => Number(String(v).replace(/[^0-9]/g, '')),
+  },
+  // OPTIONAL: the owner's date of birth, and the bank account. The portal has
+  // no box for either, so both travel in remarks (dealerPortal.remarksWith)
+  // and are on the approver's summary.
+  {
+    key: 'dob',
+    req: false,
+    ask: ['Owner date of birth? (DD/MM/YYYY — optional, "skip" chalega)', 'Owner ki date of birth? (DD/MM/YYYY — optional, "skip" chalega)'],
+    check: (v) => (readDob(v) ? null : 'Date DD/MM/YYYY mein bhejiye, jaise 15/08/1985. Ya "skip".'),
+    clean: (v) => readDob(v),
+  },
+  {
+    key: 'bankDetails',
+    req: false,
+    ask: [
+      'Bank details? Account number, IFSC aur bank ka naam (optional, "skip" chalega)',
+      'Bank details? Account number, IFSC aur bank ka naam (optional, "skip" chalega)',
+    ],
+    check: (v) => (readBank(v) ? null : 'Account number ya IFSC nahi mila. Account number, IFSC aur bank ka naam bhejiye — ya "skip".'),
+    clean: (v) => readBank(v),
+  },
   { key: 'remarks', req: false, ask: ['Aur kuch batana hai? (optional)', 'Aur kuch batana hai? (optional)'] },
 ];
 
@@ -208,10 +301,26 @@ const FIELDS = [
 // they are filled from config so the request is complete when it reaches
 // them — an approver changing a number is a conversation, a customer
 // choosing one is not.
-function commercialDefaults() {
+// THE CREDIT TERMS (founder, 26 Sep).
+//   - Credit billing: always ONE invoice on credit — the portal's credit_days
+//     1, which its credit control reads as "ONE_DAY_OPEN_EXPOSURE": a second
+//     order waits until the first bill is paid.
+//   - A customer opening their own account: credit limit Rs 1,00,000 (never
+//     more) and collection days 15.
+//   - An agent opening one: the credit limit and the collection (bill) days
+//     the agent gave (form fields creditLimit / collectionDays, days 1-30);
+//     only if they are missing, the customer's defaults.
+const SELF_CREDIT_LIMIT = 100000;
+const SELF_COLLECTION_DAYS = 15;
+function commercialDefaults(form) {
+  const a = (form && form.answers) || {};
+  const byAgent = Boolean(form && form.byName);
+  const limit = byAgent && Number(a.creditLimit) > 0 ? Number(a.creditLimit) : SELF_CREDIT_LIMIT;
+  const days = byAgent && Number(a.collectionDays) >= 1 ? Math.min(30, Math.round(Number(a.collectionDays))) : SELF_COLLECTION_DAYS;
   return {
-    creditDays: config.creation.defaultCreditDays,
-    creditLimit: config.creation.defaultCreditLimit,
+    creditDays: 1,
+    creditLimit: byAgent ? limit : Math.min(limit, SELF_CREDIT_LIMIT),
+    collectionDays: days,
   };
 }
 
@@ -288,12 +397,17 @@ function fieldAt(i) {
 function start(chatId, phone, t, opts) {
   sweep();
   const filler = store.normPhone(phone);
-  const forSomeoneElse = Boolean(opts && opts.forSomeoneElse);
+  // A SALES-TEAM MEMBER IS ALWAYS OPENING IT FOR A CUSTOMER (founder, 25
+  // Sep): the account's number is the customer's, asked first, and never
+  // the agent's own — company SIMs saved as customer numbers is how the
+  // helper's 9999492550 came to be "Fixit Auto".
+  const isAgent = Boolean(config.creation.team[filler]) || require('./salesOrder').isSalesPerson(filler);
+  const forSomeoneElse = Boolean(opts && opts.forSomeoneElse) || isAgent;
   // A number on the creation team is a colleague filling this in; anyone
   // else is the customer registering themselves. Recorded because the
   // approver needs to know which they are reading — and because the portal
   // keeps it as the sales representative on the account.
-  const agent = config.creation.team[filler] || null;
+  const agent = config.creation.team[filler] || (isAgent ? 'Sales team ' + filler : null);
   const form = {
     at: Date.now(),
     chatId,
@@ -356,9 +470,75 @@ async function answer(chatId, m, text, t) {
     };
   }
 
+  // THE PHOTO AND THE PIN ARE REQUIRED (founder, 25 Sep). "Photo not
+  // available", "skip", "location nahi hai" is answered here — the form says
+  // it cannot go without them, and waits. Checked BEFORE notAnAnswer, which
+  // passes typed text at these steps on to the agent: that is how the form sat
+  // waiting for a photo while the agent told the customer it had gone for
+  // approval (25 Sep, live). A photo with a GPS fix answers the pin as well.
+  if ((field.type === 'photo' || field.type === 'location') && said && !(m && (m.mediaBase64 || m.location)) && (NOT_AVAILABLE.test(said) || SKIP.test(said))) {
+    store.log('create', `${chatId}: no ${field.type === 'photo' ? 'shop photo' : 'location'} offered ("${said.slice(0, 60)}") — it is required, asked again`);
+    return {
+      reply:
+        field.type === 'photo'
+          ? t(
+              'The shop photo is required — the account cannot be approved without it. Please send a photo of the shop front with the signboard visible. (Taken with a GPS camera app, it also gives us the location, so we will not ask for it separately.)',
+              'Shop ki photo zaroori hai — iske bina account approve nahi hota. Shop ke saamne ki photo bhejiye, board dikhna chahiye. (GPS camera wali photo ho to location alag se nahi maangenge.)',
+            )
+          : t(
+              'The shop location is required. From the shop: attach (📎) → Location → Send your current location.',
+              'Shop ki location zaroori hai. Shop pe hi: attach (📎) → Location → Send your current location bhejiye.',
+            ),
+      done: false,
+      form,
+    };
+  }
+
   if (notAnAnswer(field, m, said)) {
     store.log('create', `${chatId}: "${said.slice(0, 50) || '(' + ((m && m.mediaType) || 'media') + ')'}" is not an answer to ${field.key} - passed on, form waits`);
     return null;
+  }
+
+  // A PHOTOGRAPH INSTEAD OF A TYPED GSTIN.
+  //
+  // Read by vision, then treated exactly as if they had typed it: the shape
+  // is checked and the number goes to the GST register like any other. So a
+  // misread character ends in "not found" — a question back to them — and
+  // never in an account opened against the wrong firm.
+  //
+  // A photo that costs them one of their three tries would be unfair when it
+  // is our reading that failed, so a photo we could not read asks again
+  // without counting.
+  if (field.type === 'gst' && m && m.mediaBase64 && /^image\//.test(m.mediaMime || '')) {
+    const read = await require('../integrations/gst').readFromImage(m.mediaBase64, m.mediaMime);
+
+    // NO GSTIN IN IT? THEN IT WAS NEVER FOR THE FORM.
+    //
+    // 22 Sep, live: with the form open, a customer sent a photo of two parts
+    // and asked what they cost. A form that eats every photo answers nothing
+    // they asked and burns a try doing it. So the form claims a photo only
+    // when a GST number is actually in it; anything else is passed on exactly
+    // as before, and the form goes on waiting.
+    //
+    // This also covers the photo that simply could not be read — a failed
+    // vision call is indistinguishable from a picture of a gearbox, and
+    // guessing between them is how the wrong one gets claimed.
+    if (!read || read.error === 'none') {
+      store.log('create', `${chatId}: a photo at the GST step held no GST number - passed on, form waits`);
+      return null;
+    }
+    if (read.error === 'shape') {
+      return {
+        reply: t(
+          `I read "${read.saw}" from that photo, which is not a GST number. Send a clearer picture, or type it.`,
+          `Photo se "${read.saw}" padha, jo GST number nahi hai. Saaf photo bhejiye, ya type kar dijiye.`,
+        ),
+        done: false,
+        form,
+      };
+    }
+    store.log('create', `${chatId}: GSTIN ${read.gstin} read from a photo`);
+    return fillFromGst(form, read.gstin, t);
   }
 
   // "skip" on an optional field moves on; on a required one it does not.
@@ -530,6 +710,17 @@ async function answer(chatId, m, text, t) {
     // The first field, when an agent is opening this for someone else,
     // sets the account's OWN number — not a contact number.
     if (field.key === 'phoneFor') {
+      // The customer's number, not the one this is being typed from.
+      if (norm === form.phone) {
+        return {
+          reply: t(
+            "That is your own number — send the CUSTOMER's WhatsApp number (10 digits).",
+            'Ye aapka apna number hai — CUSTOMER ka WhatsApp number bhejiye (10 digit).',
+          ),
+          done: false,
+          form,
+        };
+      }
       const taken = await refuseIfTaken(form, 'phone', norm, t);
       if (taken) return taken;
       form.answers.phone = norm;
@@ -588,7 +779,7 @@ function escalate(form, why, t) {
   form.answers.requestId = 'WA-' + Date.now().toString(36).toUpperCase();
   form.answers.kind = 'gst-review';
   form.answers.gstProblem = why;
-  Object.assign(form.answers, commercialDefaults());
+  Object.assign(form.answers, commercialDefaults(form));
   open.delete(form.chatId);
   store.log('create', `${form.chatId}: GST not verified (${why}) — ${form.answers.requestId} to the Sales Heads`);
   return {
@@ -820,7 +1011,7 @@ function advance(form, t) {
     return { reply: t(next.ask[1], next.ask[1]), done: false, form };
   }
   // Every field is in. The commercial terms join it here, from config.
-  Object.assign(form.answers, commercialDefaults(), { kind: 'customer' });
+  Object.assign(form.answers, commercialDefaults(form), { kind: 'customer' });
   form.answers.requestId = 'WA-' + Date.now().toString(36).toUpperCase();
   open.set(form.chatId, form);
   store.log('create', `${form.chatId}: form complete — ${form.answers.name} (${form.answers.requestId})`);
@@ -840,7 +1031,7 @@ function reviewSummary(form, t) {
   }[a.gstProblem] || `registration is ${String(a.gstProblem || '').replace(/^status:/, '')}, not Active`;
   return [
     `*GST not verified* — ${a.requestId}`,
-    form.byName ? `Bheja: ${form.byName}` : `Customer: ${a.phone}`,
+    form.byName ? `Bheja: ${form.byName}` : form.forSomeoneElse ? `Bheja: ${form.phone} (kisi aur ke liye)` : `Customer: ${a.phone}`,
     '',
     `Problem: ${why}`,
     a.gstTried && a.gstTried.length ? `Tried: ${a.gstTried.join(', ')}` : null,
@@ -882,7 +1073,7 @@ function summary(form, t) {
   const line = (label, v) => (v === undefined || v === null || v === '' ? null : `${label}: ${v}`);
   return [
     `*New customer* — ${a.requestId}`,
-    form.byName ? `Bheja: ${form.byName}` : `Bheja: customer khud (${a.phone})`,
+    form.byName ? `Bheja: ${form.byName}` : form.forSomeoneElse ? `Bheja: ${form.phone} (kisi aur ke liye)` : `Bheja: customer khud (${a.phone})`,
     '',
     line('Firm', a.name),
     line('Business type', a.businessType),
@@ -894,12 +1085,20 @@ function summary(form, t) {
     line('Constitution', a.constitution),
     line('PAN', a.panNo),
     line('Email', a.email),
+    line('Owner DOB', a.dob),
+    line('Bank', a.bankDetails),
     '',
     line('Address', a.address),
     line('City', a.city),
     line('State', a.state),
     line('PIN', a.pin),
-    a.lat ? `Location: ${a.lat}, ${a.lng}` : null,
+    // HOME BRANCH, from the location (founder, 25 Sep): Rajasthan -> Mansarovar,
+    // anywhere else -> Bijwasan. The account is opened with it (dataEntryRequests.branchFor).
+    (() => {
+      const de = require('./dataEntryRequests');
+      return 'Home branch: ' + de.branchName(de.branchFor(a)) + ' (from location)';
+    })(),
+    a.lat ? `Location: ${a.lat}, ${a.lng}` : a.locationNote ? 'Location: ' + a.locationNote : null,
     '',
     a.bannerText ? 'Board reads: ' + a.bannerText : null,
     a.photoNote ? 'Photo: ' + a.photoNote : null,
@@ -910,8 +1109,9 @@ function summary(form, t) {
       : null,
     a.createdByName ? 'Opened by: ' + a.createdByName + (a.openedFor ? ' (for ' + a.openedFor + ')' : '') : null,
     '',
-    line('Credit days', a.creditDays),
-    line('Credit limit', a.creditLimit),
+    line('Credit limit', a.creditLimit != null ? 'Rs ' + Number(a.creditLimit).toLocaleString('en-IN') : null),
+    a.creditDays != null ? 'Credit billing: ' + (Number(a.creditDays) === 1 ? '1 invoice at a time' : a.creditDays + ' days') : null,
+    line('Collection days', a.collectionDays),
     line('Remarks', a.remarks),
     '',
     t(
@@ -929,7 +1129,9 @@ function summary(form, t) {
 
 // "OK WA-ABC123" / "NO WA-ABC123" from an approver.
 function readDecision(text) {
-  const m = String(text || '').trim().match(/^(ok|yes|haan|approve|no|nahi|reject)\s+((?:WA|DSC)-[A-Z0-9]+)$/i);
+  // Stripped of WhatsApp markup FIRST — the bot asks for the format in bold,
+  // and copying bold text brings the asterisks back with it. See core/waText.
+  const m = require('./waText').unformat(text).match(/^(ok|yes|haan|approve|no|nahi|reject)\s+((?:WA|DSC|ORD)-[A-Z0-9]+)$/i);
   if (!m) return null;
   return { yes: /^(ok|yes|haan|approve)$/i.test(m[1]), requestId: m[2].toUpperCase() };
 }
@@ -952,6 +1154,24 @@ function park(form) {
 function parked(requestId) {
   return awaiting.get(String(requestId || '').toUpperCase()) || null;
 }
+// HOW MANY TIMES THIS REQUEST HAS BEEN NUDGED.
+//
+// Counted here rather than mutated by the caller, because the parked request
+// lives in chatState and a bare mutation is only in memory until something
+// writes it — a restart would reset the count and the approver would be sent
+// the same bolded message a third time.
+//
+// Per REQUEST, not per person: two firms waiting on the same approver do not
+// share a grudge.
+function noteNudge(requestId) {
+  const id = String(requestId || '').toUpperCase();
+  const req = awaiting.get(id);
+  if (!req) return 0;
+  req.nudges = (req.nudges || 0) + 1;
+  awaiting.set(id, req); // write it through, so a restart does not forget
+  return req.nudges;
+}
+
 function unpark(requestId) {
   awaiting.delete(String(requestId || '').toUpperCase());
 }
@@ -1008,6 +1228,7 @@ module.exports = {
   approverName,
   park,
   parked,
+  noteNudge,
   unpark,
   addDiscount,
   noteSummary,
@@ -1015,5 +1236,5 @@ module.exports = {
   requestIdIn,
   saysAlreadyExists,
   FIELDS,
-  _internals: { GSTIN_RE, PAN_RE, PIN_RE, commercialDefaults, MAX_GST_TRIES },
+  _internals: { GSTIN_RE, PAN_RE, PIN_RE, commercialDefaults, MAX_GST_TRIES, notAnAnswer },
 };

@@ -32,6 +32,16 @@ function start({ bots, admin }) {
     schedule(config.dailyReportTime, () => admin.sendDailyReport(bots), 'daily admin report');
   }
 
+  // 6 pm: the CSV of the day to the Sales Heads (core/dailyApprovalReport).
+  if (bots && bots.customer && Object.keys(config.creation.approvers || {}).length && /^\d{1,2}:\d{2}$/.test(config.approvalReportTime)) {
+    schedule(config.approvalReportTime, () => require('./dailyApprovalReport').send(bots.customer), 'Sales Head CSV report');
+  }
+
+  // 10 am: warm payment reminders, two days before each collection date.
+  if (bots && bots.customer && /^\d{1,2}:\d{2}$/.test(config.reminderTime)) {
+    schedule(config.reminderTime, () => require('./collectionReminders').run(bots.customer), 'payment reminders');
+  }
+
   if (!config.enableExtraBots) return;
 
   // ---- parked roles ----

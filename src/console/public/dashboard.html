@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Cartrends Bot Dashboard</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --panel: #ffffff; --ink: #1b1f24; --muted: #667085; --line: #e4e7ec;
+    --accent: #1f5fbf; --ok: #127a3d; --ok-bg: #e5f5ec; --wait: #9a6200; --wait-bg: #fff4dc;
+    --bad: #b42318; --bad-bg: #fde8e6; --info: #1f5fbf; --info-bg: #e7efff; --row-hover: #f8fafc;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f1216; --panel: #171b21; --ink: #e8eaed; --muted: #98a2b3; --line: #2a3038;
+      --accent: #7aa7ff; --ok: #5fd08f; --ok-bg: #12301f; --wait: #f2c14e; --wait-bg: #33280f;
+      --bad: #ff8a80; --bad-bg: #3a1714; --info: #7aa7ff; --info-bg: #16233d; --row-hover: #1c2129;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; padding: 16px 20px; background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 2; }
+  h1 { font-size: 18px; margin: 0; }
+  .sub { color: var(--muted); font-size: 12px; }
+  main { padding: 16px 20px 40px; max-width: 1400px; margin: 0 auto; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+  .card .k { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  .card .v { font-size: 26px; font-weight: 650; margin-top: 2px; }
+  .card .d { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
+  .tabs { display: flex; gap: 4px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 4px; }
+  .tabs button, .chips button { border: 0; background: transparent; color: var(--ink); padding: 7px 12px; border-radius: 7px; cursor: pointer; font: inherit; }
+  .tabs button.on { background: var(--accent); color: #fff; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chips button { border: 1px solid var(--line); background: var(--panel); padding: 5px 10px; font-size: 12px; }
+  .chips button.on { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+  button.dl { border: 1px solid var(--accent); background: var(--panel); color: var(--accent); padding: 6px 12px; border-radius: 8px; cursor: pointer; font: inherit; font-size: 13px; font-weight: 600; }
+  button.dl:hover { background: var(--accent); color: #fff; }
+  input[type=search], input[type=password] { flex: 1; min-width: 200px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--ink); font: inherit; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; min-width: 860px; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: 12px; color: var(--muted); font-weight: 600; background: var(--panel); position: sticky; top: 0; }
+  tr.row { cursor: pointer; }
+  tr.row:hover td { background: var(--row-hover); }
+  tr.detail td { background: var(--row-hover); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 6px 18px; font-size: 13px; }
+  .grid div span { color: var(--muted); }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 99px; font-size: 12px; font-weight: 600; white-space: nowrap; }
+  .ok { color: var(--ok); background: var(--ok-bg); } .wait { color: var(--wait); background: var(--wait-bg); }
+  .bad { color: var(--bad); background: var(--bad-bg); } .info { color: var(--info); background: var(--info-bg); }
+  .muted { color: var(--muted); } .num { text-align: right; white-space: nowrap; }
+  .empty { padding: 30px; text-align: center; color: var(--muted); }
+  .login { max-width: 420px; margin: 80px auto; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 24px; }
+  .login button { margin-top: 10px; padding: 8px 14px; border: 0; border-radius: 8px; background: var(--accent); color: #fff; font: inherit; cursor: pointer; }
+  .err { color: var(--bad); margin-top: 8px; font-size: 13px; }
+  @media (max-width: 640px) { header, main { padding-left: 16px; padding-right: 16px; } }
+</style>
+</head>
+<body>
+<header>
+  <div><h1>Cartrends Bot Dashboard</h1><div class="sub" id="updated">—</div></div>
+  <div class="sub">Customers · Orders · Discounts · Payments — refreshes every minute</div>
+</header>
+<main id="app"></main>
+<script>
+(() => {
+  const app = document.getElementById('app');
+  let key = '';
+  try { key = localStorage.getItem('dashKey') || ''; } catch (_) {}
+  const q = new URLSearchParams(location.search).get('key');
+  if (q) { key = q; try { localStorage.setItem('dashKey', q); } catch (_) {} history.replaceState(null, '', location.pathname); }
+
+  let data = null, tab = 'customers', filter = 'all', search = '', open = new Set();
+  const esc = (v) => String(v == null ? '' : v).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
+  const when = (iso) => iso ? new Date(iso).toLocaleString('en-IN', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : '';
+  const rs = (v) => v || v === 0 ? '₹' + Number(v).toLocaleString('en-IN', { maximumFractionDigits: 2 }) : '';
+  const pill = (s) => {
+    const cls = /created|placed|approved|settled/.test(s) ? 'ok' : /reject|refused|not received/.test(s) ? 'bad' : /waiting|checking/.test(s) ? 'wait' : 'info';
+    return `<span class="pill ${cls}">${esc(s)}</span>`;
+  };
+
+  function loginView(msg) {
+    app.innerHTML = `<div class="login"><h2 style="margin-top:0">Dashboard key</h2>
+      <p class="muted">Enter the dashboard key (DASHBOARD_KEY on the server).</p>
+      <input type="password" id="k" placeholder="key" autofocus />
+      <button id="go">Open</button>${msg ? `<div class="err">${esc(msg)}</div>` : ''}</div>`;
+    const go = () => { key = document.getElementById('k').value.trim(); try { localStorage.setItem('dashKey', key); } catch (_) {} load(); };
+    document.getElementById('go').onclick = go;
+    document.getElementById('k').onkeydown = (e) => { if (e.key === 'Enter') go(); };
+  }
+
+  async function load() {
+    if (!key) return loginView();
+    try {
+      const r = await fetch('/api/dashboard?key=' + encodeURIComponent(key));
+      if (r.status === 401) { key = ''; try { localStorage.removeItem('dashKey'); } catch (_) {} return loginView('Wrong key.'); }
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || 'HTTP ' + r.status);
+      data = await r.json();
+      document.getElementById('updated').textContent = 'Updated ' + when(data.at);
+      render();
+    } catch (e) {
+      app.innerHTML = `<div class="empty">Could not load: ${esc(e.message)}</div>`;
+    }
+  }
+
+  const TABS = {
+    customers: {
+      label: 'Customers', statuses: ['created', 'waiting for approval', 'rejected'],
+      cols: ['Requested', 'Customer', 'WhatsApp', 'Status', 'Opened by', 'Approved / rejected by', 'Home branch'],
+      row: (c) => [when(c.requestedAt), `<b>${esc(c.customer || '—')}</b><div class="muted">${esc(c.id)}</div>`, esc(c.phone), pill(c.status), esc(c.openedBy), esc(c.approvedBy || c.rejectedBy || '—'), esc(c.homeBranch || '')],
+      detail: (c) => grid([
+        ['GSTIN', c.gst], ['Business type', c.businessType], ['Contact', c.contactPerson], ['Contact phone', c.contactPhone],
+        ['Email', c.email], ['Address', c.address], ['Home branch', c.homeBranch], ['Location', c.location],
+        ['Owner DOB', c.dob], ['Bank', c.bank], ['Portal login', c.portalLogin], ['Odoo partner', c.odooPartner],
+        ['Opened by', c.openedBy], ['Approved by', c.approvedBy], ['Rejected by', c.rejectedBy], ['Decided', when(c.decidedAt)], ['Note', c.note],
+      ]),
+    },
+    orders: {
+      label: 'Orders', statuses: ['placed', 'waiting for approval', 'waiting for payment', 'rejected', 'refused by portal'],
+      cols: ['When', 'Order', 'Customer', 'Placed by', 'Status', 'Approved / rejected by', 'Portal order', 'Amount'],
+      row: (o) => [when(o.at), esc(o.id), `<b>${esc(o.customer || '—')}</b>`, esc(o.placedBy), pill(o.status), esc(o.approvedBy || o.rejectedBy || '—'), esc(o.portalOrder || '—'), `<span class="num">${rs(o.amount)}</span>`],
+      detail: (o) => grid([['Parts', o.lines], ['Customer portal id', o.customerId], ['Payment hold', o.paymentHold], ['Note', o.note]]),
+    },
+    discounts: {
+      label: 'Discounts', statuses: ['approved', 'waiting for approval', 'rejected'],
+      cols: ['Requested', 'Request', 'Customer', 'Asked', 'Created by', 'Status', 'Approved / rejected by'],
+      row: (d) => [when(d.requestedAt), esc(d.id), `<b>${esc(d.customer || '—')}</b>`, esc(d.asked), esc(d.createdBy), pill(d.status), esc(d.approvedBy || d.rejectedBy || '—')],
+      detail: (d) => grid([['Result', d.result], ['Decided', when(d.decidedAt)]]),
+    },
+    payments: {
+      label: 'Payments', statuses: ['settled', 'checking', 'waiting for payment', 'not received'],
+      cols: ['When', 'Request', 'Customer', 'Due', 'Status', 'Checked by'],
+      row: (p) => [when(p.at), esc(p.id), `<b>${esc(p.customer || '—')}</b>`, `<span class="num">${rs(p.due)}</span>`, pill(p.status), esc(p.checkedBy || '—')],
+      detail: (p) => grid([['Detail', p.detail], ['Received', p.received]]),
+    },
+  };
+  function grid(pairs) {
+    return `<div class="grid">${pairs.filter(([, v]) => v !== null && v !== undefined && v !== '').map(([k, v]) => `<div><span>${esc(k)}:</span> ${esc(v)}</div>`).join('') || '<div class="muted">No more details.</div>'}</div>`;
+  }
+
+  function render() {
+    const s = data.summary;
+    const cards = `<div class="cards">
+      <div class="card"><div class="k">Customers</div><div class="v">${s.customers.created}</div><div class="d">created · ${s.customers.waiting} waiting · ${s.customers.rejected} rejected</div></div>
+      <div class="card"><div class="k">Orders placed</div><div class="v">${s.orders.placed}</div><div class="d">${rs(s.orders.value)} · ${s.orders.waiting} waiting · ${s.orders.rejected} rejected</div></div>
+      <div class="card"><div class="k">Discounts</div><div class="v">${s.discounts.approved}</div><div class="d">approved · ${s.discounts.waiting} waiting · ${s.discounts.rejected} rejected</div></div>
+      <div class="card"><div class="k">Payments</div><div class="v">${s.payments.settled}</div><div class="d">settled · ${s.payments.open} open</div></div>
+    </div>`;
+    const T = TABS[tab];
+    const list = data[tab].filter((x) => (filter === 'all' || x.status === filter) && (!search || JSON.stringify(x).toLowerCase().includes(search)));
+    const tabs = `<div class="tabs">${Object.entries(TABS).map(([k, v]) => `<button data-tab="${k}" class="${k === tab ? 'on' : ''}">${v.label} (${data[k].length})</button>`).join('')}</div>`;
+    const chips = `<div class="chips">${['all', ...T.statuses].map((st) => `<button data-f="${esc(st)}" class="${st === filter ? 'on' : ''}">${esc(st)}</button>`).join('')}</div>`;
+    const rows = list.map((x, i) => {
+      const id = tab + ':' + (x.id || i);
+      const main = `<tr class="row" data-id="${esc(id)}">${T.row(x).map((c) => `<td>${c}</td>`).join('')}</tr>`;
+      return open.has(id) ? main + `<tr class="detail"><td colspan="${T.cols.length}">${T.detail(x)}</td></tr>` : main;
+    }).join('');
+    app.innerHTML = cards +
+      `<div class="bar">${tabs}<input type="search" id="q" placeholder="Search name, phone, GSTIN, order, agent…" value="${esc(search)}" /></div>
+       <div class="bar">${chips}<span style="flex:1"></span>
+         <button class="dl" id="dl1" title="Every field of the rows shown below">⬇ Download CSV (${list.length})</button>
+         <button class="dl" id="dlAll" title="One CSV per tab, with the search applied">⬇ Download all</button></div>
+       <div class="panel">${list.length ? `<table><thead><tr>${T.cols.map((c) => `<th>${esc(c)}</th>`).join('')}</tr></thead><tbody>${rows}</tbody></table>` : '<div class="empty">Nothing here.</div>'}</div>
+       <p class="muted" style="font-size:12px">Click a row for every detail.</p>`;
+    app.querySelectorAll('[data-tab]').forEach((b) => (b.onclick = () => { tab = b.dataset.tab; filter = 'all'; render(); }));
+    app.querySelectorAll('[data-f]').forEach((b) => (b.onclick = () => { filter = b.dataset.f; render(); }));
+    app.querySelectorAll('tr.row').forEach((r) => (r.onclick = () => { const id = r.dataset.id; open.has(id) ? open.delete(id) : open.add(id); render(); }));
+    const qi = document.getElementById('q');
+    qi.oninput = () => { search = qi.value.trim().toLowerCase(); const pos = qi.selectionStart; render(); const n = document.getElementById('q'); n.focus(); n.setSelectionRange(pos, pos); };
+    document.getElementById('dl1').onclick = () => download(tab, list, filter);
+    document.getElementById('dlAll').onclick = () => {
+      Object.keys(TABS).forEach((k, i) =>
+        setTimeout(() => download(k, data[k].filter((x) => !search || JSON.stringify(x).toLowerCase().includes(search)), 'all'), i * 400),
+      );
+    };
+  }
+
+  // CSV DOWNLOAD — exactly the rows shown (tab, status filter, search), with
+  // every field, not only the columns on screen. A byte-order mark so Excel
+  // reads names and ₹ correctly.
+  const HEAD = {
+    id: 'Request / order', requestedAt: 'Requested', decidedAt: 'Decided', at: 'Date', status: 'Status', customer: 'Customer',
+    customerId: 'Customer portal id', phone: 'WhatsApp', gst: 'GSTIN', businessType: 'Business type', contactPerson: 'Contact person',
+    contactPhone: 'Contact phone', email: 'Email', address: 'Address', dob: 'Owner DOB', bank: 'Bank', location: 'Location',
+    homeBranch: 'Home branch', openedBy: 'Opened by', approvedBy: 'Approved by', rejectedBy: 'Rejected by', portalLogin: 'Portal login',
+    odooPartner: 'Odoo partner', note: 'Note', placedBy: 'Placed by', portalOrder: 'Portal order', lines: 'Parts', amount: 'Amount (Rs)',
+    paymentHold: 'Payment hold', asked: 'Asked', result: 'Result', createdBy: 'Created by', due: 'Due (Rs)', detail: 'Detail',
+    checkedBy: 'Checked by', received: 'Received',
+  };
+  const DATES = new Set(['requestedAt', 'decidedAt', 'at']);
+  function csvCell(v) {
+    const s = v === null || v === undefined ? '' : String(v);
+    return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  }
+  function download(which, rows, flt) {
+    const keys = [];
+    for (const r of rows) for (const k of Object.keys(r)) if (!keys.includes(k)) keys.push(k);
+    // Nothing to export still gives the headings, so the file is recognisable.
+    if (!keys.length) {
+      const EMPTY = {
+        customers: ['id', 'requestedAt', 'decidedAt', 'status', 'customer', 'phone', 'gst', 'openedBy', 'approvedBy', 'rejectedBy', 'homeBranch'],
+        orders: ['id', 'at', 'status', 'customer', 'placedBy', 'approvedBy', 'rejectedBy', 'portalOrder', 'lines', 'amount'],
+        discounts: ['id', 'requestedAt', 'decidedAt', 'status', 'customer', 'asked', 'result', 'createdBy', 'approvedBy', 'rejectedBy'],
+        payments: ['id', 'at', 'customer', 'due', 'detail', 'status', 'checkedBy', 'received'],
+      };
+      keys.push(...(EMPTY[which] || ['id']));
+    }
+    const fmt = (k, v) => (DATES.has(k) && v ? new Date(v).toLocaleString('en-IN', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : v);
+    const lines = [keys.map((k) => csvCell(HEAD[k] || k)).join(',')];
+    for (const r of rows) lines.push(keys.map((k) => csvCell(fmt(k, r[k]))).join(','));
+    const blob = new Blob(['﻿' + lines.join('\r\n') + '\r\n'], { type: 'text/csv;charset=utf-8' });
+    const day = new Date().toISOString().slice(0, 10);
+    const name = ['cartrends', which, flt && flt !== 'all' ? flt.replace(/\s+/g, '-') : null, search ? 'search-' + search.replace(/[^a-z0-9]+/gi, '-').slice(0, 20) : null, day].filter(Boolean).join('_') + '.csv';
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+  }
+
+  load();
+  setInterval(() => { if (key && data) load(); }, 60000);
+})();
+</script>
+</body>
+</html>

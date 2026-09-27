@@ -5,16 +5,17 @@
 # the compose file caps what it can take. See docker-compose.yml.
 #
 # NOT installed on purpose:
-#   * tesseract / OCR binaries — OCR is CPU-heavy and this host has none to
-#     spare. Photos go to Claude vision instead (ANTHROPIC_API_KEY), which
-#     costs a little money and no CPU.
+#   * any character recogniser — photos go to Gemini vision,
+#     which costs a little money and no CPU. The local reader that
+#     used to sit in front of it was Windows-only, never ran here, and has been
+#     taken out of the code as well.
 #   * puppeteer / chromium — only the old QR-linked-device transport needed
 #     those, and the bot runs on the Cloud API now.
 #
 # INSTALLED, and worth the disk:
-#   * python3 + pdfplumber / PyMuPDF — reading a PDF is parsing, not OCR. It
-#     costs milliseconds of CPU and is exact, where a picture of the same page
-#     is a guess.
+#   * python3 + pdfplumber / PyMuPDF — reading a PDF is parsing, not character
+#     recognition. It costs milliseconds of CPU and is exact, where a picture
+#     of the same page is a guess.
 #   * faster-whisper — tried and removed, measured rather than assumed. On this
 #     box the `small` model took 46 seconds on a 15-second clip and returned
 #     Devanagari: too slow to answer with, and not a shape the part parser can
@@ -24,8 +25,8 @@ FROM node:22-slim
 
 WORKDIR /app
 
-# Python and the PDF libraries. Reading a PDF is parsing, not OCR: milliseconds
-# of CPU, and exact where a picture of the same page is a guess. --no-cache-dir
+# Python and the PDF libraries. Reading a PDF is parsing: milliseconds of CPU,
+# and exact where a picture of the same page is a guess. --no-cache-dir
 # and the purge keep pip's download cache out of the layer.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends python3 python3-pip \
@@ -44,6 +45,10 @@ RUN npm install --omit=dev --no-audit --no-fund
 
 COPY src ./src
 COPY scripts ./scripts
+# The knowledge-base schema. Without it `npm run migrate` inside this image
+# finds no migrations and reports "already up to date" on an empty database,
+# which looks like success and is not.
+COPY migrations ./migrations
 
 # Orders, learned parts and the sale-loss log live here. Mounted as a volume by
 # compose — without that, every rebuild would wipe what the bot has learned.

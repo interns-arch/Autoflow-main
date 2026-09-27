@@ -76,6 +76,77 @@ async function main() {
     .warmGstIndex()
     .catch(() => {});
 
+  // The knowledge base, if one is configured. Reported at boot rather than
+  // discovered on the first customer question: "schema missing" is a five
+  // second fix when you read it at startup and a mystery when you read it in
+  // the middle of a busy line.
+  const kb = require('./core/kb');
+  if (!kb.enabled()) {
+    store.log('boot', 'knowledge base: OFF (no DATABASE_URL) — questions go to a person, as before');
+  } else {
+    kb.health()
+      .then((h) => {
+        store.log(
+          'boot',
+          h.ok
+            ? `knowledge base: ready, ${h.approved} approved answer(s)`
+            : 'knowledge base: NOT USABLE — ' + h.reason,
+        );
+        if (h.ok) return kb.backfillEmbeddings();
+        return 0;
+      })
+      .then((n) => {
+        if (n) store.log('kb', 'embedded ' + n + ' entry(ies) that had none');
+      })
+      .catch(() => {});
+    // Entries approved while the embedding service was unreachable would stay
+    // unsearchable forever otherwise. The phrases a person answered (core/
+    // parts/aliases) ride along: one taught while the embedding service was
+    // down is remembered but unrecallable, which looks exactly like the bug
+    // that table exists to fix — the same question going back to him twice.
+    const catchUp = () => {
+      kb.backfillEmbeddings().catch(() => {});
+      require('./core/parts').aliases.embedPending().catch(() => {});
+    };
+    setInterval(catchUp, 60 * 60 * 1000).unref();
+    // The phrase memory — the same database, its own table (migration 004), and
+    // its own line in the log because it can be missing on its own: new code on
+    // a server whose migration has not been run yet answers exactly as it did
+    // before, and this is the only place that says so out loud.
+    const partAliases = require('./core/parts').aliases;
+    partAliases
+      .health()
+      .then((h) => {
+        store.log(
+          'boot',
+          h.ok
+            ? `phrase memory: ready, ${h.remembered} phrase(s) a person taught (${h.embedded} searchable)`
+            : 'phrase memory: NOT USABLE — ' + h.reason + ' (the same questions will go to a person, as before)',
+        );
+        // What a person has ALREADY taught, brought across once: those phrases
+        // were answered at somebody's desk and are the last ones that should
+        // have to be asked again.
+        return h.ok ? partAliases.seedFromLearnedAliases() : 0;
+      })
+      .then((n) => {
+        if (n) store.log('boot', 'phrase memory: brought across ' + n + ' phrase(s) already learned');
+      })
+      .catch(() => {});
+  }
+
+  // THE AGENT'S CHECKPOINTER, set up before the first customer message rather
+  // than inside somebody's turn. It also matters at THIS moment and not later:
+  // a conversation paused waiting for the specialist is only resumable if the
+  // checkpointer that holds it is the durable one, and this is where that is
+  // decided. Never allowed to fail the boot — the deterministic bot is the
+  // whole bot and runs without any of this.
+  require('./agent')
+    .warmUp()
+    .then((on) => {
+      if (on) store.log('boot', 'agent: ready');
+    })
+    .catch((e) => store.log('boot', 'agent could not start: ' + String((e && e.message) || e).slice(0, 90)));
+
   store.log('boot', 'ready. Console: http://localhost:' + config.consolePort);
 }
 

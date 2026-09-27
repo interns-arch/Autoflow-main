@@ -46,9 +46,75 @@ function start(bots) {
   let warnedUnverifiable = false;
   let warnedNoAck = false;
 
+  // ONE QUEUE PER CHAT, NOT ONE FOR EVERYONE.
+  //
+  // 25 Sep, live: a salesman sent a photo per part — each read by vision and
+  // priced, ~10 s apiece — and every other customer waited behind all of them.
+  // "Bot not responding" was a customer's message sitting at the back of
+  // somebody else's photo queue. A chat's own messages still go strictly in
+  // order (a quantity must follow its part); different chats no longer wait
+  // for each other, and the poll keeps pulling while they are answered.
+  const chains = new Map(); // chat -> the promise its next message waits on
+  const inFlight = new Set(); // relay event ids taken and not yet finished
+
+  const chatOf = (evt) => {
+    try {
+      const v = evt.body.entry[0].changes[0].value;
+      const msg = (v.messages || [])[0];
+      if (msg && msg.from) return 'chat:' + msg.from;
+    } catch (_) {
+      /* not a message: a status, a template update */
+    }
+    return 'evt:' + (evt.id || Math.random()); // nothing to keep in order with
+  };
+
+  const ack = async (ids) => {
+    if (!ids.length) return;
+    try {
+      const res = await fetch(`${config.relay.url}/ack?${q}`, {
+        method: 'POST',
+        headers: { ...auth, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids }),
+        signal: AbortSignal.timeout(15000),
+      });
+      // An old relay has no /ack: it already deleted what it handed over.
+      if (!res.ok && !warnedNoAck) {
+        warnedNoAck = true;
+        store.log('relay', 'relay did not accept /ack (HTTP ' + res.status + ') - running without acknowledgements');
+      }
+    } catch (e) {
+      store.log('relay', 'ack failed: ' + String((e && e.message) || e).slice(0, 100) + ' - the relay will offer these again; duplicates are dropped by message id');
+    }
+  };
+
+  // One event, start to finish: handed to the transports, then acknowledged —
+  // or, after MAX_ATTEMPTS failures, let go.
+  const handle = async (evt) => {
+    let failed = false;
+    for (const t of cloudTransports) {
+      try {
+        await t.handleWebhook(evt.body);
+      } catch (e) {
+        failed = true;
+        store.log('relay', 'webhook handling failed: ' + String((e && e.message) || e).slice(0, 160));
+      }
+    }
+    if (!evt.id) return; // an old relay: nothing to acknowledge
+    if (!failed) {
+      attempts.delete(evt.id);
+      return ack([evt.id]);
+    }
+    const n = (attempts.get(evt.id) || 0) + 1;
+    attempts.set(evt.id, n);
+    if (n >= MAX_ATTEMPTS) {
+      store.log('relay', 'event ' + evt.id + ' failed ' + n + ' times - dropping it');
+      attempts.delete(evt.id);
+      return ack([evt.id]);
+    }
+  };
+
   setInterval(async () => {
-    // A batch with a photo in it takes longer than the poll interval. A second
-    // poll starting on top of it would be handed the same work.
+    // Only the PULL is guarded now: answering happens on the chats' own queues.
     if (busy) return;
     busy = true;
     try {
@@ -59,59 +125,35 @@ function start(bots) {
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const events = await res.json();
       failures = 0;
-      const done = [];
+      const rejected = [];
+      let taken = 0;
       for (const evt of events) {
+        // Still being answered, offered again because its lease ran out.
+        if (evt.id && inFlight.has(evt.id)) continue;
         const genuine = verify(evt);
         if (genuine === false) {
           store.log('relay', 'webhook REJECTED: signature does not match WA_APP_SECRET');
-          if (evt.id) done.push(evt.id);
+          if (evt.id) rejected.push(evt.id);
           continue;
         }
         if (genuine === null && !warnedUnverifiable) {
           warnedUnverifiable = true;
           store.log('relay', 'WA_APP_SECRET is set but the relay sends no raw body - signatures cannot be checked until Render runs the new relay');
         }
-        let failed = false;
-        for (const t of cloudTransports) {
-          try {
-            await t.handleWebhook(evt.body);
-          } catch (e) {
-            failed = true;
-            store.log('relay', 'webhook handling failed: ' + String((e && e.message) || e).slice(0, 160));
-          }
-        }
-        if (!evt.id) continue; // an old relay: nothing to acknowledge
-        if (!failed) {
-          done.push(evt.id);
-          attempts.delete(evt.id);
-        } else {
-          const n = (attempts.get(evt.id) || 0) + 1;
-          attempts.set(evt.id, n);
-          if (n >= MAX_ATTEMPTS) {
-            store.log('relay', 'event ' + evt.id + ' failed ' + n + ' times - dropping it');
-            done.push(evt.id);
-            attempts.delete(evt.id);
-          }
-        }
-      }
-      if (done.length) {
-        try {
-          const ack = await fetch(`${config.relay.url}/ack?${q}`, {
-            method: 'POST',
-            headers: { ...auth, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ ids: done }),
-            signal: AbortSignal.timeout(15000),
+        taken++;
+        if (evt.id) inFlight.add(evt.id);
+        const key = chatOf(evt);
+        const next = (chains.get(key) || Promise.resolve())
+          .then(() => handle(evt))
+          .catch((e) => store.log('relay', 'event failed: ' + String((e && e.message) || e).slice(0, 120)))
+          .finally(() => {
+            if (evt.id) inFlight.delete(evt.id);
+            if (chains.get(key) === next) chains.delete(key);
           });
-          // An old relay has no /ack: it already deleted what it handed over.
-          if (!ack.ok && !warnedNoAck) {
-            warnedNoAck = true;
-            store.log('relay', 'relay did not accept /ack (HTTP ' + ack.status + ') - running without acknowledgements');
-          }
-        } catch (e) {
-          store.log('relay', 'ack failed: ' + String((e && e.message) || e).slice(0, 100) + ' - the relay will offer these again; duplicates are dropped by message id');
-        }
+        chains.set(key, next);
       }
-      if (events.length) store.log('relay', `${events.length} webhook event(s) processed`);
+      await ack(rejected);
+      if (taken) store.log('relay', `${taken} webhook event(s) taken (${chains.size} chat queue(s) busy)`);
     } catch (e) {
       failures++;
       if (failures === 5 || failures % 100 === 0) {
