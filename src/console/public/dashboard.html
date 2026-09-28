@@ -86,9 +86,26 @@
   // only what happened in the range picked. The day a row belongs to is the
   // day it was asked for (customers, discounts) or placed (orders, payments).
   // Days are the viewer's own (India) days: from 00:00 to 23:59:59.
-  let range = 'all', fromDay = '', toDay = '';
-  try { const r = JSON.parse(localStorage.getItem('dashRange') || 'null'); if (r) ({ range, fromDay, toDay } = r); } catch (_) {}
-  const DAY_OF = { customers: 'requestedAt', discounts: 'requestedAt', orders: 'at', payments: 'at' };
+  // EACH TAB ITS OWN RANGE (founder, 28 Sep: "filter of date on each tab …
+  // to know how many customers were created / how many discounts approved on
+  // that date"), and its own date to count by: a customer counts on the day it
+  // was CREATED (decided), a discount on the day it was APPROVED - or, picked,
+  // the day either was asked for.
+  const DATE_BY = {
+    customers: [['decidedAt', 'Created / decided'], ['requestedAt', 'Requested']],
+    discounts: [['decidedAt', 'Approved / decided'], ['requestedAt', 'Requested']],
+    orders: [['at', 'Placed']],
+    payments: [['at', 'Date']],
+  };
+  const blankRange = (which) => ({ range: 'all', from: '', to: '', by: DATE_BY[which][0][0] });
+  let ranges = { customers: blankRange('customers'), orders: blankRange('orders'), discounts: blankRange('discounts'), payments: blankRange('payments') };
+  try {
+    const saved = JSON.parse(localStorage.getItem('dashRanges') || 'null');
+    if (saved) for (const k of Object.keys(ranges)) if (saved[k]) ranges[k] = { ...ranges[k], ...saved[k] };
+  } catch (_) {}
+  // Tab-scoped: `range`, `fromDay`, `toDay` below always mean the tab being read.
+  let range = 'all', fromDay = '', toDay = '', byField = 'requestedAt';
+  const useTab = (which) => { const r = ranges[which]; range = r.range; fromDay = r.from; toDay = r.to; byField = r.by; };
   const ymd = (d) => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
   function bounds() {
     const now = new Date();
@@ -110,15 +127,33 @@
       default: return [null, null];
     }
   }
+  // The date a row counts on, for the tab's "count by" choice. A request not
+  // decided yet has no decided date: by that choice it is in no day's count.
+  const dayOfRow = (x) => x[byField] || null;
   function inRange(which, x) {
+    useTab(which);
     if (range === 'all') return true;
     const [f, t] = bounds();
-    const v = x[DAY_OF[which]];
+    const v = dayOfRow(x);
     if (!v) return false;
     const ms = new Date(v).getTime();
     return (!f || ms >= +f) && (!t || ms < +t);
   }
   const rowsOf = (which) => (data[which] || []).filter((x) => inRange(which, x));
+  // Day by day, for the range picked: how many of each status on each date.
+  function byDay(which, list) {
+    useTab(which);
+    const days = new Map();
+    for (const x of list) {
+      const v = dayOfRow(x);
+      if (!v) continue;
+      const k = ymd(new Date(v));
+      if (!days.has(k)) days.set(k, {});
+      const d = days.get(k);
+      d[x.status] = (d[x.status] || 0) + 1;
+    }
+    return [...days.entries()].sort((a, b) => b[0].localeCompare(a[0]));
+  }
   function rangeLabel() {
     if (range === 'all') return 'All time';
     const [f, t] = bounds();
@@ -138,7 +173,10 @@
       payments: { settled: n(p, 'settled'), open: p.length - n(p, 'settled') },
     };
   }
-  const saveRange = () => { try { localStorage.setItem('dashRange', JSON.stringify({ range, fromDay, toDay })); } catch (_) {} };
+  const saveRange = () => {
+    ranges[tab] = { range, from: fromDay, to: toDay, by: byField };
+    try { localStorage.setItem('dashRanges', JSON.stringify(ranges)); } catch (_) {}
+  };
   const esc = (v) => String(v == null ? '' : v).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
   const when = (iso) => iso ? new Date(iso).toLocaleString('en-IN', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : '';
   const rs = (v) => v || v === 0 ? '₹' + Number(v).toLocaleString('en-IN', { maximumFractionDigits: 2 }) : '';
@@ -224,21 +262,35 @@
 
   function render() {
     const s = summaryOf();
+    // Each card counts over ITS tab's range, and says which.
+    const lbl = (which) => { useTab(which); return `<div class="d" style="margin-top:6px"><span class="pill info" style="padding:0 6px">${esc(rangeLabel())}${range === 'all' ? '' : ' · by ' + esc((DATE_BY[which].find(([f]) => f === byField) || [, ''])[1].toLowerCase())}</span></div>`; };
     const cards = `<div class="cards">
-      <div class="card"><div class="k">Customers</div><div class="v">${s.customers.created}</div><div class="d">created · ${s.customers.waiting} waiting · ${s.customers.rejected} rejected</div></div>
-      <div class="card"><div class="k">Orders placed</div><div class="v">${s.orders.placed}</div><div class="d">${rs(s.orders.value)} · ${s.orders.waiting} waiting · ${s.orders.rejected} rejected${s.orders.refused ? ` · <span class="pill bad" style="padding:0 6px">${s.orders.refused} refused by portal</span>` : ' · 0 refused by portal'}${s.orders.cancelled ? ` · <span class="pill bad" style="padding:0 6px">${s.orders.cancelled} cancelled on portal</span>` : ' · 0 cancelled on portal'}</div></div>
-      <div class="card"><div class="k">Discounts</div><div class="v">${s.discounts.approved}</div><div class="d">approved · ${s.discounts.waiting} waiting · ${s.discounts.rejected} rejected</div></div>
-      <div class="card"><div class="k">Payments</div><div class="v">${s.payments.settled}</div><div class="d">settled · ${s.payments.open} open</div></div>
+      <div class="card"><div class="k">Customers</div><div class="v">${s.customers.created}</div><div class="d">created · ${s.customers.waiting} waiting · ${s.customers.rejected} rejected</div>${lbl('customers')}</div>
+      <div class="card"><div class="k">Orders placed</div><div class="v">${s.orders.placed}</div><div class="d">${rs(s.orders.value)} · ${s.orders.waiting} waiting · ${s.orders.rejected} rejected${s.orders.refused ? ` · <span class="pill bad" style="padding:0 6px">${s.orders.refused} refused by portal</span>` : ' · 0 refused by portal'}${s.orders.cancelled ? ` · <span class="pill bad" style="padding:0 6px">${s.orders.cancelled} cancelled on portal</span>` : ' · 0 cancelled on portal'}</div>${lbl('orders')}</div>
+      <div class="card"><div class="k">Discounts</div><div class="v">${s.discounts.approved}</div><div class="d">approved · ${s.discounts.waiting} waiting · ${s.discounts.rejected} rejected</div>${lbl('discounts')}</div>
+      <div class="card"><div class="k">Payments</div><div class="v">${s.payments.settled}</div><div class="d">settled · ${s.payments.open} open</div>${lbl('payments')}</div>
     </div>`;
     const T = TABS[tab];
-    const list = rowsOf(tab).filter((x) => (filter === 'all' || x.status === filter) && (!search || JSON.stringify(x).toLowerCase().includes(search)));
     const tabs = `<div class="tabs">${Object.entries(TABS).map(([k, v]) => `<button data-tab="${k}" class="${k === tab ? 'on' : ''}">${v.label} (${rowsOf(k).length})</button>`).join('')}</div>`;
+    const inTab = rowsOf(tab); // leaves this tab's range in force below
+    const list = inTab.filter((x) => (filter === 'all' || x.status === filter) && (!search || JSON.stringify(x).toLowerCase().includes(search)));
+    useTab(tab);
     const PRESETS = [['all', 'All time'], ['today', 'Today'], ['yesterday', 'Yesterday'], ['7d', 'Last 7 days'], ['30d', 'Last 30 days'], ['month', 'This month'], ['lastmonth', 'Last month'], ['custom', 'Custom']];
-    const dates = `<div class="bar datebar"><span class="muted" style="font-size:12px">Date</span>
+    const byChoices = DATE_BY[tab];
+    const dates = `<div class="bar datebar"><span class="muted" style="font-size:12px"><b>${esc(T.label)}</b> — date</span>
       <select id="rng">${PRESETS.map(([v, l]) => `<option value="${v}"${v === range ? ' selected' : ''}>${l}</option>`).join('')}</select>
       <label class="muted" style="font-size:12px">From <input type="date" id="dFrom" value="${esc(fromDay)}"${range === 'custom' ? '' : ' disabled'} /></label>
       <label class="muted" style="font-size:12px">To <input type="date" id="dTo" value="${esc(toDay)}"${range === 'custom' ? '' : ' disabled'} /></label>
+      ${byChoices.length > 1 ? `<label class="muted" style="font-size:12px">Count by <select id="byF">${byChoices.map(([f, l]) => `<option value="${f}"${f === byField ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select></label>` : ''}
       <span class="pill info">${esc(rangeLabel())}</span></div>`;
+    // DAY BY DAY, for a picked range: each date, and how many of each status.
+    const days = range === 'all' ? [] : byDay(tab, list);
+    const dayNames = [...new Set(days.flatMap(([, c]) => Object.keys(c)))];
+    const perDay = days.length
+      ? `<div class="panel" style="margin-bottom:12px"><table style="min-width:0"><thead><tr><th>Date</th>${dayNames.map((n) => `<th class="num">${esc(n)}</th>`).join('')}<th class="num">Total</th></tr></thead><tbody>${days
+          .map(([d, c]) => `<tr><td>${esc(new Date(d + 'T00:00:00').toLocaleDateString('en-IN', { weekday: 'short', day: '2-digit', month: 'short', year: 'numeric' }))}</td>${dayNames.map((n) => `<td class="num">${c[n] ? `<b>${c[n]}</b>` : '<span class="muted">0</span>'}</td>`).join('')}<td class="num"><b>${Object.values(c).reduce((a, b) => a + b, 0)}</b></td></tr>`)
+          .join('')}</tbody></table></div>`
+      : range === 'all' ? '' : '<div class="panel" style="margin-bottom:12px"><div class="empty">Nothing on these dates' + (byChoices.length > 1 && byField === 'decidedAt' ? ' (counted by the day it was decided)' : '') + '.</div></div>';
     const chips = `<div class="chips">${['all', ...T.statuses].map((st) => `<button data-f="${esc(st)}" class="${st === filter ? 'on' : ''}">${esc(st)}</button>`).join('')}</div>`;
     const rows = list.map((x, i) => {
       const id = tab + ':' + (x.id || i);
@@ -248,8 +300,9 @@
     // Where the portal did not answer, say so: those rows show the bot's record only.
     const down = Object.entries(data.sources || {}).filter(([, v]) => v !== 'ok');
     const warn = down.length ? `<div class="panel" style="padding:10px 14px;margin-bottom:12px;border-color:var(--wait)"><span class="pill wait">Portal</span> ${down.map(([k, v]) => `${esc(k)}: ${esc(v)}`).join(' · ')} — showing the bot's own record for these.</div>` : '';
-    app.innerHTML = warn + dates + cards +
+    app.innerHTML = warn + cards +
       `<div class="bar">${tabs}<input type="search" id="q" placeholder="Search name, phone, GSTIN, order, agent…" value="${esc(search)}" /></div>
+       ${dates}${perDay}
        <div class="bar">${chips}<span style="flex:1"></span>
          <button class="dl" id="dl1" title="Every field of the rows shown below">⬇ Download CSV (${list.length})</button>
          <button class="dl" id="dlAll" title="One CSV per tab, with the search applied">⬇ Download all</button></div>
@@ -268,12 +321,14 @@
     const setDay = (which) => (e) => { if (which === 'from') fromDay = e.target.value; else toDay = e.target.value; range = 'custom'; saveRange(); render(); };
     document.getElementById('dFrom').onchange = setDay('from');
     document.getElementById('dTo').onchange = setDay('to');
+    const byF = document.getElementById('byF');
+    if (byF) byF.onchange = () => { byField = byF.value; saveRange(); render(); };
     const qi = document.getElementById('q');
     qi.oninput = () => { search = qi.value.trim().toLowerCase(); const pos = qi.selectionStart; render(); const n = document.getElementById('q'); n.focus(); n.setSelectionRange(pos, pos); };
     document.getElementById('dl1').onclick = () => download(tab, list, filter);
     document.getElementById('dlAll').onclick = () => {
       Object.keys(TABS).forEach((k, i) =>
-        setTimeout(() => download(k, rowsOf(k).filter((x) => !search || JSON.stringify(x).toLowerCase().includes(search)), 'all'), i * 400),
+        setTimeout(() => download(k, rowsOf(k).filter((x) => !search || JSON.stringify(x).toLowerCase().includes(search)), 'all', k), i * 400),
       );
     };
   }
@@ -325,6 +380,7 @@
     const blob = new Blob(['﻿' + lines.join('\r\n') + '\r\n'], { type: 'text/csv;charset=utf-8' });
     const day = new Date().toISOString().slice(0, 10);
     // The date range in the file name, so a download says which days it holds.
+    useTab(which); // this file's own tab range, for its name
     const [bf, bt] = bounds();
     const span = range === 'all' ? null : (bf ? ymd(bf) : 'start') + '-to-' + (bt ? ymd(new Date(+bt - 1)) : day);
     const name = ['cartrends', which, flt && flt !== 'all' ? flt.replace(/\s+/g, '-') : null, span, search ? 'search-' + search.replace(/[^a-z0-9]+/gi, '-').slice(0, 20) : null, day].filter(Boolean).join('_') + '.csv';

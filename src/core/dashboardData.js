@@ -308,6 +308,9 @@ async function portalDiscounts(list) {
     // The portal decides now: a Sales Head's "OK" on WhatsApp was never
     // approval there.
     d.status = status(r);
+    // Decided on the portal: its last update is when the Super Admin said
+    // yes or no - the date a "discounts approved on 28 Sep" count reads.
+    if (r && !d.decidedAt && /approved|rejected|expired/.test(d.status)) d.decidedAt = r.updated_at || null;
   }
   // Customer rules on the portal the bot did not ask for (typed on the
   // portal, or before the bot kept a log): one row each.
@@ -318,7 +321,7 @@ async function portalDiscounts(list) {
       id: 'RULE-' + id,
       ruleId: id,
       requestedAt: r.created_at || null,
-      decidedAt: r.updated_at || null,
+      decidedAt: /^(APPROVED|REJECTED)$/i.test(String(r.approval_status || '')) ? r.updated_at || null : null,
       status: status(r),
       customer: String(r.rule_name || '').replace(/\s+\S+\s+-?[\d.]+%?$/, '').trim() || null,
       asked: facts(r).on + ' ' + (facts(r).value || ''),
