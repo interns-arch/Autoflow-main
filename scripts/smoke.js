@@ -6098,6 +6098,41 @@ async function main() {
         so74._resetDirectory();
       }
 
+      // 28 Sep, live (7355374975): invoices of a customer, then "ledger" -
+      // and the bot asked for the mobile number again.
+      console.log('\n[74b] a ledger right after an invoice is for the same customer');
+      config.salesTeamNumbers.push(S74);
+      try {
+        so74._resetDirectory();
+        // The mock has two accounts on this number: the desk picks Kalra.
+        const which74 = await say74('9811122233 ka invoice');
+        const kalra74 = (which74.match(/(\d)\. Kalra Motors/) || [])[1] || '2';
+        const inv74 = await say74(kalra74);
+        check('the invoice is looked up for Kalra Motors', /Kalra Motors/.test(inv74), which74 + ' || ' + inv74);
+        const led74 = await say74('ledger');
+        check('"ledger" next is Kalra Motors\' ledger - not "whose ledger?"', /Kalra Motors/.test(led74) && !/Whose ledger|Kiska ledger|mobile number/i.test(led74), led74);
+        const inv74b = await say74('invoice bhejo');
+        check('...and "invoice bhejo" after that is theirs too', /Kalra Motors/.test(inv74b) && !/Whose invoice|Kiska invoice/i.test(inv74b), inv74b);
+        so74._resetDirectory();
+        const cold74 = await say74('ledger');
+        check('with nobody asked about, "ledger" still asks whose', /Whose ledger|Kiska ledger/i.test(cold74), cold74);
+        // Same day, same number: "9122781913. Is customer ke liye".
+        const k74 = (x) => JSON.stringify(so74.readCustomerKey(x));
+        check('"9811122233. Is customer ke liye" names the customer', k74('9811122233. Is customer ke liye') === JSON.stringify({ phone: '919811122233' }));
+        check('..."9811122233 ke liye" and "9811122233 for this customer" too', k74('9811122233 ke liye') === k74('9811122233') && k74('9811122233 for this customer') === k74('9811122233'));
+        check('..."9811122233 ka ledger" is not just a number', so74.readCustomerKey('9811122233 ka ledger') === null);
+        // "Kiska invoice?" left open, then an order: the number is the order's.
+        so74._resetDirectory();
+        await say74('invoice dedo');
+        so74.holdItems(C74, [{ partNo: '16510M68K00', qty: 1 }]);
+        so74.orderAsked(C74);
+        const ord74 = await say74('9811122233');
+        check('after the desk moved on to an order, the number is not taken as the invoice ask', !/latest invoices|linked to Odoo|invoice/i.test(ord74), ord74);
+      } finally {
+        config.salesTeamNumbers.splice(config.salesTeamNumbers.indexOf(S74), 1);
+        so74._resetDirectory();
+      }
+
       // 26 Sep, live: Houseneed (ACCOUNT 227) had its discount rule written to
       // DEALER 227 - Dhakad Car Decor. Houseneed's dealer is 3340.
       console.log('\n[75] discount rules go to the customer\'s DEALER id, never its account id');

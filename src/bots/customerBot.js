@@ -4729,6 +4729,7 @@ class CustomerBot {
       // Answered, the parts become that customer's draft.
       if (salesOrder.isSalesPerson(m.from) && !(config.inquiryOnlyNumbers || []).includes(store.normPhone(m.from))) {
         salesOrder.holdItems(m.chatId, usable);
+        salesOrder.orderAsked(m.chatId);
         const n = salesOrder.heldCount(m.chatId);
         const ask = t(
           `To order ${n > 1 ? 'these ' + n + ' parts' : 'this'}, which customer is it for? Send the customer's ${salesOrder.mobileOnly() ? '10-digit mobile number' : 'phone number or GST number'}.`,

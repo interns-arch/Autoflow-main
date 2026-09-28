@@ -173,7 +173,14 @@ async function findCustomers(query) {
 // -> { phone } | { gst } | null. Only when the message IS that — a part
 // number with digits in it is not a phone number.
 const GSTIN_IN = /^(?:gst(?:in)?(?:\s*(?:no|number))?\s*[:\-]?\s*)?([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9A-Z]Z[0-9A-Z])$/i;
-const PHONE_IN = /^(?:(?:customer|cust|party|mobile|mob|phone|number|no)\.?\s*(?:no\.?|number)?\s*[:\-]?\s*)?(?:\+?91[\s-]?)?([6-9]\d{4}[\s-]?\d{5})$/i;
+// ...and the same number followed by only "this customer's": "9122781913. Is
+// customer ke liye", "9122781913 ke liye", "9122781913 for this customer"
+// (28 Sep, live: that was answered "Theek hai sir" and the customer dropped).
+const PHONE_TAIL = String.raw`(?:[\s.,:\-]*(?:for\s+)?(?:(?:is|iss|es|this|us|ye|yeh)\s+)?(?:customer|cust|party|client)?\s*(?:ke\s+liye|ke\s+lie|ke\s+liya|for)?)?[\s.!]*`;
+const PHONE_IN = new RegExp(
+  String.raw`^(?:(?:customer|cust|party|mobile|mob|phone|number|no)\.?\s*(?:no\.?|number)?\s*[:\-]?\s*)?(?:\+?91[\s-]?)?([6-9]\d{4}[\s-]?\d{5})` + PHONE_TAIL + '$',
+  'i',
+);
 // MOBILE NUMBER ONLY (founder, 26 Sep): "make customer search using only
 // mobile no. not gst or name". Names and GSTINs are not searched; the agent
 // is asked for the mobile number instead. CUSTOMER_SEARCH_BY=any brings the
@@ -911,8 +918,31 @@ async function invoicesFor(bot, m, row, reply, t) {
   );
 }
 
+// THE CUSTOMER THE DESK IS ASKING ABOUT. 28 Sep, live (7355374975): invoices
+// of a customer, then "ledger" - and the bot asked for the mobile number
+// again. The customer lived only in the invoice pick-list session, which the
+// ledger path does not read and which is cleared the moment an invoice is
+// picked. Kept here, apart from any session, so a follow-up that names nobody
+// ("ledger", "invoice bhejo", "iska khata") is about the same customer.
+const lookedUp = chatState.slot('sales.lookedUp'); // chatId -> { row, at }
+const LOOKED_UP_TTL_MS = 30 * 60 * 1000;
+function rememberLookedUp(chatId, row) {
+  if (!chatId || !row || !row.name) return;
+  lookedUp.set(chatId, { row: { ...row }, at: Date.now() });
+}
+function lastLookedUp(chatId) {
+  const l = lookedUp.get(chatId);
+  if (!l) return null;
+  if (Date.now() - l.at > LOOKED_UP_TTL_MS) {
+    lookedUp.delete(chatId);
+    return null;
+  }
+  return l.row;
+}
+
 // What an agent asked for, once the customer is known.
 async function deliverFor(bot, m, row, intent, reply, t) {
+  rememberLookedUp(m.chatId, row);
   if (intent === 'invoice') return invoicesFor(bot, m, row, reply, t);
   await reply(t('Sending the ledger of ' + row.name + '…', row.name + ' ka ledger bhej raha hoon…'));
   if (!(await sendLedgerPdf(bot, m, row, t))) return reply(await lookup.answer(row, 'ledger', t).catch(() => t('The ledger could not be made right now.', 'Ledger abhi nahi ban paya.')));
@@ -922,6 +952,7 @@ async function deliverFor(bot, m, row, intent, reply, t) {
 async function answerAbout(bot, m, row, about, reply, t) {
   const portal = require('../integrations/dealerPortal');
   store.log('sales', m.from + ' asked about ' + row.name + ' (' + about.intent + (about.part ? ' ' + about.part : '') + ')');
+  rememberLookedUp(m.chatId, row);
   if (about.intent === 'ledger') {
     await reply(await lookup.answer(row, about.intent, t));
     await sendLedgerPdf(bot, m, row, t);
@@ -1107,6 +1138,17 @@ function activeCustomer(chatId) {
 }
 function clear(chatId) {
   sessions.delete(chatId);
+}
+// THE DESK MOVED ON TO AN ORDER. A "Kiska invoice?" still waiting must not
+// take the number meant for the order. 28 Sep, live (7355374975): "Invoice
+// dedo" -> "Kiska invoice?", then an order, "which customer is it for?",
+// 9582314722 - and Lucky Auto Spare Parts' invoices came back, no order.
+function orderAsked(chatId) {
+  const s = sessions.get(chatId);
+  if (s && s.stage === 'askCustomer' && (s.intent === 'ledger' || s.intent === 'invoice')) {
+    sessions.set(chatId, { stage: 'askCustomer', items: s.items || null, at: Date.now() });
+    store.log('sales', `${chatId}: the "whose ${s.intent}?" question is dropped - the desk is ordering now`);
+  }
 }
 
 // "2" -> index 1; "haan" -> 0 when there is only one; "nahi" -> 'no'.
@@ -1536,13 +1578,20 @@ async function handle(bot, m, text, reply, t) {
       }
     }
     if (!k && !rows.length) {
+      // Nobody named: the customer in front of the desk right now - a list
+      // of one, the invoices just listed, the one being ordered for, or the
+      // one last asked about.
       const shown = s && s.stage === 'choose' && s.candidates && s.candidates.length === 1 ? s.candidates[0] : null;
-      const active = !shown && activeCustomer(m.chatId);
+      const picking = !shown && s && s.stage === 'pickInvoice' && s.customer ? s.customer : null;
+      const active = !shown && !picking && activeCustomer(m.chatId);
+      const asked = !shown && !picking && !active && lastLookedUp(m.chatId);
       if (shown) rows = [shown];
+      else if (picking) rows = [picking];
       else if (active) rows = [{ ...(active.raw || {}), id: active.buyerId, name: active.name }];
+      else if (asked) rows = [asked];
     }
     if (rows.length === 1) {
-      if (s && s.stage === 'choose') clear(m.chatId);
+      if (s && (s.stage === 'choose' || s.stage === 'pickInvoice')) clear(m.chatId);
       return deliverFor(bot, m, rows[0], want, reply, t);
     }
     if (rows.length > 1) {
@@ -1700,6 +1749,7 @@ async function handle(bot, m, text, reply, t) {
         clear(m.chatId);
         if (about) return about.many ? answerAboutMany(bot, m, row, about, reply, t) : answerAbout(bot, m, row, about, reply, t);
         store.log('sales', m.from + ' asked about ' + row.name + ' (' + s.intent + ')');
+        rememberLookedUp(m.chatId, row);
         await reply(await lookup.answer(row, s.intent, t));
         if (s.intent === 'ledger') await sendLedgerPdf(bot, m, row, t);
         return true;
@@ -1769,6 +1819,7 @@ async function handle(bot, m, text, reply, t) {
             ? answerAboutMany(bot, m, row, { ...entry.about, customer: row.name }, reply, t)
             : answerAbout(bot, m, row, { ...entry.about, customer: row.name }, reply, t);
         }
+        rememberLookedUp(m.chatId, row);
         return reply(await lookup.answer(row, entry.intent, t));
       }
     }
@@ -1792,6 +1843,7 @@ async function handle(bot, m, text, reply, t) {
           ? answerAboutMany(bot, m, row, { ...ll.about, customer: row.name }, reply, t)
           : answerAbout(bot, m, row, { ...ll.about, customer: row.name }, reply, t);
       }
+      rememberLookedUp(m.chatId, row);
       return reply(await lookup.answer(row, ll.intent, t));
     }
     lastLists.delete(m.chatId);
@@ -2155,9 +2207,11 @@ function _resetDirectory() {
   sessions.clear();
   discussingMap.clear();
   lastLists.clear();
+  lookedUp.clear();
 }
 
 module.exports = {
+  orderAsked,
   customerCard,
   readCustomerKey,
   mobileOnly,
