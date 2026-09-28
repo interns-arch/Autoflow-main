@@ -997,9 +997,13 @@ function partsAfterKey(text, key) {
 async function deliverFor(bot, m, row, intent, reply, t) {
   rememberLookedUp(m.chatId, row);
   if (intent === 'invoice') return invoicesFor(bot, m, row, reply, t);
-  await reply(t('Sending the ledger of ' + row.name + '…', row.name + ' ka ledger bhej raha hoon…'));
-  if (!(await sendLedgerPdf(bot, m, row, t))) return reply(await lookup.answer(row, 'ledger', t).catch(() => t('The ledger could not be made right now.', 'Ledger abhi nahi ban paya.')));
-  return true;
+  // The PDF first, and only then a word about it: "Sending the ledger…" said
+  // before a PDF that then could not be made told them one was on its way.
+  if (await sendLedgerPdf(bot, m, row, t)) return true;
+  return reply(
+    t('The ledger PDF of ' + row.name + ' could not be made right now — here is the summary:\n', row.name + ' ka ledger PDF abhi nahi ban paya — summary ye hai:\n') +
+      (await lookup.answer(row, 'ledger', t).catch(() => t('The ledger could not be read right now.', 'Ledger abhi nahi mil paya.'))),
+  );
 }
 
 async function answerAbout(bot, m, row, about, reply, t) {

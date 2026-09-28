@@ -21,6 +21,7 @@ const knowledge = require('../core/knowledge');
 const inquiries = require('../core/inquiries');
 const customers = require('../core/customers');
 const agent = require('../agent');
+const staffAgent = require('../agent/staff');
 const incoming = require('../agent/incoming');
 const customerCreate = require('../core/customerCreate');
 const portal = require('../integrations/dealerPortal');
@@ -393,9 +394,16 @@ class CustomerBot {
     // not a Cartrends person talking in a group (pipeline/route).
     if (!route.forBot(m)) return false;
 
+    // m._desk: the STAFF AGENT (agent/staff) driving the desk. The message is
+    // its instruction, not the staff member's words: nothing about it is
+    // recorded, no typing is shown, the chat's language is not re-read from
+    // it, and every reply goes to m._capture for the agent to read instead of
+    // to WhatsApp.
+    const viaAgent = Boolean(m._desk);
+
     // They wrote, so their 24h window is open: an approval sent to them in
     // the next day goes as plain text, with no template in front of it.
-    if (!m.isGroup) escalation.noteInbound(m.from);
+    if (!m.isGroup && !viaAgent) escalation.noteInbound(m.from);
 
     // Whatever recording the last message left behind is finished with. A
     // voice note's clip is held only for as long as its own words are being
@@ -408,7 +416,7 @@ class CustomerBot {
     // customer sees the same thing they would from a person at the counter:
     // read, and someone is writing. Never awaited — a failed indicator must
     // not delay the actual reply.
-    if (this.transport.sendTyping && m.id) {
+    if (this.transport.sendTyping && m.id && !viaAgent) {
       Promise.resolve(this.transport.sendTyping(m.id)).catch(() => {});
     }
 
@@ -416,7 +424,7 @@ class CustomerBot {
     // just sent (a caption counts), remembered per chat, and used by every
     // reply below. A bare "16510M65L10 10" says nothing either way, so the
     // language they last showed us stands.
-    lang.note(m.chatId, m.body || '');
+    if (!viaAgent) lang.note(m.chatId, m.body || '');
     const t = lang.for(m.chatId);
 
     // OUR OWN WORDS, SENT BACK TO US.
@@ -429,7 +437,7 @@ class CustomerBot {
     // Only a WHOLE message of ours counts. Quoting one line to choose it —
     // "1. CTWBSI26P-24INCH" — is how a customer picks from a list, and that
     // has to keep working.
-    if (isOurOwnMessageBack(m.chatId, m.body)) {
+    if (!viaAgent && isOurOwnMessageBack(m.chatId, m.body)) {
       store.log(this.key, `ignored an echo of our own message from ${m.from}`);
       return true;
     }
@@ -441,8 +449,10 @@ class CustomerBot {
     // message later on. `receivedAt` marks where this message sits in that
     // record, so the agent's catch-up can leave it out (it is being answered).
     m.receivedAt = Date.now();
-    conversation.record(m.chatId, 'customer', incoming.forLog(m));
-    rememberMsg(m.chatId, m.id, 'customer', m.body || '');
+    if (!viaAgent) {
+      conversation.record(m.chatId, 'customer', incoming.forLog(m));
+      rememberMsg(m.chatId, m.id, 'customer', m.body || '');
+    }
 
     // They carried on talking, so the "send me a part number" nudge is no
     // longer wanted — whatever they said next IS the conversation.
@@ -455,6 +465,11 @@ class CustomerBot {
     const say = (text) => profiles.polish(m.from, text);
 
     const reply = async (text) => {
+      // The staff agent reads the desk's reply and writes its own.
+      if (viaAgent && typeof m._capture === 'function') {
+        m._capture(text);
+        return true;
+      }
       const out = say(text);
       const sentId = await this.transport.sendToChat(m.chatId, out);
       conversation.record(m.chatId, 'us', out);
@@ -492,6 +507,14 @@ class CustomerBot {
       // passes it to a person; a setup left open from before is dropped.
       if (discountSetup.pending(m.chatId)) discountSetup.cancel(m.chatId);
       return this.answerCustomer(m, asWritten, t);
+    }
+
+    // STAFF, UNDERSTOOD AND ANSWERED BY THE STAFF AGENT (agent/staff), which
+    // drives everything below through the desk tool. Approvals, the helper's
+    // answers, buttons and media stay with the desk directly (staff.takes).
+    if (!viaAgent && staffAgent.takes(this, m)) {
+      const done = await this.askStaffAgent(m);
+      if (done !== null) return done;
     }
 
     // A CUSTOMER FORM IN PROGRESS owns every message until it is finished,
@@ -3084,6 +3107,32 @@ class CustomerBot {
     store.log(this.key, 'model is down — admins alerted: ' + f.message.slice(0, 120));
   }
 
+  // ONE STAFF MESSAGE TO THE STAFF AGENT. -> true when answered, null when
+  // the desk should answer it the old way (the model could not run and had
+  // done nothing yet). Once the desk has acted, it is never asked twice: if
+  // the model then fails, the desk's own words are sent.
+  async askStaffAgent(m) {
+    const send = async (text) => {
+      const id = await this.transport.sendToChat(m.chatId, text);
+      conversation.record(m.chatId, 'us', text);
+      rememberMsg(m.chatId, id, 'us', text);
+      return true;
+    };
+    const res = await staffAgent.handle(this, m).catch((e) => {
+      store.log(this.key, 'staff agent threw: ' + String((e && e.message) || e).slice(0, 120));
+      return { handled: false, deskCalls: 0, deskSaid: [] };
+    });
+    if (res.handled && res.reply) return send(res.reply);
+    if (res.deskCalls > 0) {
+      const words = (res.deskSaid || []).filter(Boolean);
+      store.log(this.key, `staff agent gave no usable reply after ${res.deskCalls} desk call(s) — the desk's own words are sent`);
+      if (words.length) return send(words.join('\n\n'));
+      return true;
+    }
+    store.log(this.key, `staff agent could not run for ${m.from} — the desk answers directly`);
+    return null;
+  }
+
   // ONE MESSAGE TO THE AGENT, and whatever it says back.
   //
   // -> the reply's result when the agent answered (the caller returns it), or
@@ -3144,6 +3193,10 @@ class CustomerBot {
   // here, so the step logic, and a tap on an old button still sitting in
   // someone's chat, keep working.
   async askDiscount(m, text) {
+    if (m._capture) {
+      m._capture(text);
+      return true;
+    }
     const id = await this.transport.sendToChat(m.chatId, text);
     conversation.record(m.chatId, 'us', text);
     rememberMsg(m.chatId, id, 'us', text);
@@ -4954,6 +5007,11 @@ class CustomerBot {
     const outText = askText ? `${msg}\n\n${askText}` : msg;
     // Same styling as reply(), reached directly: this runs in its own method,
     // outside the handleMessage closure that defines say().
+    // The staff agent reads this and writes its own (handleMessage, m._capture).
+    if (m._capture) {
+      m._capture(outText);
+      return true;
+    }
     const styled = profiles.polish(m.from, outText);
     const sentId = await this.transport.sendToChat(m.chatId, styled);
     conversation.record(m.chatId, 'us', styled);

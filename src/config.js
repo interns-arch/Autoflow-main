@@ -391,6 +391,10 @@ const config = {
     // AGENT_ALLOW_FROM is gone: with no template path, a list could only
     // decide who gets no answer at all.
     enabled: String(process.env.AGENT_ENABLED || 'true').toLowerCase() !== 'false',
+    // The STAFF agent (agent/staff): sales team, agents and admins are
+    // understood and answered by the model, which drives the desk. Off =
+    // the desk answers them directly, as before.
+    staffEnabled: String(process.env.AGENT_STAFF || 'true').toLowerCase() !== 'false',
     // A runaway loop costs money and makes a customer wait. Measured: a
     // normal part-and-price turn is 2 to 4 tool calls.
     maxToolCalls: parseInt(process.env.AGENT_MAX_TOOL_CALLS || '10', 10),

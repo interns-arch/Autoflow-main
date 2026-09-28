@@ -24,7 +24,8 @@
     "test:gst": "node scripts/test-gst.js",
     "test:watext": "node scripts/test-watext.js",
     "test:discount": "node scripts/test-discount.js",
-    "check:portal": "node scripts/check-portal-contracts.js"
+    "check:portal": "node scripts/check-portal-contracts.js",
+    "test:staff": "node scripts/test-staff-agent.js"
   },
   "dependencies": {
     "@langchain/core": "^1.2.12",

@@ -50,6 +50,10 @@ const config = require('../src/config');
 // Most of this suite finds customers by name and GSTIN; the mobile-only
 // search (the default since 26 Sep) has its own section, [74].
 config.customerSearchBy = 'any';
+// This suite is about the DESK: the staff agent in front of it has its own
+// check with the real model (npm run test:staff). Some sections below set a
+// stand-in Gemini key, and the staff agent must not try it.
+config.agent.staffEnabled = false;
 config.dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'autoflow-smoke-'));
 config.customerDms = ['919899555001'];
 config.adminNumbers = ['919800000009'];
