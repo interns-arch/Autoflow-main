@@ -134,7 +134,7 @@
     return {
       customers: { created: n(c, 'created'), waiting: n(c, 'waiting for approval'), rejected: n(c, 'rejected') },
       orders: { placed: n(o, 'placed'), waiting: n(o, 'waiting for approval') + n(o, 'waiting for payment'), rejected: n(o, 'rejected'), refused: n(o, 'refused by portal'), value: Math.round(o.filter((x) => x.status === 'placed').reduce((s, x) => s + (Number(x.amount) || 0), 0)) },
-      discounts: { approved: n(d, 'approved'), waiting: n(d, 'waiting for approval'), rejected: n(d, 'rejected') },
+      discounts: { approved: n(d, 'approved'), waiting: n(d, 'waiting for approval') + n(d, 'waiting for Super Admin'), rejected: n(d, 'rejected') },
       payments: { settled: n(p, 'settled'), open: p.length - n(p, 'settled') },
     };
   }
@@ -142,8 +142,14 @@
   const esc = (v) => String(v == null ? '' : v).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
   const when = (iso) => iso ? new Date(iso).toLocaleString('en-IN', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : '';
   const rs = (v) => v || v === 0 ? '₹' + Number(v).toLocaleString('en-IN', { maximumFractionDigits: 2 }) : '';
+  // What the PORTAL says, with a line under it.
+  const portalPill = (s, sub) => {
+    if (!s) return '<span class="muted">—</span>';
+    const cls = /^(on portal|invoiced|dispatched|approved|allocated|closed)$/i.test(s) ? 'ok' : /not found|refused|rejected|inactive|cancel/i.test(s) ? 'bad' : /pending|waiting|not on portal yet/i.test(s) ? 'wait' : 'info';
+    return `<span class="pill ${cls}">${esc(s)}</span>${sub ? `<div class="muted" style="font-size:12px;margin-top:3px">${esc(sub)}</div>` : ''}`;
+  };
   const pill = (s) => {
-    const cls = /created|placed|approved|settled/.test(s) ? 'ok' : /reject|refused|not received/.test(s) ? 'bad' : /waiting|checking/.test(s) ? 'wait' : 'info';
+    const cls = /created|placed|approved|settled/.test(s) ? 'ok' : /reject|refused|not received|expired|inactive|not on portal/.test(s) ? 'bad' : /waiting|checking/.test(s) ? 'wait' : 'info';
     return `<span class="pill ${cls}">${esc(s)}</span>`;
   };
 
@@ -174,9 +180,10 @@
   const TABS = {
     customers: {
       label: 'Customers', statuses: ['created', 'waiting for approval', 'rejected'],
-      cols: ['Requested', 'Customer', 'WhatsApp', 'Status', 'Opened by', 'Approved / rejected by', 'Home branch'],
-      row: (c) => [when(c.requestedAt), `<b>${esc(c.customer || '—')}</b><div class="muted">${esc(c.id)}</div>`, esc(c.phone), pill(c.status), esc(c.openedBy), esc(c.approvedBy || c.rejectedBy || '—'), esc(c.homeBranch || '')],
+      cols: ['Requested', 'Customer', 'WhatsApp', 'Status (bot)', 'On the portal', 'Opened by', 'Approved / rejected by', 'Home branch'],
+      row: (c) => [when(c.requestedAt), `<b>${esc(c.customer || '—')}</b><div class="muted">${esc(c.id)}</div>`, esc(c.phone), pill(c.status), portalPill(c.portalStatus, c.portal && c.portal.account ? 'account ' + c.portal.account : ''), esc(c.openedBy), esc(c.approvedBy || c.rejectedBy || '—'), esc(c.homeBranch || '')],
       detail: (c) => grid([
+        ['Portal', c.portalStatus], ['Portal account id', c.portal && c.portal.account], ['Portal name', c.portal && c.portal.name], ['Portal dealer', c.portal && c.portal.dealer], ['Accounts on this number', c.portal && c.portal.accounts],
         ['GSTIN', c.gst], ['Business type', c.businessType], ['Contact', c.contactPerson], ['Contact phone', c.contactPhone],
         ['Email', c.email], ['Address', c.address], ['Home branch', c.homeBranch], ['Location', c.location],
         ['Owner DOB', c.dob], ['Bank', c.bank], ['Portal login', c.portalLogin], ['Odoo partner', c.odooPartner],
@@ -185,15 +192,24 @@
     },
     orders: {
       label: 'Orders', statuses: ['placed', 'waiting for approval', 'waiting for payment', 'rejected', 'refused by portal'],
-      cols: ['When', 'Order', 'Customer', 'Placed by', 'Status', 'Approved / rejected by', 'Portal order', 'Amount'],
-      row: (o) => [when(o.at), esc(o.id), `<b>${esc(o.customer || '—')}</b>`, esc(o.placedBy), pill(o.status) + (o.status === 'refused by portal' && o.note ? `<div class="muted" style="font-size:12px;margin-top:4px">${esc(o.note)}</div>` : ''), esc(o.approvedBy || o.rejectedBy || '—'), esc(o.portalOrder || '—'), `<span class="num">${rs(o.amount)}</span>`],
-      detail: (o) => grid([['Parts', o.lines], ['Customer portal id', o.customerId], ['Payment hold', o.paymentHold], ['Note', o.note]]),
+      cols: ['When', 'Order', 'Customer', 'Placed by', 'Status (bot)', 'On the portal', 'Approved / rejected by', 'Portal order', 'Amount'],
+      row: (o) => [when(o.at), esc(o.id), `<b>${esc(o.customer || '—')}</b>`, esc(o.placedBy), pill(o.status) + (o.status === 'refused by portal' && o.note ? `<div class="muted" style="font-size:12px;margin-top:4px">${esc(o.note)}</div>` : ''), portalPill(o.portalStage, o.portal ? [o.portal.invoiceNo ? 'inv ' + o.portal.invoiceNo : '', o.portal.discount ? 'disc ' + o.portal.discount : ''].filter(Boolean).join(' · ') : ''), esc(o.approvedBy || o.rejectedBy || '—'), esc(o.portalOrder || '—'), `<span class="num">${rs(o.amount)}</span>`],
+      detail: (o) => grid([
+        ['Parts', o.lines], ['Customer portal id', o.customerId], ['Payment hold', o.paymentHold], ['Note', o.note],
+        ['Portal status', o.portal && o.portal.status], ['DO status', o.portal && o.portal.doStatus], ['Invoice', o.portal && [o.portal.invoice, o.portal.invoiceNo].filter(Boolean).join(' · ')],
+        ['Dispatch', o.portal && [o.portal.dispatch, o.portal.dispatchedAt ? when(o.portal.dispatchedAt) : ''].filter(Boolean).join(' · ')], ['Odoo SO', o.portal && o.portal.odooSo],
+        ['Portal total', o.portal && o.portal.total != null ? rs(o.portal.total) : null], ['Discount on the portal', o.portal && o.portal.discount],
+      ]),
     },
     discounts: {
-      label: 'Discounts', statuses: ['approved', 'waiting for approval', 'rejected'],
-      cols: ['Requested', 'Request', 'Customer', 'Asked', 'Created by', 'Status', 'Approved / rejected by'],
-      row: (d) => [when(d.requestedAt), esc(d.id), `<b>${esc(d.customer || '—')}</b>`, esc(d.asked), esc(d.createdBy), pill(d.status), esc(d.approvedBy || d.rejectedBy || '—')],
-      detail: (d) => grid([['Result', d.result], ['Decided', when(d.decidedAt)]]),
+      label: 'Discounts', statuses: ['approved', 'waiting for Super Admin', 'waiting for approval', 'expired', 'rejected', 'inactive on portal', 'not on portal'],
+      cols: ['Requested', 'Request', 'Customer', 'Asked', 'Created by', 'Status (portal)', 'Portal rule'],
+      row: (d) => [when(d.requestedAt), esc(d.id) + (d.source === 'portal' ? ' <span class="pill info" style="padding:0 6px">portal</span>' : ''), `<b>${esc(d.customer || '—')}</b>`, esc(d.asked), esc(d.createdBy), pill(d.status), d.portal && d.portal.rule ? `#${esc(d.portal.rule)} · ${esc(d.portal.on || '')} ${esc(d.portal.value || '')}` : '<span class="muted">—</span>'],
+      detail: (d) => grid([
+        ['Result', d.result], ['Decided', when(d.decidedAt)],
+        ['Portal rule', d.portal && d.portal.rule], ['Portal name', d.portal && d.portal.name], ['Portal approval', d.portal && d.portal.approval],
+        ['Valid from', d.portal && d.portal.validFrom ? when(d.portal.validFrom) : null], ['Valid to', d.portal && d.portal.validTo ? when(d.portal.validTo) : null], ['Dealer id', d.portal && d.portal.dealer],
+      ]),
     },
     payments: {
       label: 'Payments', statuses: ['settled', 'checking', 'waiting for payment', 'not received'],
@@ -229,7 +245,10 @@
       const main = `<tr class="row" data-id="${esc(id)}">${T.row(x).map((c) => `<td>${c}</td>`).join('')}</tr>`;
       return open.has(id) ? main + `<tr class="detail"><td colspan="${T.cols.length}">${T.detail(x)}</td></tr>` : main;
     }).join('');
-    app.innerHTML = dates + cards +
+    // Where the portal did not answer, say so: those rows show the bot's record only.
+    const down = Object.entries(data.sources || {}).filter(([, v]) => v !== 'ok');
+    const warn = down.length ? `<div class="panel" style="padding:10px 14px;margin-bottom:12px;border-color:var(--wait)"><span class="pill wait">Portal</span> ${down.map(([k, v]) => `${esc(k)}: ${esc(v)}`).join(' · ')} — showing the bot's own record for these.</div>` : '';
+    app.innerHTML = warn + dates + cards +
       `<div class="bar">${tabs}<input type="search" id="q" placeholder="Search name, phone, GSTIN, order, agent…" value="${esc(search)}" /></div>
        <div class="bar">${chips}<span style="flex:1"></span>
          <button class="dl" id="dl1" title="Every field of the rows shown below">⬇ Download CSV (${list.length})</button>
@@ -276,7 +295,18 @@
     const s = v === null || v === undefined ? '' : String(v);
     return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
   }
-  function download(which, rows, flt) {
+  // The portal's facts sit in a nested object: in the file each gets its own
+  // column ("Portal: status", "Portal: invoiceNo" …).
+  const flat = (r) => {
+    const o = {};
+    for (const [k, v] of Object.entries(r)) {
+      if (v && typeof v === 'object' && !Array.isArray(v)) for (const [k2, v2] of Object.entries(v)) o[k + '.' + k2] = v2;
+      else o[k] = v;
+    }
+    return o;
+  };
+  function download(which, rowsIn, flt) {
+    const rows = rowsIn.map(flat);
     const keys = [];
     for (const r of rows) for (const k of Object.keys(r)) if (!keys.includes(k)) keys.push(k);
     // Nothing to export still gives the headings, so the file is recognisable.
@@ -290,7 +320,7 @@
       keys.push(...(EMPTY[which] || ['id']));
     }
     const fmt = (k, v) => (DATES.has(k) && v ? new Date(v).toLocaleString('en-IN', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : v);
-    const lines = [keys.map((k) => csvCell(HEAD[k] || k)).join(',')];
+    const lines = [keys.map((k) => csvCell(HEAD[k] || (k.startsWith('portal.') ? 'Portal: ' + k.slice(7) : k))).join(',')];
     for (const r of rows) lines.push(keys.map((k) => csvCell(fmt(k, r[k]))).join(','));
     const blob = new Blob(['﻿' + lines.join('\r\n') + '\r\n'], { type: 'text/csv;charset=utf-8' });
     const day = new Date().toISOString().slice(0, 10);
