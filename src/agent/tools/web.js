@@ -29,15 +29,24 @@ const partish = require('../../core/partish');
 // three by itself so the model cannot turn a miss into six slow retries.
 const MAX_ATTEMPTS = 3;
 
+// Boodmo lists most Indian-market OEM parts with the maker's own number
+// (founder, 28 Sep: "check the product on boodmo"), so it is asked second -
+// after the maker's own wording, before the open web.
 function queriesFor(phrase, vehicle) {
   const what = String(phrase || '').trim();
   const car = String(vehicle || '').trim();
   const base = car ? car + ' ' + what : what;
   return [
     'Maruti Suzuki genuine part number for ' + base,
+    'boodmo.com ' + base + ' OEM part number',
     base + ' OEM part number India',
-    'what is the part number of ' + base + ' (car spare part)',
   ];
+}
+
+// A number AS OUR PORTAL STORES IT: capitals, no dashes or spaces.
+// "16510-M68K00" on a website is 16510M68K00 on the portal.
+function asStored(partNo) {
+  return String(partNo || '').toUpperCase().replace(/[\s\-./]/g, '');
 }
 
 // MONEY GOES. PART NUMBERS AND SIZES STAY.
@@ -107,36 +116,35 @@ function partNumbersIn(text) {
     const k = clean.toUpperCase().replace(/[^A-Z0-9]/g, '');
     if (seen.has(k)) continue;
     seen.add(k);
-    out.push(clean);
+    out.push(asStored(clean));
     if (out.length >= 6) break;
   }
   return out;
 }
 
-async function askGoogle(query) {
+// `image` ({ base64, mime }) goes with the question, so the model searches
+// for what it SEES - the photo of a part with no number on it.
+async function askGoogle(query, image) {
   const url =
     'https://generativelanguage.googleapis.com/v1beta/models/' +
     encodeURIComponent(config.agent.webSearchModel) +
     ':generateContent?key=' +
     encodeURIComponent(config.gemini.apiKey);
 
+  const parts = [];
+  if (image && image.base64) parts.push({ inline_data: { mime_type: image.mime || 'image/jpeg', data: image.base64 } });
+  parts.push({
+    text:
+      query +
+      '\n\nAnswer with the manufacturer part number or numbers only, and say which variant each belongs to if they differ. ' +
+      'Do not give any price. If you cannot find a part number, say exactly: NOT FOUND.',
+  });
+
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      contents: [
-        {
-          role: 'user',
-          parts: [
-            {
-              text:
-                query +
-                '\n\nAnswer with the manufacturer part number or numbers only, and say which variant each belongs to if they differ. ' +
-                'Do not give any price. If you cannot find a part number, say exactly: NOT FOUND.',
-            },
-          ],
-        },
-      ],
+      contents: [{ role: 'user', parts }],
       tools: [{ google_search: {} }],
     }),
     signal: AbortSignal.timeout(config.agent.webSearchTimeoutMs),
@@ -213,4 +221,73 @@ const searchTheWeb = tool(
   },
 );
 
-module.exports = { searchTheWeb, _internals: { stripFigures, partNumbersIn, queriesFor } };
+// THE PHOTO OF A PART THE PORTAL DOES NOT KNOW (founder, 28 Sep: "when
+// customer send photo of any product which bot not able to search on portal
+// then it web search the product and try to find part no like we store / or
+// check the product on boodmo").
+//
+// The photo itself goes to the search, not a description of it: a model
+// looking at a wiper blade or a filter it cannot read a number off still
+// knows what it is and, with the web, what it is sold as. Same rules as
+// search_the_web - part numbers only, money stripped here, every one still to
+// be confirmed by the portal.
+function photoQueries(hint, vehicle) {
+  const extra = [String(vehicle || '').trim(), String(hint || '').trim()].filter(Boolean).join(', ');
+  const about = extra ? ' The customer says: ' + extra + '.' : '';
+  return [
+    'This is a photo of a car spare part sent by a customer in India.' + about +
+      ' Identify the part (what it is, which car it fits, brand if visible) and find its OEM part number, looking on boodmo.com first.',
+    'Find this car part on boodmo.com or the car maker\'s parts catalogue and give its OEM part number.' + about,
+  ];
+}
+
+const identifyPartFromPhoto = tool(
+  async ({ hint, vehicle }, cfg) => {
+    const ctx = require('../context').contextFrom(cfg);
+    const photo = ctx.chatId ? require('../incoming').heldPhoto(ctx.chatId) : null;
+    if (!photo) return JSON.stringify({ found: false, why: 'there is no recent photo in this chat' });
+    if (!config.gemini || !config.gemini.apiKey) {
+      return JSON.stringify({ found: false, why: 'web search is not configured', askAPerson: true });
+    }
+    let tries = 0;
+    for (const query of photoQueries(hint, vehicle)) {
+      tries++;
+      let got = null;
+      try {
+        got = await askGoogle(query, photo);
+      } catch (e) {
+        store.log('agent', 'photo web search failed: ' + String((e && e.message) || e).slice(0, 80));
+        continue;
+      }
+      const safe = stripFigures(got.text);
+      const candidates = partNumbersIn(safe);
+      if (!candidates.length) continue;
+      store.log('agent', `photo web search -> ${candidates.join(', ')} (attempt ${tries}${got.sources.length ? ', ' + got.sources.slice(0, 2).join(' / ') : ''})`);
+      return JSON.stringify({
+        found: true,
+        // In the portal's own form (no dashes, capitals).
+        candidatePartNumbers: candidates,
+        whatThePartIs: safe.slice(0, 300),
+        sources: got.sources,
+        nextStep:
+          'UNCONFIRMED leads from the web for the part in the photo. Call check_stock_and_price on them. ' +
+          'Only a part the portal confirms may be mentioned, at the portal price. If none is confirmed, call ask_a_person (the photo goes with it) and pass these as webCandidates.',
+      });
+    }
+    store.log('agent', `photo web search found no part number in ${tries} attempt(s)`);
+    return JSON.stringify({ found: false, attempts: tries, why: 'the web did not give a part number for this photo', askAPerson: true });
+  },
+  {
+    name: 'identify_part_from_photo',
+    description:
+      'Find the part number of the part in the customer\'s PHOTO by searching the web with the photo itself (Boodmo first, then the maker\'s catalogue). ' +
+      'Use it when a photo shows a part but no part number can be read off it, or the numbers read off it are not on the portal - after our own lookups found nothing and before ask_a_person. Call it ONCE. ' +
+      'It returns candidate part numbers in the portal\'s form and never a price; put them through check_stock_and_price and say only what the portal confirms.',
+    schema: z.object({
+      hint: z.string().optional().describe('anything the customer said about the photo, e.g. "iska rate" or "front wiper"'),
+      vehicle: z.string().optional().describe('the car and year if known, e.g. "Swift 2018 petrol"'),
+    }),
+  },
+);
+
+module.exports = { searchTheWeb, identifyPartFromPhoto, _internals: { stripFigures, partNumbersIn, queriesFor, photoQueries, asStored, askGoogle } };

@@ -48,6 +48,7 @@ const TOOLS = [
   parts.searchCatalogueIndex,
   parts.searchPortalCatalogue,
   web.searchTheWeb,
+  web.identifyPartFromPhoto,
   commerce.checkStockAndPrice,
   commerce.myDiscounts,
   cart.showCart,

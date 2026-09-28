@@ -73,6 +73,55 @@ function webGuards() {
   ok('a sentence with no part number yields none', w.partNumbersIn('sorry, NOT FOUND').length === 0);
 
   ok('it asks the web three different ways', w.queriesFor('cabin filter', 'Brezza 2019').length === 3);
+
+  // 28 Sep, founder: "find part no like we store / or check the product on boodmo".
+  ok('one of the three asks Boodmo', w.queriesFor('cabin filter', 'Brezza 2019').some((q) => /boodmo/i.test(q)));
+  ok('a website\'s "16510-M68K00" comes back as the portal stores it', JSON.stringify(w.partNumbersIn('Boodmo lists it as 16510-M68K00.')) === JSON.stringify(['16510M68K00']), JSON.stringify(w.partNumbersIn('Boodmo lists it as 16510-M68K00.')));
+  ok('the photo search asks Boodmo too', w.photoQueries('front wiper', 'Swift 2018').every((q) => /boodmo/i.test(q)));
+  ok('...and passes on what the customer said', /front wiper/.test(w.photoQueries('front wiper', 'Swift 2018')[0]) && /Swift 2018/.test(w.photoQueries('front wiper', 'Swift 2018')[0]));
+}
+
+async function photoSearch() {
+  console.log('\nA PHOTO THE PORTAL CANNOT PLACE (offline)\n');
+  const web = require('../src/agent/tools/web');
+  const incoming = require('../src/agent/incoming');
+  const agentTools = require('../src/agent').TOOLS.map((t) => t.name);
+  ok('the agent has identify_part_from_photo', agentTools.includes('identify_part_from_photo'));
+  const none = JSON.parse(await web.identifyPartFromPhoto.invoke({ hint: 'iska rate' }, { configurable: { chatId: 'photo-test-none' } }));
+  ok('with no photo in the chat it says so and searches nothing', none.found === false && /no recent photo/.test(none.why), JSON.stringify(none));
+
+  // The search itself, stubbed: a page naming a dashed number and a price.
+  const realFetch = global.fetch;
+  const keyWas = config.gemini.apiKey;
+  let sentImage = false;
+  config.gemini.apiKey = config.gemini.apiKey || 'test-key';
+  global.fetch = async (url, opts) => {
+    const body = JSON.parse(opts.body);
+    sentImage = body.contents[0].parts.some((p) => p.inline_data && p.inline_data.data === 'AAAA');
+    return {
+      ok: true,
+      json: async () => ({
+        candidates: [
+          {
+            content: { parts: [{ text: 'This is an oil filter for Maruti petrol cars, OEM 16510-M68K00, Rs.110 on boodmo.' }] },
+            groundingMetadata: { groundingChunks: [{ web: { title: 'boodmo.com' } }] },
+          },
+        ],
+      }),
+    };
+  };
+  try {
+    incoming.holdPhoto('photo-test', { base64: 'AAAA', mime: 'image/jpeg' });
+    const r = JSON.parse(await web.identifyPartFromPhoto.invoke({ hint: 'iska rate' }, { configurable: { chatId: 'photo-test' } }));
+    ok('the photo itself goes to the search', sentImage);
+    ok('the part number comes back as the portal stores it', r.found && r.candidatePartNumbers[0] === '16510M68K00', JSON.stringify(r));
+    ok('no price from the website reaches the agent', !/110/.test(JSON.stringify(r)), JSON.stringify(r));
+    ok('the source is named', (r.sources || []).includes('boodmo.com'));
+  } finally {
+    global.fetch = realFetch;
+    config.gemini.apiKey = keyWas;
+    incoming.dropPhoto('photo-test');
+  }
 }
 
 // ------------------------------------------------- the loop, with a model
@@ -211,6 +260,7 @@ async function loopTest() {
 
 (async () => {
   webGuards();
+  await photoSearch();
   await loopTest();
   console.log('\n' + pass + ' passed, ' + fail + ' failed' + (skip ? ', ' + skip + ' skipped' : '') + '\n');
   process.exit(fail ? 1 : 0);
