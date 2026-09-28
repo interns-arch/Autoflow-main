@@ -150,7 +150,9 @@ function orders(events) {
     out.push({
       id: o.id,
       at: o.confirmedAt || o.approvalAskedAt || (refusedHere && o.punchRefused.at) || o.createdAt || null,
-      status: failed && st !== 'placed' ? 'refused by portal' : st,
+      // Punched, then cancelled on the portal (core/cancelWatch): not placed.
+      status: o.portalCancelled ? 'cancelled on portal' : failed && st !== 'placed' ? 'refused by portal' : st,
+      cancelledAt: o.portalCancelled ? o.portalCancelled.at : null,
       customer: pc.name || (typeof o.customer === 'string' && !/@/.test(o.customer) ? o.customer : null),
       customerId: pc.buyerId || null,
       placedBy: agent ? (/^Admin /.test(agent) ? agent : agent + ' (agent)') : 'customer',
@@ -161,7 +163,7 @@ function orders(events) {
       lines: (o.lines || []).map((l) => `${l.partNo || l.item} x${l.qty}`).join(', '),
       amount: Math.round(amount * 100) / 100,
       paymentHold: o.paymentId || null,
-      note: failed ? failed.detail : null,
+      note: o.portalCancelled ? 'cancelled on the portal after the punch (portal order ' + o.portalCancelled.so + ')' + (o.portalCancelled.told ? ' — customer told' : '') : failed ? failed.detail : null,
     });
   }
   return out.sort((a, b) => String(b.at).localeCompare(String(a.at)));
@@ -249,6 +251,11 @@ async function portalOrders(list) {
       total: p.total_amount != null ? Number(p.total_amount) : null,
       discount: disc.length ? (disc.some((x) => x > 0) ? Math.max(...disc) + '%' : '0%') : null,
     };
+    // Cancelled there before the watcher's next look: shown as such at once.
+    if (/cancel/i.test(String(p.status || '') + ' ' + String(p.do_status || '')) && o.status === 'placed') {
+      o.status = 'cancelled on portal';
+      o.note = o.note || 'cancelled on the portal after the punch (portal order ' + id + ')';
+    }
     // Where it stands, in one word the team uses.
     o.portalStage = p.dispatched_at || /dispatch|deliver/i.test(p.tracker_status || '')
       ? 'dispatched'
@@ -379,6 +386,7 @@ function build() {
         waiting: count(o, 'waiting for approval') + count(o, 'waiting for payment'),
         rejected: count(o, 'rejected'),
         refused: count(o, 'refused by portal'),
+        cancelled: count(o, 'cancelled on portal'),
         value: Math.round(o.filter((x) => x.status === 'placed').reduce((s, x) => s + x.amount, 0)),
       },
       discounts: { total: d.length, approved: count(d, 'approved'), waiting: count(d, 'waiting for approval'), rejected: count(d, 'rejected') },

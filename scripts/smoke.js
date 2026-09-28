@@ -443,6 +443,54 @@ async function main() {
   customer.transport.sendText = hadText7;
   portal.confirm = realConfirm7;
 
+  // 28 Sep, founder: an order punched and then CANCELLED on the portal (by the
+  // Super Admin) - the customer and the salesman are told, and the dashboard
+  // shows it.
+  console.log('\n[5b-viii] an order cancelled on the portal after the punch');
+  {
+    const cw = require('../src/core/cancelWatch');
+    const AGENT8 = '919000000268';
+    const CUSTP8 = '919000000269';
+    const mk = (chat, hoursAgo, so, byAgent) => {
+      const o = orders.getOrCreateDraft(chat, 'Cancel Test');
+      o.lines = [{ item: '16510M65L10', partNo: '16510M65L10', qty: 2, source: 'available', available: 5 }];
+      o.status = 'confirmed';
+      o.soNumber = so;
+      o.placed = [{ soNumber: so }];
+      o.confirmedAt = new Date(Date.now() - hoursAgo * 3600e3).toISOString();
+      o.portalCustomer = { buyerId: 1, name: 'Cancel Test Motors', phone: CUSTP8 };
+      if (byAgent) o.requestedBy = AGENT8;
+      require('../src/store').save();
+      return o;
+    };
+    const fresh8 = mk('sim-' + AGENT8, 1, '9901', true);
+    const old8 = mk('sim-919000000270', 24 * 5, '9902', false);
+    const orderWas8 = portal.order;
+    const chatOfWas8 = customer.customerChatOf;
+    customer.customerChatOf = (o) => (o.requestedBy ? 'sim-' + CUSTP8 : null);
+    portal.order = async (id) => ({ order_id: id, status: 'cancelled', do_status: 'cancelled' });
+    customer.transport.outbox.length = 0;
+    try {
+      const found8 = await cw.checkOnce(customer);
+      check('an order cancelled on the portal after the punch is found and marked', fresh8.portalCancelled && fresh8.portalCancelled.so === '9901' && found8.some((f) => f.id === fresh8.id), JSON.stringify(found8));
+      const toAgent8 = customer.transport.outbox.filter((o) => String(o.to).includes(AGENT8)).map((o) => o.text).join('\n');
+      const toCust8 = customer.transport.outbox.filter((o) => String(o.to).includes(CUSTP8)).map((o) => o.text).join('\n');
+      check('...the salesman is told it will not be supplied', /cancel/i.test(toAgent8) && /9901/.test(toAgent8), toAgent8);
+      check('...and so is the customer, warmly, with the parts', /cancel/i.test(toCust8) && /16510M65L10/.test(toCust8) && /(maaf|sorry)/i.test(toCust8), toCust8);
+      check('an older one is marked for the dashboard, but nobody is messaged about it', old8.portalCancelled && old8.portalCancelled.told === 0 && !customer.transport.outbox.some((o) => String(o.to).includes('919000000270')));
+      customer.transport.outbox.length = 0;
+      check('...and nobody is told twice', (await cw.checkOnce(customer)).length === 0 && customer.transport.outbox.length === 0);
+      const dash8 = require('../src/core/dashboardData').build();
+      const row8 = dash8.orders.find((o) => o.id === fresh8.id);
+      check('the dashboard shows it as cancelled on portal, not placed', row8 && row8.status === 'cancelled on portal' && dash8.summary.orders.cancelled >= 2, JSON.stringify(row8));
+    } finally {
+      portal.order = orderWas8;
+      customer.customerChatOf = chatOfWas8;
+      orders.cancel(fresh8);
+      orders.cancel(old8);
+    }
+  }
+
   // ---- 5c. GROUP safety: only the customer's unmistakable YES orders ----
   console.log('\n[5c] group — staff are not customers, filler words do not confirm');
   const STAFF = '919800000777';

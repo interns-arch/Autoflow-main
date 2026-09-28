@@ -319,6 +319,9 @@ class CustomerBot {
     // Discount rules waiting for the Super Admin on the portal: the agent is
     // told when one is approved (core/discountWatch).
     require('../core/discountWatch').start(this);
+    // Orders punched and then cancelled on the portal: marked, and the
+    // customer (and the salesman) told (core/cancelWatch).
+    require('../core/cancelWatch').start(this);
     await this.transport.start();
   }
 
