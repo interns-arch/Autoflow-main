@@ -139,6 +139,15 @@ const config = {
     adminPassword: (process.env.DEALER_PORTAL_ADMIN_PASSWORD || '').trim(),
     adminToken: (process.env.DEALER_PORTAL_ADMIN_TOKEN || '').trim(),
 
+    // THE LOGIN THAT APPROVES DISCOUNT RULES on the portal. The admin login
+    // writes the rule, and the portal answers 403 when that same login then
+    // approves it (28 Sep, live: rules 2872 created and updated, both left
+    // PENDING, so order punch gave 0%). A second user holding the portal's
+    // discount-approval permission goes here. Blank = the admin login.
+    approverUsername: (process.env.DEALER_PORTAL_APPROVER_USERNAME || '').trim(),
+    approverPassword: (process.env.DEALER_PORTAL_APPROVER_PASSWORD || '').trim(),
+    approverToken: (process.env.DEALER_PORTAL_APPROVER_TOKEN || '').trim(),
+
     // Token lifecycle: the portal's access_token expires; these control
     // proactive refresh so no customer request ever hits an expired token.
     tokenLifetimeMs: parseFloat(process.env.DEALER_PORTAL_TOKEN_LIFETIME_HOURS || '8') * 60 * 60 * 1000,

@@ -144,6 +144,22 @@ const counts = (r) =>
   String(r.approval_status || '').toUpperCase() !== 'REJECTED' &&
   (String(r.approval_status || '').toUpperCase() === 'APPROVED' || (r.rule_metadata && r.rule_metadata.source === 'whatsapp-bot'));
 
+// ONE MAKER, SEVERAL SPELLINGS. The portal's brand list offers "MARUTI
+// SUZUKI" while a rule read back says "MARUTI" and a part row can say either
+// (28 Sep, live: MIYA JI MOTORS' approved MARUTI rule #2872 punched at 0%).
+// Two brands are the same when they are spelt alike, or when both are
+// spellings of one maker listed below — only listed ones: "TATA" and "TATA
+// AUTOCOMP" are two companies, and a wrong match is a discount nobody gave.
+const SAME_MAKER = [['MARUTI', 'SUZUKI', 'MARUTISUZUKI', 'MSIL', 'MARUTISUZUKIGENUINE', 'MGP']];
+const brandKey = (s) => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+function sameBrand(a, b) {
+  const x = brandKey(a);
+  const y = brandKey(b);
+  if (!x || !y) return false;
+  if (x === y) return true;
+  return SAME_MAKER.some((g) => g.includes(x) && g.includes(y));
+}
+
 function ruleFor(rules, { dealerId, partNo, brand, qty = 1, now = new Date() } = {}) {
   const norm = (s) => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
   const t = new Date(now).getTime();
@@ -152,7 +168,7 @@ function ruleFor(rules, { dealerId, partNo, brand, qty = 1, now = new Date() } =
   const kind = (r) => {
     const type = String(r.rule_type || '').toUpperCase();
     if (type === 'ITEM') return r.part_no && norm(r.part_no) === norm(partNo) ? 3 : 0;
-    if (type === 'BRAND') return r.brand && brand && norm(r.brand) === norm(brand) ? 2 : 0;
+    if (type === 'BRAND') return r.brand && brand && sameBrand(r.brand, brand) ? 2 : 0;
     return !r.part_no && !r.brand ? 1 : 0; // every part for this customer
   };
   let best = null;

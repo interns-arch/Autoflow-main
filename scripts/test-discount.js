@@ -22,6 +22,10 @@ process.env.SCRATCH = process.env.SCRATCH || path.join(os.tmpdir(), 'autoflow-di
 require('fs').mkdirSync(process.env.SCRATCH, { recursive: true });
 require('fs').writeFileSync(path.join(process.env.SCRATCH, 'state.json'), '{}');
 process.env.DATA_DIR = process.env.SCRATCH;
+// The MOCK portal, always: .env names the live one, and dotenv never
+// overrides a variable already set. Without this the punch test below read
+// the live discount rules and accounts.
+process.env.DEALER_PORTAL_BASE_URL = '';
 
 const d = require('../src/core/discountSetup');
 
@@ -147,6 +151,13 @@ console.log('\nTHE RULE THAT PRICES A LINE\n');
   ok("another customer's rule does not count", d.ruleFor(rules, { dealerId: 9999, partNo: 'X', brand: 'MARUTI', now }) === null);
   ok('below the minimum quantity it does not apply', pick({ partNo: 'X', brand: 'LUMAX', qty: 2 }) === null);
   ok('at the minimum quantity it does', pick({ partNo: 'X', brand: 'LUMAX', qty: 5 }) === 6);
+  // 28 Sep, live: rule #2872 said MARUTI, the brand list said MARUTI SUZUKI.
+  ok('a MARUTI rule prices a MARUTI SUZUKI part', pick({ partNo: 'X', brand: 'MARUTI SUZUKI' }) === 1);
+  ok('...and a Maruti-Suzuki one, however it is spelt', pick({ partNo: 'X', brand: 'Maruti-Suzuki' }) === 1);
+  const suzukiRule = [{ ...base, rule_id: 7, rule_type: 'BRAND', brand: 'MARUTI SUZUKI', discount_value: 12, approval_status: 'APPROVED' }];
+  ok('a MARUTI SUZUKI rule prices a MARUTI part', (d.ruleFor(suzukiRule, { dealerId: 8328, partNo: 'X', brand: 'MARUTI', now }) || {}).rule_id === 7);
+  const tataRule = [{ ...base, rule_id: 8, rule_type: 'BRAND', brand: 'TATA', discount_value: 12, approval_status: 'APPROVED' }];
+  ok('a TATA rule does not price a TATA AUTOCOMP part (two companies)', d.ruleFor(tataRule, { dealerId: 8328, partNo: 'X', brand: 'TATA AUTOCOMP', now }) === null);
 }
 
 console.log('\nA CHANGE, AS THE SALES HEAD READS IT\n');
@@ -199,5 +210,47 @@ console.log('\nTHEIR DISCOUNTS TODAY\n');
   ok('after it ends it is not listed', d.activeRules(rules, 8328, new Date('2026-10-01')).length === 1);
 }
 
-console.log('\n' + pass + ' passed, ' + fail + ' failed\n');
-process.exit(fail ? 1 : 0);
+console.log('\nTHE PUNCHED ORDER CARRIES THE DISCOUNT\n');
+{
+  const portal = require('../src/integrations/dealerPortal');
+  // A commercial-analyze row after withDiscountRules: MARUTI 12% on MRP 1000.
+  const raw = {
+    part_no: '16510M68K10', mrp: 1000, discount_percent: 12, price: 880, discount_rule: { id: 2872, name: 'MIYA JI MOTORS MARUTI 12%' },
+    allocations: [{ dealer_id: 23, qty: 2, mrp: 1000, discount_percent: 12, price: 880 }],
+  };
+  const body = portal._confirmBody({ id: 'ORD-T1', lines: [{ partNo: '16510M68K10', qty: 2, source: 'portal', _raw: raw }], portalCustomer: { buyerId: 265 } });
+  const line = body.lines[0];
+  ok('the line says the discount the way an order line keeps it', line.item_discount_per === 12 && line.discounted_unit_price === 880, JSON.stringify(line));
+  ok('...names the rule it came from', line.discount_rule_id === 2872);
+  ok('...and every allocation carries it too', line.dealers.every((a) => a.item_discount_per === 12 && a.discounted_unit_price === 880));
+  const plain = portal._confirmBody({ id: 'ORD-T2', lines: [{ partNo: 'X1', qty: 1, source: 'portal', _raw: { part_no: 'X1', mrp: 500, discount_percent: 0, price: 500, allocations: [] } }] });
+  ok('a line with no discount gets no discount fields', plain.lines[0].item_discount_per === undefined && plain.lines[0].discounted_unit_price === undefined);
+}
+
+console.log('\nAT PUNCH, THE DISCOUNT COMES FROM THE ADMIN RULES\n');
+(async () => {
+  const portal = require('../src/integrations/dealerPortal');
+  portal._setMockDealerFor(265, { dealerId: 8858, accountId: 265, odooPartnerId: 1 });
+  portal._setMockDiscountRules([
+    { rule_id: 2872, dealer_id: 8858, rule_type: 'BRAND', brand: 'MARUTI', discount_mode: 'PERCENT', discount_value: 12, is_active: true, approval_status: 'APPROVED', min_qty: 1 },
+  ]);
+  // Quoted by the plain analyze: no money, no discount on the row.
+  const order = {
+    id: 'ORD-T3',
+    portalCustomer: { buyerId: 265 },
+    lines: [
+      { partNo: '16510M68K10', qty: 2, mrp: 1000, brand: 'MARUTI SUZUKI', source: 'portal', _raw: { part_no: '16510M68K10', dealers: [{ dealer_id: 23, qty: 2 }] } },
+      { partNo: 'BOSCH1', qty: 1, mrp: 400, brand: 'BOSCH', source: 'portal', _raw: { part_no: 'BOSCH1', dealers: [] } },
+    ],
+  };
+  const priced = await portal._discountForPunch(order);
+  const body = portal._confirmBody(priced);
+  ok('a line quoted with no discount is punched with the rule from the admin panel', body.lines[0].item_discount_per === 12 && body.lines[0].discounted_unit_price === 880, JSON.stringify(body.lines[0]));
+  ok('...its allocation too', body.lines[0].dealers[0].item_discount_per === 12);
+  ok('a part no rule covers goes at its price, no discount', body.lines[1].item_discount_per === undefined);
+  ok('the order itself is not changed', order.lines[0]._raw.discount_percent === undefined);
+  const noCustomer = await portal._discountForPunch({ id: 'ORD-T4', lines: order.lines });
+  ok('an order with no customer account goes as it was', noCustomer.lines === order.lines);
+  console.log('\n' + pass + ' passed, ' + fail + ' failed\n');
+  process.exit(fail ? 1 : 0);
+})();
