@@ -315,6 +315,9 @@ class CustomerBot {
     this.transport.onMessage((m) => require('../pipeline/shadow').around(this, m, () => this.handleMessage(m)));
     // An approval WhatsApp would not deliver is reported (core/deliveryWatch).
     if (this.transport.onDeliveryFailed) this.transport.onDeliveryFailed((info) => deliveryWatch.onFailed(this, info));
+    // Discount rules waiting for the Super Admin on the portal: the agent is
+    // told when one is approved (core/discountWatch).
+    require('../core/discountWatch').start(this);
     await this.transport.start();
   }
 
@@ -2695,7 +2698,13 @@ class CustomerBot {
           }
           const made = await this.createDiscountFor(r);
           if (made.ok) discountSetup.drop(r.id);
-          lines.push(made.ok ? '✅ ' + made.name : `⚠️ ${made.name} — ${made.why}`);
+          lines.push(
+            !made.ok
+              ? `⚠️ ${made.name} — ${made.why}`
+              : made.live
+                ? '✅ ' + made.name
+                : `📨 ${made.name} — ${t('on the Dealer Portal for a Super Admin to approve', 'Dealer Portal pe Super Admin ke approval ke liye')} (rule #${made.ruleId})`,
+          );
         }
         try {
           await this.transport.sendToChat(req.chatId, t(`${req.answers.name} is approved. Discount rules:\n${lines.join('\n')}`, `${req.answers.name} approve ho gaya. Discount rules:\n${lines.join('\n')}`));
@@ -3292,25 +3301,23 @@ class CustomerBot {
   // There used to be one more "Send for approval?" first, and a customer who
   // wrote anything else next — "Maruti part btao" — had it read as a no: the
   // change was dropped and the Sales Head never heard of it (25 Sep, live).
-  // The Sales Head's OK is the check; this one only lost requests.
+  // The Super Admin's approval on the portal is the check; this one only
+  // lost requests.
   async sendDiscountChange(m, st, submit, reply, t) {
     const r = st.rule;
     const d = st.draft;
     discountSetup.cancel(m.chatId);
     const askedByCustomer = /^customer/.test(String(st.setBy || ''));
-    const req = await submit('change', {
+    const { sent } = await submit('change', {
       ruleId: r.id,
       oldValue: r.value,
       oldName: r.name,
       oldRule: { minQty: r.minQty, maxQty: r.maxQty, validFrom: r.validFrom, validTo: r.validTo },
       customerPhone: askedByCustomer ? m.from : null,
     });
-    return reply(
-      t(
-        `${r.name || d.target}: ${r.value}% → ${d.value}%. Sent to the Sales Head for approval (${req.id}); the discount changes on the portal once it is approved.`,
-        `${r.name || d.target}: ${r.value}% → ${d.value}%. Sales Head ko approval ke liye bhej diya (${req.id}); approve hote hi portal pe discount update ho jayega.`,
-      ),
-    );
+    const head = `${r.name || d.target}: ${r.value}% → ${d.value}%.`;
+    if (!sent.ok) return reply(head + '\n' + t(`Could not put it on the portal: ${sent.why}. Please try again.`, `Portal pe nahi daal paya: ${sent.why}. Dobara try kijiye.`));
+    return reply(head + '\n' + this.discountSentText(sent, t));
   }
 
   // The portal's MRP for a part, for the price question.
@@ -3340,14 +3347,16 @@ class CustomerBot {
       store.log(this.key, `discount setup left (${st.count} rule(s) sent for approval)`);
       return reply(
         st.count
-          ? t(`Done — ${st.count} discount rule(s) are with the Sales Head for approval.`, `Theek hai — ${st.count} discount rule approval ke liye bhej diye hain.`)
+          ? t(`Done — ${st.count} discount rule(s) are on the Dealer Portal for a Super Admin's approval.`, `Theek hai — ${st.count} discount rule Dealer Portal pe Super Admin ke approval ke liye hain.`)
           : t('No discount rule, then. It can be set later.', 'Theek hai, koi discount rule nahi. Baad mein set ho sakta hai.'),
       );
     }
     // A price question or a part order in the middle is not an answer here.
     if (!m.buttonId && /\b(kitne|kitna|rate|stock|hai kya)\b|\?\s*$/i.test(said) && !['confirm', 'confirmChange'].includes(st.step)) return null;
 
-    // The request, filed and sent to the Sales Head.
+    // The request, filed and written straight to the Dealer Portal for the
+    // Super Admin (founder, 28 Sep: not to the Sales Head any more).
+    // -> { req, sent }
     const submit = async (type, extra) => {
       const req = discountSetup.file({
         type,
@@ -3364,10 +3373,10 @@ class CustomerBot {
         chatId: m.chatId,
         ...extra,
       });
-      await this.toApprovers(discountSetup.approvalText(req), { ref: req.id, requesterChat: m.chatId });
-      store.log(this.key, `${req.id}: discount ${type} for ${st.customer} sent for approval (${d.target || ''} ${d.value}%)`);
       approvalLog.record({ kind: 'discount', id: req.id, event: 'requested', by: st.setBy || null, customer: st.customer, detail: `${type === 'change' ? 'change ' + (extra && extra.oldValue) + '% → ' : ''}${d.kind || ''} ${d.target || ''} ${d.value}%`.trim() });
-      return req;
+      const sent = await this.discountToPortal(req, st.setBy || null);
+      store.log(this.key, `${req.id}: discount ${type} for ${st.customer} (${d.target || ''} ${d.value}%) ${sent.ok ? 'on the portal for approval' : 'NOT written: ' + sent.why}`);
+      return { req, sent };
     };
 
     switch (st.step) {
@@ -3595,7 +3604,7 @@ class CustomerBot {
         d.durationLabel = dur.label;
         d.ruleName = discountSetup.ruleName(st.customer, d.target, d.value);
         const priced = d.mrp ? `\nMRP ${money(d.mrp)} → ${money(discountSetup.priceAt(d.mrp, d.value))}` : '';
-        return next('confirm', discountSetup.describe(d, t) + priced + '\n\n' + t('Send this rule for approval?', 'Ye rule approval ke liye bhejun?'), [
+        return next('confirm', discountSetup.describe(d, t) + priced + '\n\n' + t('Send this rule to the Dealer Portal for approval?', 'Ye rule Dealer Portal pe approval ke liye bhejun?'), [
           { id: 'DSC_YES', title: t('Yes', 'Haan') },
           { id: 'DSC_NO', title: t('No, start again', 'Nahi, dobara') },
         ]);
@@ -3614,10 +3623,16 @@ class CustomerBot {
             { id: 'DSC_NO', title: t('No, start again', 'Nahi, dobara') },
           ]);
         }
-        const req = await submit('new', {});
+        const { sent } = await submit('new', {});
+        if (!sent.ok) {
+          return next('confirm', t(`Could not put it on the portal: ${sent.why}\nSend it again? Yes or no.`, `Portal pe nahi daal paya: ${sent.why}\nDobara bhejun? Haan ya Nahi.`), [
+            { id: 'DSC_YES', title: t('Yes', 'Haan') },
+            { id: 'DSC_NO', title: t('No, start again', 'Nahi, dobara') },
+          ]);
+        }
         st.count += 1;
         st.draft = {};
-        return next('more', t(`Sent for approval (${req.id}): ${d.ruleName}. Another rule for this customer?`, `Approval ke liye bhej diya (${req.id}): ${d.ruleName}. Is customer ke liye aur rule?`), [
+        return next('more', this.discountSentText(sent, t) + '\n\n' + t('Another rule for this customer?', 'Is customer ke liye aur rule?'), [
           { id: 'DSC_MORE_YES', title: t('Add another', 'Aur add karo') },
           { id: 'DSC_MORE_NO', title: t('Done', 'Bas itna') },
         ]);
@@ -3637,8 +3652,8 @@ class CustomerBot {
         if (!finished && !discountSetup.NO.test(said)) return null;
         return reply(
           t(
-            `Done — ${st.count} discount rule(s) sent to the Sales Head. Each is created on the portal once approved${st.accountRequestId ? ' and the account is open' : ''}.`,
-            `Ho gaya — ${st.count} discount rule approval ke liye bhej diye. Approve hote hi${st.accountRequestId ? ' (aur account khulte hi)' : ''} portal pe ban jayenge.`,
+            `Done — ${st.count} discount rule(s) ${st.accountRequestId ? 'go to the Dealer Portal once the account is open' : 'are on the Dealer Portal'}, waiting for a Super Admin's approval. I will tell you as each is approved.`,
+            `Ho gaya — ${st.count} discount rule ${st.accountRequestId ? 'account khulte hi Dealer Portal pe jayenge' : 'Dealer Portal pe hain'}, Super Admin ke approval ka wait. Har ek approve hote hi bata dunga.`,
           ),
         );
       }
@@ -3676,15 +3691,15 @@ class CustomerBot {
     }
     if (!target.dealerId) return { ok: false, name: req.rule.ruleName, why: target.why };
     const body = discountSetup.toPortal({ ...req.rule, requestId: req.id, setBy: req.by }, target, name);
+    // PENDING on the portal: the Super Admin approves it there, by hand
+    // (founder, 28 Sep). The bot never approves a rule itself.
+    body.approval_status = 'PENDING';
     try {
       const made = await portal.createDiscountRule(body);
-      // Approved here means approved there: a rule the portal parked as
-      // PENDING is put through its own review, or it never applies.
       const id = made && (made.rule_id || made.id);
-      if (id && made.approval_status && String(made.approval_status).toUpperCase() !== 'APPROVED') {
-        await portal.reviewDiscountRule(id, 'approve').catch((e) => store.log(this.key, `rule ${id} created but left ${made.approval_status}: ${String((e && e.message) || e).slice(0, 80)}`));
-      }
-      return { ok: true, name: body.rule_name };
+      const live = String((made && made.approval_status) || '').toUpperCase() === 'APPROVED';
+      if (id && !live && req.chatId) require('../core/discountWatch').watch(id, { chatId: req.chatId, name: body.rule_name });
+      return { ok: true, name: body.rule_name, ruleId: id, live };
     } catch (e) {
       return { ok: false, name: body.rule_name, why: String((e && e.message) || e).slice(0, 100) };
     }
@@ -3713,58 +3728,95 @@ class CustomerBot {
       return reply(t(`Rejected ${req.id}. ${req.by || 'They'} was told.`, `${req.id} reject kar diya. ${req.by || 'Unko'} bata diya.`));
     }
 
+    // A request filed before 28 Sep, when the Sales Head still approved on
+    // WhatsApp: it goes to the portal now, for the Super Admin like any other.
+    const sent = await this.discountToPortal(req, who);
+    if (!sent.ok) return reply(t(`Could not put it on the portal: ${sent.why}\nTry *OK ${req.id}* again.`, `Portal pe nahi daal paya: ${sent.why}\nDobara *OK ${req.id}* bhejiye.`));
+    const text = this.discountSentText(sent, t);
+    await tell(text);
+    return reply(text);
+  }
+
+  // ONE DISCOUNT REQUEST, WRITTEN TO THE DEALER PORTAL (founder, 28 Sep): a
+  // new rule or the changed %, left PENDING for the Super Admin, who approves
+  // it on the portal by hand. From then on orders get it: the portal applies
+  // an APPROVED rule at order punch, and the rule starts at midnight the day
+  // before (discountSetup.opensFrom), so it counts the moment it is approved.
+  // core/discountWatch tells the agent when that happens.
+  //   -> { ok, ruleId, name, live, waitsForAccount } | { ok: false, why }
+  async discountToPortal(req, by) {
+    const what = req.type === 'change' ? `${req.customer}: ${req.oldValue}% → ${req.rule.value}%` : `${req.rule.ruleName || req.customer}`;
     if (req.type === 'change') {
+      let now;
       try {
-        // THE SAME RULE, only its % changed — never a new rule. The rule as the
-        // portal has it now is sent back whole with the new value, so a PUT that
-        // treats a missing field as "clear it" cannot blank its brand, dates or
-        // limits.
-        const now = (await portal.listDiscountRules()).find((x) => String(x.rule_id || x.id) === String(req.ruleId));
-        if (!now) {
-          discountSetup.drop(req.id);
-          return reply(t(`Rule #${req.ruleId} is no longer on the portal — nothing was changed.`, `Rule #${req.ruleId} ab portal pe nahi hai — kuch change nahi kiya.`));
-        }
-        const keep = ['rule_type', 'part_no', 'brand', 'dealer_id', 'discount_mode', 'min_qty', 'max_qty', 'min_amount', 'max_amount', 'is_active', 'valid_from', 'valid_to', 'priority', 'rule_metadata'];
-        const body = {};
-        for (const k of keep) if (now[k] !== undefined) body[k] = now[k];
-        body.discount_value = req.rule.value;
-        body.rule_name = discountSetup.ruleName(req.customer, req.rule.target, req.rule.value);
-        body.rule_metadata = { ...(now.rule_metadata || {}), source: 'whatsapp-bot', requestId: req.id, changedFrom: req.oldValue, approvedBy: who };
-        const updated = await portal.updateDiscountRule(req.ruleId, body);
-        if (updated && updated.approval_status && String(updated.approval_status).toUpperCase() !== 'APPROVED') {
-          await portal.reviewDiscountRule(req.ruleId, 'approve').catch((e) => store.log(this.key, `rule ${req.ruleId} updated but left ${updated.approval_status}: ${String((e && e.message) || e).slice(0, 80)}`));
-        }
+        now = (await portal.listDiscountRules()).find((x) => String(x.rule_id || x.id) === String(req.ruleId));
+      } catch (e) {
+        return { ok: false, why: 'the portal did not answer: ' + String((e && e.message) || e).slice(0, 100) };
+      }
+      if (!now) {
+        discountSetup.drop(req.id);
+        return { ok: false, why: `rule #${req.ruleId} is no longer on the portal` };
+      }
+      // THE SAME RULE, only its % changed — never a new rule. Sent back whole,
+      // so a PUT that treats a missing field as "clear it" cannot blank its
+      // brand, dates or limits.
+      const keep = ['rule_type', 'part_no', 'brand', 'dealer_id', 'discount_mode', 'min_qty', 'max_qty', 'min_amount', 'max_amount', 'is_active', 'valid_from', 'valid_to', 'priority', 'rule_metadata'];
+      const body = {};
+      for (const k of keep) if (now[k] !== undefined) body[k] = now[k];
+      body.discount_value = req.rule.value;
+      body.valid_from = discountSetup.opensFrom(now.valid_from);
+      body.rule_name = discountSetup.ruleName(req.customer, req.rule.target, req.rule.value);
+      body.rule_metadata = { ...(now.rule_metadata || {}), source: 'whatsapp-bot', requestId: req.id, changedFrom: req.oldValue, setBy: by || null };
+      let updated;
+      try {
+        updated = await portal.updateDiscountRule(req.ruleId, body);
       } catch (e) {
         const why = String((e && e.message) || e).slice(0, 120);
         store.log(this.key, `${req.id} discount update FAILED: ${why}`);
-        return reply(t(`Could not update it: ${why}\nThe request is still here — try *OK ${req.id}* again.`, `Update nahi ho paya: ${why}\nRequest abhi bhi hai — dobara *OK ${req.id}* bhejiye.`));
+        return { ok: false, why };
       }
       discountSetup.drop(req.id);
-      store.log(this.key, `${req.id} approved by ${who} — rule ${req.ruleId} now ${req.rule.value}%`);
-      approvalLog.record({ kind: 'discount', id: req.id, event: 'approved', by: who, customer: req.customer, detail: `${what} (rule #${req.ruleId} updated)` });
-      await tell(t(`✅ Approved: ${what}. Updated on the portal.`, `✅ Approve ho gaya: ${what}. Portal pe update kar diya.`));
-      return reply(t(`Done — ${what}.`, `Ho gaya — ${what}.`));
+      const live = String((updated && updated.approval_status) || 'PENDING').toUpperCase() === 'APPROVED';
+      if (!live && req.chatId) require('../core/discountWatch').watch(req.ruleId, { chatId: req.chatId, name: body.rule_name, what });
+      store.log(this.key, `${req.id}: rule ${req.ruleId} changed to ${req.rule.value}% on the portal — ${live ? 'APPROVED' : 'waiting for the Super Admin'}`);
+      approvalLog.record({ kind: 'discount', id: req.id, event: 'sent to portal', by: by || null, customer: req.customer, detail: `${what} (rule #${req.ruleId})` });
+      return { ok: true, ruleId: req.ruleId, name: body.rule_name, live };
     }
 
-    // A new rule for an account that is itself still waiting: approved now,
-    // created the moment the account is.
+    // A new rule for an account that is itself still waiting: written to the
+    // portal the moment the account opens (the account approval path).
     if (req.accountRequestId && customerCreate.parked(req.accountRequestId)) {
       req.status = 'approved';
       discountSetup.requests.set(req.id, req);
-      store.log(this.key, `${req.id} approved by ${who} — waits for account ${req.accountRequestId}`);
-      approvalLog.record({ kind: 'discount', id: req.id, event: 'approved', by: who, customer: req.customer, detail: `${what} (created when ${req.accountRequestId} opens)` });
-      return reply(t(`Approved. It is created as soon as ${req.accountRequestId} is approved.`, `Approve ho gaya. ${req.accountRequestId} approve hote hi portal pe ban jayega.`));
+      store.log(this.key, `${req.id} waits for account ${req.accountRequestId} before it goes to the portal`);
+      return { ok: true, name: req.rule.ruleName || what, waitsForAccount: req.accountRequestId };
     }
     const made = await this.createDiscountFor(req);
     if (!made.ok) {
       store.log(this.key, `${req.id} discount create FAILED: ${made.why}`);
-      return reply(t(`Could not create it: ${made.why}\nTry *OK ${req.id}* again.`, `Nahi ban paya: ${made.why}\nDobara *OK ${req.id}* bhejiye.`));
+      return { ok: false, why: made.why };
     }
     discountSetup.drop(req.id);
-    store.log(this.key, `${req.id} approved by ${who} — created ${made.name}`);
-    approvalLog.record({ kind: 'discount', id: req.id, event: 'approved', by: who, customer: req.customer, detail: `${made.name} (created on the portal)` });
-    await tell(t(`✅ Discount rule approved and created: ${made.name}`, `✅ Discount rule approve ho gaya, portal pe ban gaya: ${made.name}`));
-    return reply(t(`Done — ${made.name}.`, `Ho gaya — ${made.name}.`));
+    store.log(this.key, `${req.id}: ${made.name} written to the portal as rule ${made.ruleId} — ${made.live ? 'APPROVED' : 'waiting for the Super Admin'}`);
+    approvalLog.record({ kind: 'discount', id: req.id, event: 'sent to portal', by: by || null, customer: req.customer, detail: `${made.name} (rule #${made.ruleId})` });
+    return { ok: true, ruleId: made.ruleId, name: made.name, live: made.live };
+  }
+
+  // What the agent is told once a request is on the portal.
+  discountSentText(sent, t) {
+    if (sent.waitsForAccount) {
+      return t(
+        `Saved: ${sent.name}. It goes to the Dealer Portal for approval as soon as account ${sent.waitsForAccount} is open.`,
+        `Save ho gaya: ${sent.name}. Account ${sent.waitsForAccount} khulte hi Dealer Portal pe approval ke liye chala jayega.`,
+      );
+    }
+    if (sent.live) {
+      return t(`✅ ${sent.name} (rule #${sent.ruleId}) is live on the Dealer Portal — orders get the discount from now.`, `✅ ${sent.name} (rule #${sent.ruleId}) Dealer Portal pe live hai — ab se order pe discount lagega.`);
+    }
+    return t(
+      `Sent to the Dealer Portal for approval: ${sent.name} (rule #${sent.ruleId}). Orders get the discount as soon as a Super Admin approves it there — I will tell you when.`,
+      `Dealer Portal pe approval ke liye bhej diya: ${sent.name} (rule #${sent.ruleId}). Super Admin approve karte hi order pe discount lagega — approve hote hi bata dunga.`,
+    );
   }
 
   // ---- payment before a new order (core/payments) ----

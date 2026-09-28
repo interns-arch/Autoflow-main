@@ -2453,19 +2453,21 @@ async function main() {
       for (let i = 0; i < 4; i++) await say20(AGENT20, 'skip');
       const sum20 = text20(await say20(AGENT20, '3 mahine'));
       check('the rule is named customer + brand + discount', /KALRA MOTORS CARTRENDS 12%/.test(sum20) && /Min qty: 1/.test(sum20) && /3 months/.test(sum20));
+      // 28 Sep, founder: not to the Sales Head - straight to the Dealer
+      // Portal, where the Super Admin approves it.
       const sent20 = await say20(AGENT20, 'Haan', 'DSC_YES');
-      const id20 = dscIn20(sent20);
-      const toAppr20 = sent20.filter((o) => o.to === APPR20).map((o) => o.text).join('\n');
-      check('the rule goes to the Sales Head for approval', Boolean(id20) && /\*Discount rule\*/.test(toAppr20) && /CARTRENDS — 12%/.test(toAppr20) && /OK DSC-/.test(toAppr20));
+      check('the rule is NOT sent to the Sales Head', !sent20.some((o) => o.to === APPR20));
+      check('...the agent is told it goes to the Dealer Portal once the account opens', /Account WA-DSC20 khulte hi Dealer Portal pe approval/.test(text20(sent20)), text20(sent20));
       await say20(AGENT20, 'Bas itna', 'DSC_MORE_NO');
       const before20 = (await portal.listDiscountRules()).length;
-      // the account is approved first: the rule waits for its own OK
+      // the account is approved: the rule goes to the portal with it
       await customer.decideNewCustomer({ chatId: 'sim-' + APPR20, from: APPR20 }, { yes: true, requestId: 'WA-DSC20' }, async () => true, tt20);
-      check('an unapproved rule is not created with the account', (await portal.listDiscountRules()).length === before20);
-      await say20(APPR20, 'OK ' + id20);
       const rules20 = await portal.listDiscountRules();
       const made20 = rules20[rules20.length - 1] || {};
-      check('"OK DSC-…" creates it on the portal', rules20.length === before20 + 1 && made20.rule_type === 'BRAND' && made20.brand === 'CARTRENDS' && made20.discount_value === 12);
+      check('when the account opens the rule is written to the portal', rules20.length === before20 + 1 && made20.rule_type === 'BRAND' && made20.brand === 'CARTRENDS' && made20.discount_value === 12);
+      check('...as PENDING, for the Super Admin to approve there', made20.approval_status === 'PENDING', made20.approval_status);
+      const watch20 = require('../src/core/discountWatch');
+      check('...and it is watched for that approval', watch20.pending().some((w) => String(w.ruleId) === String(made20.rule_id || made20.id)));
       check('...for the customer as the portal has them, for 3 months from today', made20.dealer_id === 1 && made20.rule_name === 'Mock Customer CARTRENDS 12%' && Date.parse(made20.valid_to) - Date.parse(made20.valid_from) > 85 * 864e5);
       check('a customer registering themselves is not asked for a discount', !ds20.pending('sim-919000000302'));
 
@@ -2481,13 +2483,12 @@ async function main() {
       for (let i = 0; i < 4; i++) await say20(AGENT20, 'skip');
       await say20(AGENT20, '30 din');
       const sent21 = await say20(AGENT20, 'Haan', 'DSC_YES');
-      const toAppr21 = sent21.filter((o) => o.to === APPR20).map((o) => o.text).join('\n');
-      check('...and the Sales Head sees MRP, sale price and the discount', /Part: 16510M65L10 — 15%/.test(toAppr21) && /MRP ₹200 → sells at ₹170 \(15% off, ₹30 per piece\)/.test(toAppr21));
+      check('...and nothing about it goes to the Sales Head', !sent21.some((o) => o.to === APPR20));
       await say20(AGENT20, 'Bas itna', 'DSC_MORE_NO');
       // rejected with the account: the rule goes with it
-      const id21 = dscIn20(sent21);
+      const waiting21 = ds20.forAccount('WA-DSC21').map((r) => r.id);
       await customer.decideNewCustomer({ chatId: 'sim-' + APPR20, from: APPR20 }, { yes: false, requestId: 'WA-DSC21' }, async () => true, tt20);
-      check('a rejected account takes its discount rules with it', !ds20.find(id21));
+      check('a rejected account takes its discount rules with it', waiting21.length === 1 && !ds20.find(waiting21[0]));
 
       // ---- an AGENT changes an EXISTING customer's discount ----
       // Only the sales team sets discounts (founder, 25 Sep): the agent names
@@ -2511,20 +2512,16 @@ async function main() {
       // live — the next message was read as a no and the change was lost).
       const sent22 = await say20(AGENT20, '15');
       check('...shown the change as it is sent', /12% → 15%/.test(text20(sent22)));
-      const id22 = dscIn20(sent22);
-      check('the change goes to the Sales Head, not the portal', /\*Discount change\*/.test(sent22.filter((o) => o.to === APPR20).map((o) => o.text).join('\n')) && (await portal.listDiscountRules())[0].discount_value === 12);
-      const ok22 = await say20(APPR20, 'OK ' + id22);
+      check('the change is NOT sent to the Sales Head', !sent22.some((o) => o.to === APPR20));
       const rule22 = (await portal.listDiscountRules())[0];
-      check('"OK DSC-…" updates only the discount on the portal', rule22.discount_value === 15 && rule22.brand === 'CARTRENDS' && rule22.rule_name === 'Mock Customer CARTRENDS 15%');
-      check('...and the agent is told', ok22.some((o) => String(o.to).indexOf(AGENT20) >= 0 && /12% → 15%/.test(o.text || '')));
-      // a NO leaves it as it was
-      await say20(AGENT20, 'discount change karna hai');
-      await say20(AGENT20, '9000000304');
-      await say20(AGENT20, 'haan');
-      await say20(AGENT20, '1');
-      const id23 = dscIn20(await say20(AGENT20, '20'));
-      await say20(APPR20, 'NO ' + id23);
-      check('"NO DSC-…" changes nothing', (await portal.listDiscountRules())[0].discount_value === 15);
+      check('the change goes straight to the portal, only the discount changed', rule22.discount_value === 15 && rule22.brand === 'CARTRENDS' && rule22.rule_name === 'Mock Customer CARTRENDS 15%', JSON.stringify(rule22));
+      check('...and the agent is told it waits for the Super Admin', /Dealer Portal pe approval ke liye bhej diya/.test(text20(sent22)) && /rule #501/.test(text20(sent22)), text20(sent22));
+      // The Super Admin approves it on the portal: the agent hears it.
+      rule22.approval_status = 'APPROVED';
+      customer.transport.outbox.length = 0;
+      const told22 = await require('../src/core/discountWatch').checkOnce(customer);
+      check('once approved on the portal, the agent is told orders get it from now', told22.some((x) => String(x.ruleId) === '501' && x.status === 'APPROVED') && customer.transport.outbox.some((o) => String(o.to).indexOf(AGENT20) >= 0 && /approve ho gaya — ab se order pe discount lagega/.test(o.text || '')), text20(customer.transport.outbox));
+      check('...and is told only once', (await require('../src/core/discountWatch').checkOnce(customer)).length === 0);
       cr20.team = teamWas22;
 
       // ---- the same flow with NOTHING TAPPED ----
@@ -2548,7 +2545,7 @@ async function main() {
       for (let i = 0; i < 4; i++) await say20(AGENT24, 'skip');
       await say20(AGENT24, '3 mahine');
       const sent24 = await say20(AGENT24, 'haan');
-      check('...typed "haan" sends it for approval', Boolean(dscIn20(sent24)));
+      check('...typed "haan" sends it for approval', /Dealer Portal/.test(text20(sent24)), text20(sent24));
       const done24 = text20(await say20(AGENT24, 'done'));
       check(
         '...and typed "done" at "another rule?" FINISHES — it does not start another',

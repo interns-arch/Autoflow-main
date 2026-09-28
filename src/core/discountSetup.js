@@ -74,6 +74,19 @@ function describe(r, t) {
   return lines.filter(Boolean).join('\n');
 }
 
+// THE START A RULE IS WRITTEN WITH: midnight the day before (see toPortal),
+// or the rule's own start when that is earlier still. null stays null - the
+// portal's own rules often have no start at all.
+function opensFrom(existing, now = new Date()) {
+  const iso = (d) => new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 19);
+  const opens = new Date(now);
+  opens.setDate(opens.getDate() - 1);
+  opens.setHours(0, 0, 0, 0);
+  if (existing === null) return null;
+  if (existing && new Date(existing).getTime() <= opens.getTime()) return existing;
+  return iso(opens);
+}
+
 // What the portal is sent, once the account exists. `target` is what
 // dealerPortal.dealerIdForAccount found: { dealerId, accountId, odooPartnerId }.
 // The rule carries the account and Odoo partner it was resolved from, and
@@ -137,10 +150,11 @@ function toPortal(r, target, customerName, from = new Date()) {
 // 10% rule and a MARUTI headlight came back at ₹21,310, and dealer 1002's
 // APPROVED MARUTI 12% was not applied either. So the rule is applied here.
 //
-// A rule counts when it is APPROVED on the portal, or when WE made it
-// (rule_metadata.source 'whatsapp-bot'): the bot only ever creates a rule
-// after a Sales Head said "OK DSC-…", and the portal keeps those PENDING
-// because only a Super Admin may review there.
+// A rule counts only when it is APPROVED on the portal - the same test the
+// portal applies at order punch, so a quote never shows a discount the SO
+// will not carry. (Until 28 Sep the bot's own PENDING rules counted too, and
+// quotes said 10% off while SO 1458 was punched at 0%.) The Super Admin
+// approves on the portal; from that moment quotes and orders both have it.
 //
 // Most specific wins: a rule for this part, then for its brand, then one for
 // every part; between two of the same kind, the bigger discount.
@@ -151,8 +165,7 @@ const counts = (r) =>
   // Rejected on the portal never counts, the bot's own included (26 Sep:
   // rule 2869, written to the wrong dealer and rejected in Super Admin,
   // still priced that dealer's parts at 15% off).
-  String(r.approval_status || '').toUpperCase() !== 'REJECTED' &&
-  (String(r.approval_status || '').toUpperCase() === 'APPROVED' || (r.rule_metadata && r.rule_metadata.source === 'whatsapp-bot'));
+  String(r.approval_status || '').toUpperCase() === 'APPROVED';
 
 // ONE MAKER, SEVERAL SPELLINGS. The portal's brand list offers "MARUTI
 // SUZUKI" while a rule read back says "MARUTI" and a part row can say either
@@ -352,5 +365,5 @@ const CHANGE_RE = WANTS_RE;
 
 module.exports = {
   open, get, pending, save, cancel, STEPS, SKIP, LATER, YES, NO, readNumber, readDuration, ruleName, describe, toPortal,
-  requests, file, find, drop, forAccount, approvalText, pctFromPrice, priceAt, money, CHANGE_RE, wantsSetup, ruleFor, activeRules,
+  requests, file, find, drop, forAccount, approvalText, pctFromPrice, priceAt, money, CHANGE_RE, wantsSetup, ruleFor, activeRules, opensFrom,
 };

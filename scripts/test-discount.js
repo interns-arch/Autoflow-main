@@ -116,6 +116,10 @@ console.log('\nNOTHING REACHES THE PORTAL BEFORE APPROVAL\n');
     const b = d.toPortal({ kind: 'brand', target: 'MARUTI', value: 10, days: 30 }, 8895, 'Customer Testing', at);
     ok('a new rule starts at midnight the day before, so it counts at once', b.valid_from === '2026-09-27T00:00:00', b.valid_from);
     ok('...and still ends the given days from today', b.valid_to === '2026-10-28T23:59:59', b.valid_to);
+    // A % change keeps the rule, and moves a start that is still ahead back.
+    ok('a change moves a start of 11:44 today back to midnight yesterday', d.opensFrom('2026-09-28T11:44:52', at) === '2026-09-27T00:00:00', d.opensFrom('2026-09-28T11:44:52', at));
+    ok('...keeps an earlier start as it was', d.opensFrom('2026-09-03T00:00:00', at) === '2026-09-03T00:00:00');
+    ok('...and a rule with no start keeps none', d.opensFrom(null, at) === null);
   }
   ok('the rule is named after the customer the portal knows', /MIYA JI MOTORS/.test(body.rule_name), body.rule_name);
   ok('it is tagged as the bot\'s, with the request it came from', body.rule_metadata.source === 'whatsapp-bot' && body.rule_metadata.requestId === 'DSC-TEST');
@@ -144,7 +148,8 @@ console.log('\nTHE RULE THAT PRICES A LINE\n');
   const now = new Date('2026-09-25T12:00:00Z');
   const base = { dealer_id: 8328, discount_mode: 'PERCENT', is_active: true, min_qty: 1 };
   const rules = [
-    { ...base, rule_id: 1, rule_type: 'BRAND', brand: 'MARUTI', discount_value: 10, approval_status: 'PENDING', rule_metadata: { source: 'whatsapp-bot' } },
+    { ...base, rule_id: 1, rule_type: 'BRAND', brand: 'MARUTI', discount_value: 10, approval_status: 'APPROVED', rule_metadata: { source: 'whatsapp-bot' } },
+    { ...base, rule_id: 9, rule_type: 'BRAND', brand: 'HYUNDAI', discount_value: 10, approval_status: 'PENDING', rule_metadata: { source: 'whatsapp-bot' } }, // the bot wrote it, the Super Admin has not approved it
     { ...base, rule_id: 2, rule_type: 'ITEM', part_no: '35121M55RB0', discount_value: 15, approval_status: 'APPROVED' },
     { ...base, rule_id: 3, rule_type: 'BRAND', brand: 'BOSCH', discount_value: 20, approval_status: 'PENDING' }, // typed on the portal, nobody approved it
     { ...base, rule_id: 4, rule_type: 'BRAND', brand: 'MINDA', discount_value: 9, approval_status: 'APPROVED', valid_to: '2026-09-01T00:00:00' },
@@ -152,7 +157,9 @@ console.log('\nTHE RULE THAT PRICES A LINE\n');
     { ...base, rule_id: 6, rule_type: 'BRAND', brand: 'LUMAX', discount_value: 7, approval_status: 'APPROVED', min_qty: 5 },
   ];
   const pick = (o) => (d.ruleFor(rules, { dealerId: 8328, now, ...o }) || {}).rule_id || null;
-  ok('a MARUTI part gets the MARUTI rule the Sales Head approved on WhatsApp', pick({ partNo: '01104M12556', brand: 'MARUTI' }) === 1);
+  ok('a MARUTI part gets the MARUTI rule approved on the portal', pick({ partNo: '01104M12556', brand: 'MARUTI' }) === 1);
+  // 28 Sep: only what the portal applies at order punch may be quoted.
+  ok('a rule the bot wrote but the Super Admin has not approved does not count', pick({ partNo: 'X', brand: 'HYUNDAI' }) === null);
   ok('a rule for the part itself beats the brand rule', pick({ partNo: '35121M55RB0', brand: 'MARUTI' }) === 2);
   ok('a PENDING rule nobody approved does not count', pick({ partNo: 'X', brand: 'BOSCH' }) === null);
   ok('an expired rule does not count', pick({ partNo: 'X', brand: 'MINDA' }) === null);
@@ -206,7 +213,7 @@ console.log('\nTHEIR DISCOUNTS TODAY\n');
 {
   const now = new Date('2026-09-25T12:00:00Z');
   const rules = [
-    { dealer_id: 8328, rule_type: 'BRAND', brand: 'MARUTI', discount_value: 10, is_active: true, approval_status: 'PENDING', rule_metadata: { source: 'whatsapp-bot' }, valid_to: '2026-09-26T23:59:59' },
+    { dealer_id: 8328, rule_type: 'BRAND', brand: 'MARUTI', discount_value: 10, is_active: true, approval_status: 'APPROVED', rule_metadata: { source: 'whatsapp-bot' }, valid_to: '2026-09-26T23:59:59' },
     { dealer_id: 8328, rule_type: 'ITEM', part_no: '35121M55RB0', discount_value: 15, is_active: true, approval_status: 'APPROVED', min_qty: 2 },
     { dealer_id: 8328, rule_type: 'BRAND', brand: 'BOSCH', discount_value: 20, is_active: true, approval_status: 'PENDING' },
     { dealer_id: 1002, rule_type: 'BRAND', brand: 'MARUTI', discount_value: 12, is_active: true, approval_status: 'APPROVED' },
@@ -257,6 +264,19 @@ console.log('\nAT PUNCH, THE DISCOUNT COMES FROM THE ADMIN RULES\n');
   ok('...its allocation too', body.lines[0].dealers[0].item_discount_per === 12);
   ok('a part no rule covers goes at its price, no discount', body.lines[1].item_discount_per === undefined);
   ok('the order itself is not changed', order.lines[0]._raw.discount_percent === undefined);
+  // "Only Super Admins can review requests." - a rule that stays PENDING is
+  // reported as waiting, never as live.
+  const reviewWas = portal.reviewDiscountRule;
+  try {
+    portal.reviewDiscountRule = async () => { throw Object.assign(new Error('HTTP 403 Only Super Admins can review requests.'), { status: 403, superAdminNeeded: true }); };
+    const pend = await portal.approveDiscountRule({ rule_id: 99, approval_status: 'PENDING' });
+    ok('a rule the portal will not approve comes back not live, and says a Super Admin is needed', pend.approved === false && pend.superAdminNeeded === true, JSON.stringify(pend));
+    portal.reviewDiscountRule = async () => ({ rule_id: 99, approval_status: 'APPROVED' });
+    ok('...and one it approves comes back live', (await portal.approveDiscountRule({ rule_id: 99, approval_status: 'PENDING' })).approved === true);
+    ok('a rule already APPROVED is not reviewed again', (await portal.approveDiscountRule({ rule_id: 99, approval_status: 'APPROVED' })).approved === true);
+  } finally {
+    portal.reviewDiscountRule = reviewWas;
+  }
   const noCustomer = await portal._discountForPunch({ id: 'ORD-T4', lines: order.lines });
   ok('an order with no customer account goes as it was', noCustomer.lines === order.lines);
   console.log('\n' + pass + ' passed, ' + fail + ' failed\n');

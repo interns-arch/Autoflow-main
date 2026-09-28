@@ -1245,19 +1245,43 @@ module.exports = {
       if (r) r.approval_status = decision === 'approve' ? 'APPROVED' : 'REJECTED';
       return r;
     }
+    // "Only Super Admins can review requests." (403, 28 Sep, live, rule 2873)
+    // - the bot's admin login never can. The approver login is a Super Admin
+    // (config.dealerPortal.approverUsername), used for this call and nothing
+    // else, so the Sales Head's "OK DSC-…" puts the rule live at once.
+    const as = hasApprover() ? 'approver' : 'admin';
     const tries = decision === 'approve' ? ['approve', 'APPROVE', 'APPROVED'] : ['reject', 'REJECT', 'REJECTED'];
     let last;
     for (const action of tries) {
       try {
-        const data = await api('POST', `/discount-rules/${encodeURIComponent(ruleId)}/review?action=${action}`, null, true, 'admin');
-        store.log('portal', `discount rule ${ruleId} reviewed: ${action}`);
+        const data = await api('POST', `/discount-rules/${encodeURIComponent(ruleId)}/review?action=${action}`, null, true, as);
+        forgetDiscountRules();
+        store.log('portal', `discount rule ${ruleId} reviewed: ${action} (as ${as})`);
         return data;
       } catch (e) {
         last = e;
         if (e && e.status && e.status !== 400 && e.status !== 422) break;
       }
     }
+    if (last && last.status === 403) {
+      last.superAdminNeeded = true;
+      if (!hasApprover()) last.message += ' — set DEALER_PORTAL_APPROVER_USERNAME / _PASSWORD to a Super Admin login on the portal';
+    }
     throw last;
+  },
+  // A rule just written, put through to APPROVED - which is what makes it
+  // apply at order punch. -> { approved: true } | { approved: false, why, superAdminNeeded }
+  async approveDiscountRule(rule) {
+    const id = rule && (rule.rule_id || rule.id);
+    const status = String((rule && rule.approval_status) || '').toUpperCase();
+    if (!id || status === 'APPROVED') return { approved: true };
+    try {
+      const done = await module.exports.reviewDiscountRule(id, 'approve');
+      const now = String((done && done.approval_status) || 'APPROVED').toUpperCase();
+      return now === 'APPROVED' ? { approved: true } : { approved: false, why: 'the portal still has it ' + now };
+    } catch (e) {
+      return { approved: false, superAdminNeeded: Boolean(e && e.superAdminNeeded), why: String((e && e.message) || e).slice(0, 300) };
+    }
   },
   // The customer's discounts that apply today (core/discountSetup.activeRules),
   // from the same five-minute copy of the rules the prices use.
