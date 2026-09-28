@@ -47,6 +47,9 @@ const fs = require('fs');
 const os = require('os');
 
 const config = require('../src/config');
+// Most of this suite finds customers by name and GSTIN; the mobile-only
+// search (the default since 26 Sep) has its own section, [74].
+config.customerSearchBy = 'any';
 config.dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'autoflow-smoke-'));
 config.customerDms = ['919899555001'];
 config.adminNumbers = ['919800000009'];
@@ -5832,6 +5835,302 @@ async function main() {
       ai70.parseOrderImage = readWas70;
       customer.isOperator = () => true;
       config.customerDms = dmsWas70;
+    }
+  }
+
+  // 26 Sep, live: Shubham asked "Only avl item punch Krna hai" five ways, and
+  // ORD-1069 still reached Prateek sir with all 58 lines.
+  console.log('\n[71] "only available items": the cart and the approval carry only what is in stock');
+  {
+    const S71 = '919000000711';
+    const C71 = 'sim-' + S71;
+    config.salesTeamNumbers.push(S71);
+    const d71 = orders.getOrCreateDraft(C71, S71);
+    orders.addLines(d71, [
+      { item: 'AA-1', partNo: 'AA-1', qty: 4, source: 'portal', available: 10, mrp: 100 },
+      { item: 'BB-2', partNo: 'BB-2', qty: 5, source: 'portal', available: 2, mrp: 200 },
+      { item: 'CC-3', partNo: 'CC-3', qty: 3, source: 'unavailable', available: 0, mrp: 300 },
+      { item: 'DD-4', partNo: 'DD-4', qty: 1, source: 'portal', available: 0, mrp: 400 },
+    ]);
+    d71.portalCustomer = { buyerId: 345, name: 'Houseneed Test' };
+    d71.confirmAskedAt = new Date().toISOString();
+    try {
+      customer.transport.outbox.length = 0;
+      await customer.transport.injectIncoming({ id: 'wamid.s71', from: S71, chatId: C71, isGroup: false, body: 'Only avl item punch Krna hai', hasMedia: false, mediaType: 'chat' });
+      const said71 = customer.transport.outbox.filter((o) => o.to === C71).map((o) => o.text).join('\n');
+      check('"only avl item" keeps the two in-stock lines', d71.lines.map((l) => l.partNo).join(',') === 'AA-1,BB-2', d71.lines.map((l) => l.partNo).join(','));
+      check('...cuts the short one to what is in stock', d71.lines[1] && d71.lines[1].qty === 2);
+      check('...and says so, asking before sending', /2 item|Removed 2/i.test(said71) && /approval/i.test(said71), said71);
+
+      // The other ways he said it, live - with no list just asked about.
+      for (const say of ['Sirf available part btao', 'Only avl item do', 'Send request of only available parts', 'sirf stock wale items bhejo']) {
+        orders.addLines(d71, [{ item: 'CC-3', partNo: 'CC-3', qty: 3, source: 'unavailable', available: 0, mrp: 300 }]);
+        d71.confirmAskedAt = null;
+        customer.transport.outbox.length = 0;
+        await customer.transport.injectIncoming({ id: 'wamid.s71-' + Math.random(), from: S71, chatId: C71, isGroup: false, body: say, hasMedia: false, mediaType: 'chat' });
+        check(`"${say}" drops the line on order`, d71.lines.map((l) => l.partNo).join(',') === 'AA-1,BB-2', d71.lines.map((l) => l.partNo).join(','));
+      }
+
+      // The approval lists only what will be punched.
+      const d71b = orders.getOrCreateDraft('sim-919000000712', '919000000712');
+      orders.addLines(d71b, [
+        { item: 'AA-1', partNo: 'AA-1', qty: 4, source: 'portal', available: 10, mrp: 100 },
+        { item: 'CC-3', partNo: 'CC-3', qty: 3, source: 'unavailable', available: 0, mrp: 300 },
+      ]);
+      d71b.portalCustomer = { buyerId: 345, name: 'Houseneed Test' };
+      let appr71 = '';
+      const toWas71 = customer.toApprovers;
+      customer.toApprovers = async (text) => {
+        appr71 = text;
+        return 1;
+      };
+      try {
+        await customer.requestOrderApproval(d71b, { by: 'Test Agent' });
+      } finally {
+        customer.toApprovers = toWas71;
+      }
+      check('the approval lists the in-stock line', /AA-1 × 4/.test(appr71), appr71);
+      check('...and not the one on order, only a count of it', !/CC-3/.test(appr71) && /1 other item/.test(appr71), appr71);
+
+      // Approved: the agent AND the customer hear what was punched and what not.
+      d71b.portalCustomer.phone = '9000000799';
+      d71b.leftOut = ['EE-5 × 2'];
+      d71b.leftOutLines = [{ partNo: 'EE-5', item: 'EE-5', qty: 2, price: 50 }];
+      const confWas71 = orders.confirm;
+      const opWas71 = customer.isOperator;
+      customer.isOperator = realIsOperator;
+      orders.confirm = async () => ({ soNumber: 'SO-71', placed: [{ soNumber: 'SO-71' }], punchedLines: [{ partNo: 'AA-1', qty: 4 }], skipped: [{ partNo: 'CC-3', qty: 3 }], short: [] });
+      customer.transport.outbox.length = 0;
+      try {
+        await customer.decideOrder({ from: '919999492550', chatId: 'sim-919999492550' }, { requestId: d71b.id, yes: true }, async () => {}, (en) => en);
+      } finally {
+        orders.confirm = confWas71;
+        customer.isOperator = opWas71;
+      }
+      const toCust71 = customer.transport.outbox.filter((o) => /9000000799/.test(o.to || '')).map((o) => o.text || '').join('\n');
+      const toAgent71 = customer.transport.outbox.filter((o) => o.to === 'sim-919000000712').map((o) => o.text || '').join('\n');
+      check('the customer is told on their own number', /SO-71/.test(toCust71) && /AA-1 × 4/.test(toCust71), JSON.stringify(customer.transport.outbox.map((o) => o.to)));
+      check('...with the parts that could not be punched, including ones the agent took out', /CC-3 × 3/.test(toCust71) && /EE-5 × 2/.test(toCust71), toCust71);
+      check('the agent gets the same breakdown', /CC-3 × 3/.test(toAgent71) && /AA-1 × 4/.test(toAgent71), toAgent71);
+
+      // ETA FIRST (founder, 26 Sep): the parts on order are offered to the
+      // customer with the ETA explained; booked on the portal only on a yes.
+      const adv71 = require('../src/core/advanceOrders');
+      const CUST71 = '919000000799@cloud';
+      check('the customer is offered the parts on order with the ETA explained', /ETA/.test(toCust71) && /estimated time of arrival/i.test(toCust71) && /CC-3/.test(toCust71) && /(HAAN|YES)/.test(toCust71), toCust71);
+      check('...including the part the agent took out before approval', /EE-5 × 2 — ETA/.test(toCust71), toCust71);
+      check('...and nothing is booked before they answer', portal._mockAdvance().length === 0);
+      check('the agent is told the customer was asked', /asked to accept the ETA|ETA .*poocha/i.test(toAgent71), toAgent71);
+      check('the offer is standing on the customer chat', Boolean(adv71.pending(CUST71)));
+
+      customer.transport.outbox.length = 0;
+      await customer.transport.injectIncoming({ id: 'wamid.s71-yes', from: '919000000799', chatId: CUST71, isGroup: false, body: 'haan', hasMedia: false, mediaType: 'chat' });
+      const booked71 = portal._mockAdvance()[0];
+      check('"haan" books an advance order on the portal', Boolean(booked71), JSON.stringify(customer.transport.outbox.map((o) => o.text)));
+      check('...for that customer, unallocated, the on-order part with its whole quantity short', booked71 && booked71.selected_buyer_id === 345 && booked71.include_unallocated === true && booked71.allow_empty_dealers === true && booked71.lines.length === 2 && booked71.lines[0].part_no === 'CC-3' && booked71.lines[0].shortfall === 3 && booked71.lines[1].part_no === 'EE-5' && booked71.lines.every((l) => l.dealers.length === 0), JSON.stringify(booked71));
+      const after71 = customer.transport.outbox.map((o) => `${o.to}: ${o.text || ''}`).join('\n');
+      check('...the customer is told it is booked, with the date', /Advance mein book|Booked in advance/.test(after71), after71);
+      check('...and the agent is told', customer.transport.outbox.some((o) => o.to === 'sim-919000000712' && /advance order/i.test(o.text || '')), after71);
+      check('...and the offer is closed', !adv71.pending(CUST71));
+
+      // A "no" books nothing.
+      const d71c = orders.getOrCreateDraft('sim-919000000713', '919000000713');
+      orders.addLines(d71c, [{ item: 'FF-6', partNo: 'FF-6', qty: 2, source: 'unavailable', available: 0, mrp: 100 }]);
+      d71c.portalCustomer = { buyerId: 346, name: 'Nahi Motors', phone: '9000000798' };
+      await customer.requestOrderApproval(d71c, { by: 'Test Agent' }).catch(() => {});
+      d71c.status = 'approval';
+      const confWas71c = orders.confirm;
+      orders.confirm = async () => ({ nothingInStock: true, skipped: d71c.lines });
+      customer.isOperator = realIsOperator;
+      let decided71 = '';
+      try {
+        await customer.decideOrder({ from: '919999492550', chatId: 'sim-919999492550' }, { requestId: d71c.id, yes: true }, async (x) => { decided71 = x; }, (en) => en);
+      } finally {
+        orders.confirm = confWas71c;
+        customer.isOperator = opWas71;
+      }
+      check('with nothing in stock, the approver hears the customer was asked about the ETA', /asked to accept an ETA/.test(decided71), decided71);
+      check('...and the offer is standing', Boolean(adv71.pending('919000000798@cloud')));
+      const n71 = portal._mockAdvance().length;
+      customer.transport.outbox.length = 0;
+      await customer.transport.injectIncoming({ id: 'wamid.s71-no', from: '919000000798', chatId: '919000000798@cloud', isGroup: false, body: 'nahi', hasMedia: false, mediaType: 'chat' });
+      check('"nahi" books nothing, and says so', portal._mockAdvance().length === n71 && /kuch book nahi|nothing has been booked/i.test(customer.transport.outbox.map((o) => o.text || '').join('\n')));
+      orders.cancel(d71c);
+
+      // The portal's own ETA date wins over the standard one when it has one.
+      portal._setMockEta('GG-7', [{ partNo: 'GG-7', eta: '2099-01-15' }]);
+      const eta71 = await adv71.withEta([{ partNo: 'GG-7', qty: 1 }, { partNo: 'HH-8', qty: 1 }]);
+      check('ETA: the portal date when it has one, the standard days otherwise', eta71.lines[0].etaDate === '2099-01-15' && eta71.lines[1].etaFromPortal === false && eta71.etaDate === '2099-01-15');
+      orders.cancel(d71b);
+
+      // 26 Sep, live: DSC-NH2X reached Prateek sir only - WhatsApp refused
+      // Arun sir's and Shad's (131042 template, then 131047) - and the agent
+      // was told "Sent for approval" regardless.
+      console.log('\n[72] an approval WhatsApp would not deliver is reported to whoever asked');
+      const dw72 = require('../src/core/deliveryWatch');
+      const cr72 = require('../src/config').creation;
+      const apprWas72 = cr72.approvers;
+      cr72.approvers = { 919999492550: 'Prateek Sir', 919773900582: 'Arun Sir', 916388059016: 'Shad' };
+      try {
+        customer.transport.outbox.length = 0;
+        await customer.toApprovers('*Discount rule* — DSC-T72', { ref: 'DSC-T72', requesterChat: 'sim-919000000721' });
+        const ids72 = Object.fromEntries(customer.transport.outbox.filter((o) => /DSC-T72/.test(o.text)).map((o) => [o.to, o.id]));
+        check('(the request went to all three)', Object.keys(ids72).length === 3, JSON.stringify(ids72));
+        customer.transport.outbox.length = 0;
+        // Shad: the template fails first (not tracked), then the request itself.
+        await customer.transport.injectFailure({ id: 'wamid.template-x', to: '916388059016', code: 131042, why: 'Business eligibility payment issue' });
+        await customer.transport.injectFailure({ id: ids72['916388059016'], to: '916388059016', code: 131047, why: 'Re-engagement message' });
+        await customer.transport.injectFailure({ id: ids72['919773900582'], to: '919773900582', code: 131047, why: 'Re-engagement message' });
+        await customer.transport.injectFailure({ id: ids72['919773900582'], to: '919773900582', code: 131047, why: 'Re-engagement message' }); // a repeat
+        check('nothing is said while the failures are still coming in', customer.transport.outbox.length === 0);
+        await dw72._flushAll(customer);
+        const toAgent72 = customer.transport.outbox.filter((o) => /919000000721/.test(o.to || '')).map((o) => o.text);
+        const toPrateek72 = customer.transport.outbox.filter((o) => o.to === '919999492550').map((o) => o.text);
+        check('the agent who asked gets ONE note naming both who did not get it', toAgent72.length === 1 && /DSC-T72/.test(toAgent72[0]) && /Shad/.test(toAgent72[0]) && /Arun Sir/.test(toAgent72[0]), JSON.stringify(toAgent72));
+        check('...saying Prateek sir got it and can approve it - nothing to do', /Prateek Sir/.test(toAgent72[0] || '') && /approve/i.test(toAgent72[0] || '') && /nothing to do|kuch karne ki zaroorat nahi/i.test(toAgent72[0] || ''), toAgent72[0]);
+        check('...with the reason: Meta billing, and "Hi" for the 24h window', /currency|payment method/i.test(toAgent72[0] || '') && /Hi/.test(toAgent72[0] || ''), toAgent72[0]);
+        check('the Sales Head who got it is not bothered with it', toPrateek72.length === 0, JSON.stringify(toPrateek72));
+        check('...and nothing is sent to the ones it could not reach', !customer.transport.outbox.some((o) => o.to === '916388059016' || o.to === '919773900582'));
+
+        // It reached NOBODY: that is the alarm.
+        dw72._reset();
+        customer.transport.outbox.length = 0;
+        await customer.toApprovers('*Discount rule* — DSC-U72', { ref: 'DSC-U72', requesterChat: 'sim-919000000721' });
+        const idsU72 = Object.fromEntries(customer.transport.outbox.filter((o) => /DSC-U72/.test(o.text)).map((o) => [o.to, o.id]));
+        customer.transport.outbox.length = 0;
+        for (const [to, id] of Object.entries(idsU72)) await customer.transport.injectFailure({ id, to, code: 131047, why: 'Re-engagement message' });
+        await dw72._flushAll(customer);
+        const alarm72 = customer.transport.outbox.filter((o) => /919000000721/.test(o.to || '')).map((o) => o.text).join('\n');
+        check('when no Sales Head got it, the agent is warned it must be sent again', /⚠️/.test(alarm72) && /dobara|sent again/i.test(alarm72), alarm72);
+        customer.transport.outbox.length = 0;
+        await customer.transport.injectFailure({ id: 'wamid.unrelated', to: '919000000999', code: 131047, why: '' });
+        await dw72._flushAll(customer);
+        check('a failure of any other message warns nobody', customer.transport.outbox.length === 0);
+      } finally {
+        cr72.approvers = apprWas72;
+        dw72._reset();
+      }
+
+      // 26 Sep, live: Shad answered DSC-OCDJ with just "ok'" and was told
+      // "koi order pending nahi hai"; the discount sat there.
+      console.log('\n[73] a Sales Head\'s bare "ok" decides the one request open');
+      const cr73 = require('../src/config').creation;
+      const apprWas73 = cr73.approvers;
+      cr73.approvers = { 916388059016: 'Shad' };
+      const d73 = orders.getOrCreateDraft('sim-919000000731', '919000000731');
+      orders.addLines(d73, [{ item: 'AA-1', partNo: 'AA-1', qty: 1, source: 'portal', available: 5, mrp: 100 }]);
+      d73.portalCustomer = { buyerId: 345, name: 'Bare OK Motors' };
+      d73.status = 'approval';
+      d73.approvalAskedAt = new Date().toISOString();
+      const old73 = orders.getOrCreateDraft('sim-919000000732', '919000000732');
+      old73.status = 'approval';
+      old73.approvalAskedAt = new Date(Date.now() - 5 * 86400000).toISOString();
+      const openWas73 = customer.openApprovals;
+      const opWas73 = customer.isOperator;
+      const confWas73 = orders.confirm;
+      customer.isOperator = realIsOperator;
+      try {
+        const open73 = customer.openApprovals();
+        check('open requests: a fresh order waiting is one', open73.includes(d73.id), JSON.stringify(open73));
+        check('...one left unanswered five days ago is not', !open73.includes(old73.id));
+        customer.openApprovals = () => [d73.id];
+        let punched73 = 0;
+        orders.confirm = async () => {
+          punched73++;
+          return { soNumber: 'SO-73', placed: [{ soNumber: 'SO-73' }], punchedLines: [{ partNo: 'AA-1', qty: 1 }], skipped: [], short: [] };
+        };
+        customer.transport.outbox.length = 0;
+        await customer.transport.injectIncoming({ id: 'wamid.s73', from: '916388059016', chatId: '916388059016@cloud', isGroup: false, body: "ok'", hasMedia: false, mediaType: 'chat' });
+        const said73 = customer.transport.outbox.filter((o) => /6388059016/.test(o.to || '')).map((o) => o.text).join('\n');
+        check('"ok\'" with one request open approves it', punched73 === 1 && /SO-73/.test(said73), said73);
+        check('...and is never answered "no order pending"', !/pending nahi|no order/i.test(said73), said73);
+
+        customer.openApprovals = () => ['DSC-AAAA', 'ORD-9999'];
+        customer.transport.outbox.length = 0;
+        await customer.transport.injectIncoming({ id: 'wamid.s73b', from: '916388059016', chatId: '916388059016@cloud', isGroup: false, body: 'ok', hasMedia: false, mediaType: 'chat' });
+        const ask73 = customer.transport.outbox.filter((o) => /6388059016/.test(o.to || '')).map((o) => o.text).join('\n');
+        check('with two open, a bare "ok" decides nothing and asks which', punched73 === 1 && /OK DSC-AAAA/.test(ask73) && /OK ORD-9999/.test(ask73), ask73);
+      } finally {
+        customer.openApprovals = openWas73;
+        customer.isOperator = opWas73;
+        orders.confirm = confWas73;
+        cr73.approvers = apprWas73;
+        orders.cancel(d73);
+        orders.cancel(old73);
+      }
+
+      // 26 Sep, founder: "make customer search using only mobile no. not gst
+      // or name".
+      console.log('\n[74] customers are searched by mobile number only');
+      const so74 = require('../src/core/salesOrder');
+      const S74 = '919000000741';
+      const C74 = 'sim-' + S74;
+      config.salesTeamNumbers.push(S74);
+      config.customerSearchBy = 'mobile';
+      portal.setMockCustomers([
+        { id: 265, name: 'Kalra Motors', home_branch_dealer: 23, address: 'Gurgaon, Haryana (IN)', group_name: '', gst_no: '06AABCK1234L1Z5', phone: '9811122233' },
+      ]);
+      const say74 = async (body) => {
+        customer.transport.outbox.length = 0;
+        await customer.transport.injectIncoming({ id: 'wamid.s74-' + Math.random(), from: S74, chatId: C74, isGroup: false, body, hasMedia: false, mediaType: 'chat' });
+        return customer.transport.outbox.filter((o) => /919000000741/.test(o.to || '')).map((o) => o.text || '').join('\n');
+      };
+      try {
+        so74._resetDirectory();
+        check('a GSTIN is not a customer key', so74.readCustomerKey('06AABCK1234L1Z5') === null);
+        check('a mobile number is', JSON.stringify(so74.readCustomerKey('9811122233')) === JSON.stringify({ phone: '919811122233' }));
+        const byName74 = await say74('search Kalra Motors');
+        check('"search Kalra Motors" asks for the mobile number, and finds nobody by name', /mobile number/i.test(byName74) && !/Kalra Motors/.test(byName74.replace(/search Kalra Motors/g, '')), byName74);
+        so74._resetDirectory();
+        const so74a = await say74('Kalra Motors ka SO bana do');
+        check('"Kalra Motors ka SO bana do" asks for the mobile number', /mobile number/i.test(so74a) && !/Which one|Kaunsa/.test(so74a), so74a);
+        const gst74 = await say74('06AABCK1234L1Z5');
+        check('a GSTIN on its own asks for the mobile number instead', /mobile number/i.test(gst74), gst74);
+        so74._resetDirectory();
+        const ledger74 = await say74('Kalra Motors ka ledger');
+        check('"Kalra Motors ka ledger" asks for the mobile number', /mobile number/i.test(ledger74), ledger74);
+        so74._resetDirectory();
+        const phone74 = await say74('9811122233');
+        check('the mobile number finds the customer and shows the card', /Kalra Motors/.test(phone74), phone74);
+      } finally {
+        config.customerSearchBy = 'any';
+        config.salesTeamNumbers.splice(config.salesTeamNumbers.indexOf(S74), 1);
+        so74._resetDirectory();
+      }
+
+      // 26 Sep, live: Houseneed (ACCOUNT 227) had its discount rule written to
+      // DEALER 227 - Dhakad Car Decor. Houseneed's dealer is 3340.
+      console.log('\n[75] discount rules go to the customer\'s DEALER id, never its account id');
+      {
+        portal._resetDealerCache();
+        portal._setMockDealerFor(227, { dealerId: 3340, dealerName: 'Houseneed Doorstep Services Private Limited', odooPartnerId: 1696, accountId: 227, accountName: 'Houseneed Doorstep Services Private Limited' });
+        portal._setMockDealerFor(9999, { dealerId: null, accountId: 9999, why: 'no dealer record carries Odoo partner 4242' });
+        portal._setMockDiscountRules([
+          { rule_id: 1, rule_type: 'BRAND', brand: 'MARUTI', dealer_id: 227, discount_mode: 'PERCENT', discount_value: 12, approval_status: 'APPROVED', is_active: true, rule_name: 'Dhakad MARUTI 12%' },
+          { rule_id: 2, rule_type: 'BRAND', brand: 'TATA', dealer_id: 3340, discount_mode: 'PERCENT', discount_value: 7, approval_status: 'APPROVED', is_active: true, rule_name: 'Houseneed TATA 7%' },
+        ]);
+        const disc75 = await portal.activeDiscounts(227);
+        check("a customer's discounts are the ones on its DEALER (3340), not on dealer 227", disc75.length === 1 && /TATA/i.test(JSON.stringify(disc75)), JSON.stringify(disc75));
+
+        const made75 = await customer.createDiscountFor({ id: 'DSC-T75', rule: { kind: 'brand', target: 'MARUTI SUZUKI', value: 15, minQty: 1, days: 30, ruleName: 'x' }, customer: 'Houseneed Doorstep Services Private Limited', dealerId: 227, by: 'Shubham' });
+        const rule75 = (await portal.listDiscountRules()).find((r) => r.rule_metadata && r.rule_metadata.requestId === 'DSC-T75');
+        check('a request filed with the account id in dealerId (before the fix) is created on dealer 3340', made75.ok && rule75 && rule75.dealer_id === 3340, JSON.stringify(rule75));
+        check('...and the rule says which account and Odoo partner it was resolved from', rule75 && rule75.rule_metadata.account_id === 227 && rule75.rule_metadata.odoo_partner_id === 1696);
+
+        const made75b = await customer.createDiscountFor({ id: 'DSC-T75B', rule: { kind: 'brand', target: 'MARUTI', value: 10, minQty: 1, days: 30, ruleName: 'y' }, customer: 'Nolink Motors', accountId: 9999, odooPartnerId: null, by: 'Shubham' });
+        check('an account with no single dealer gets no rule at all, and says why', !made75b.ok && /no dealer record/.test(made75b.why || ''), JSON.stringify(made75b));
+
+        const card75 = await require('../src/core/salesOrder').customerCard({ id: 227, name: 'Houseneed Doorstep Services Private Limited', credit_limit: 100000 }, (en) => en);
+        check('the card names both ids for what they are', /Account id: 227 · Dealer id: 3340/.test(card75), card75);
+        const ds75 = require('../src/core/discountSetup');
+        const rej75 = ds75.activeRules([{ rule_id: 9, rule_type: 'BRAND', brand: 'MARUTI', dealer_id: 227, discount_mode: 'PERCENT', discount_value: 15, approval_status: 'REJECTED', is_active: true, rule_metadata: { source: 'whatsapp-bot' } }], 227);
+        check("a bot rule REJECTED on the portal gives no discount", rej75.length === 0, JSON.stringify(rej75));
+        portal._resetDealerCache();
+        portal._setMockDiscountRules([]);
+      }
+    } finally {
+      config.salesTeamNumbers.splice(config.salesTeamNumbers.indexOf(S71), 1);
+      if (orders.findDraft(C71)) orders.cancel(orders.findDraft(C71));
     }
   }
 

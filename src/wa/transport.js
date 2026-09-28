@@ -44,6 +44,13 @@ class SimTransport {
   onMessage(fn) {
     this.handlers.push(fn);
   }
+  onDeliveryFailed(fn) {
+    (this.failHandlers = this.failHandlers || []).push(fn);
+  }
+  // Tests: WhatsApp reporting a message as not delivered.
+  async injectFailure(info) {
+    for (const fn of this.failHandlers || []) await fn(info);
+  }
   // called by the console simulator to inject an inbound message
   async injectIncoming(msg) {
     await dispatch(this.handlers, msg);

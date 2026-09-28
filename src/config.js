@@ -189,6 +189,9 @@ const config = {
   // its own (every allocation comes back with tatDays: null), so this is the
   // founder's rule, written once. Shown to the customer as "ETA = 7 days".
   onOrderEtaDays: Math.max(1, parseInt(process.env.ON_ORDER_ETA_DAYS || '7', 10)),
+  // How staff find a customer: 'any' (28 Sep - mobile, GSTIN or name) or
+  // 'mobile' (the 26 Sep rule - the mobile number only).
+  customerSearchBy: (process.env.CUSTOMER_SEARCH_BY || 'any').trim().toLowerCase(),
   documents: {
     pdf: (process.env.PDF_READING || 'on').toLowerCase() !== 'off',
   },

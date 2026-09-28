@@ -174,10 +174,37 @@ async function findCustomers(query) {
 // number with digits in it is not a phone number.
 const GSTIN_IN = /^(?:gst(?:in)?(?:\s*(?:no|number))?\s*[:\-]?\s*)?([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9A-Z]Z[0-9A-Z])$/i;
 const PHONE_IN = /^(?:(?:customer|cust|party|mobile|mob|phone|number|no)\.?\s*(?:no\.?|number)?\s*[:\-]?\s*)?(?:\+?91[\s-]?)?([6-9]\d{4}[\s-]?\d{5})$/i;
+// MOBILE NUMBER ONLY (founder, 26 Sep): "make customer search using only
+// mobile no. not gst or name". Names and GSTINs are not searched; the agent
+// is asked for the mobile number instead. CUSTOMER_SEARCH_BY=any brings the
+// GST and name searches back.
+const mobileOnly = () => String(config.customerSearchBy || 'mobile').toLowerCase() === 'mobile';
+const askMobile = (t) =>
+  t(
+    "Send the customer's 10-digit mobile number — customers are searched by mobile number only (not by name or GST).",
+    'Customer ka 10 digit mobile number bhejiye — customer sirf mobile number se search hota hai (naam ya GST se nahi).',
+  );
+const isGstinOnly = (text) => GSTIN_IN.test(String(text || '').trim().replace(/\s+/g, ' '));
+// The customers a NAME points at — or, searching by mobile only, the ones
+// for the mobile number in it; { needMobile: true } when there is none.
+async function customersFor(name) {
+  if (!mobileOnly()) {
+    let f = await findCustomers(name);
+    if (!f.total) f = await findCustomersFuzzy(name);
+    return f;
+  }
+  const k = findKeyIn(name);
+  if (k && k.phone) {
+    const rows = await findByKey(k);
+    return { total: rows.length, top: rows.slice(0, MAX_CANDIDATES) };
+  }
+  return { total: 0, top: [], needMobile: true };
+}
+
 function readCustomerKey(text) {
   const t = String(text || '').trim();
   const g = t.replace(/\s+/g, ' ').match(GSTIN_IN);
-  if (g) return { gst: g[1].toUpperCase() };
+  if (g && !mobileOnly()) return { gst: g[1].toUpperCase() };
   const p = t.match(PHONE_IN);
   if (p) return { phone: '91' + p[1].replace(/\D/g, '') };
   return null;
@@ -255,7 +282,7 @@ const INFO_RE = /\b(customer|party|client|account|khata|gst|gstin)\b[\s\S]{0,40}
 function findKeyIn(text) {
   const s = String(text || '');
   const g = s.toUpperCase().match(/\b[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9A-Z]Z[0-9A-Z]\b/);
-  if (g) return { gst: g[0] };
+  if (g && !mobileOnly()) return { gst: g[0] };
   const p = s.replace(/[\s-]/g, ' ').match(/(?:\+?91\s?)?\b([6-9]\d{9})\b/) || s.replace(/[\s-]/g, '').match(/(?:\+?91)?([6-9]\d{9})/);
   return p ? { phone: '91' + p[1] } : null;
 }
@@ -282,6 +309,7 @@ function nameAsked(text) {
 // ("kalara" -> Kalra Motors). `quiet`: say nothing when there is no match
 // (a bare name that might be something else).
 async function showByName(m, name, reply, t, { quiet = false } = {}) {
+  if (mobileOnly()) return quiet ? false : reply(askMobile(t));
   let found;
   try {
     found = await findCustomers(name);
@@ -314,6 +342,7 @@ async function showByName(m, name, reply, t, { quiet = false } = {}) {
 // A bare name counts only when every word IS a word of a customer's name —
 // "Kalra Motors" yes, "swift headlight" (a part) no.
 async function bareName(text) {
+  if (mobileOnly()) return null;
   const tt = String(text || '').trim();
   if (!looksLikeName(tt) || tt.split(/\s+/).length < 2) return null;
   const found = await findCustomers(tt).catch(() => ({ top: [] }));
@@ -381,6 +410,9 @@ async function customerCard(row, t) {
   }
   const money = (v) => (v === null || v === undefined || v === '' ? null : '₹' + Number(v).toLocaleString('en-IN', { maximumFractionDigits: 2 }));
   const discounts = await portal.activeDiscounts(full.id).catch(() => []);
+  // Two ids, named as what they are (integrations/portalContracts): this row's
+  // id is the ACCOUNT; discount rules are made against the DEALER.
+  const dl = await portal.dealerIdForAccount(full.id, full).catch(() => null);
   const lines = [
     `*${full.name}*`,
     full.phone || full.mobile ? 'Phone: ' + (full.phone || full.mobile) : null,
@@ -398,7 +430,7 @@ async function customerCard(row, t) {
     full.home_branch_dealer_id || full.home_branch_dealer
       ? 'Home branch: ' + require('./dataEntryRequests').branchName(full.home_branch_dealer_id || full.home_branch_dealer)
       : null,
-    'Portal id: ' + full.id,
+    'Account id: ' + full.id + (dl && dl.dealerId ? ' · Dealer id: ' + dl.dealerId : ''),
     discounts.length
       ? t('Discounts now: ', 'Abhi discount: ') + discounts.map((d) => `${d.on} ${d.percent}%${d.validTill ? ' (till ' + d.validTill + ')' : ''}`).join('; ')
       : t('Discounts now: none', 'Abhi discount: koi nahi'),
@@ -1211,8 +1243,7 @@ async function analyseMany(bot, m, many, reply, t) {
   }
   let hits = { total: 0, top: [] };
   try {
-    hits = await findCustomers(many.customer);
-    if (!hits.total) hits = await findCustomersFuzzy(many.customer);
+    hits = await customersFor(many.customer);
   } catch (e) {
     // Not "no such customer": the portal did not answer. 13 Sep, live: a 401
     // SESSION_INACTIVE was told to the founder as "No customer called lagan
@@ -1432,6 +1463,10 @@ function afterPunch(chatId, result, t) {
 // A name: one account -> its card and "this one?"; several -> the list; none
 // -> say so, and how else to find them.
 async function searchByName(m, name, items, reply, t) {
+  if (mobileOnly()) {
+    sessions.set(m.chatId, { stage: 'askCustomer', items: items || null, at: Date.now() });
+    return reply(askMobile(t));
+  }
   let found;
   try {
     found = await findCustomers(name);
@@ -1495,7 +1530,7 @@ async function handle(bot, m, text, reply, t) {
     let rows = k ? await findByKey(k).catch(() => []) : [];
     if (!k && want === 'invoice') {
       const nm = (String(text).trim().match(INVOICE_OF) || [])[1];
-      if (nm && !isGenericName(nm) && looksLikeName(nm.replace(/\b(is|us|mere|mera)\b/gi, '').trim() || 'x')) {
+      if (nm && !mobileOnly() && !isGenericName(nm) && looksLikeName(nm.replace(/\b(is|us|mere|mera)\b/gi, '').trim() || 'x')) {
         const found = await findCustomers(nm).catch(() => ({ top: [] }));
         rows = found.top && found.top.length ? found.top : (await findCustomersFuzzy(nm).catch(() => ({ top: [] }))).top || [];
       }
@@ -1516,6 +1551,13 @@ async function handle(bot, m, text, reply, t) {
     }
     if (k) return reply(t('No customer on the portal with that number.', 'Is number pe portal mein koi customer nahi mila.'));
     sessions.set(m.chatId, { stage: 'askCustomer', intent: want, items: null, at: Date.now() });
+    if (mobileOnly()) {
+      return reply(
+        want === 'invoice'
+          ? t("Whose invoice? Send the customer's 10-digit mobile number.", 'Kiska invoice? Customer ka 10 digit mobile number bhejiye.')
+          : t("Whose ledger? Send the customer's 10-digit mobile number.", 'Kiska ledger? Customer ka 10 digit mobile number bhejiye.'),
+      );
+    }
     return reply(
       want === 'invoice'
         ? t("Whose invoice? Send the customer's phone number or GST number (or name).", 'Kiska invoice? Customer ka phone number ya GST number bhejiye (ya naam).')
@@ -1523,8 +1565,18 @@ async function handle(bot, m, text, reply, t) {
     );
   }
 
+  // 1b2b. A GSTIN on its own, searching by mobile only: not searched - the
+  //       mobile number is asked for.
+  if (mobileOnly() && isGstinOnly(text)) {
+    store.log('sales', m.from + ' sent a GSTIN - customers are searched by mobile only');
+    if (!(s && s.stage === 'askCustomer')) sessions.set(m.chatId, { stage: 'askCustomer', items: (s && s.items) || null, intent: s && s.intent, at: Date.now() });
+    return reply(askMobile(t));
+  }
+
   // 1b3. A CUSTOMER BY NAME / SHOP NAME: "search Vinod automobiles", "Kalra
   //      Motors ki detail", "customer Miya ji motors" — or just the name.
+  //      Searching by mobile only, the name is not searched: the mobile
+  //      number is asked for (showByName).
   if (!(s && s.stage === 'choose' && readChoice(text, s.candidates.length) !== null) && !parseOrderFor(text)) {
     const asked = nameAsked(text);
     if (asked) return showByName(m, asked, reply, t);
@@ -1542,6 +1594,14 @@ async function handle(bot, m, text, reply, t) {
     infoKey = findKeyIn(text) || (/\b(mere|mera|my)\s+(number|no\.?)\b/i.test(text) ? { phone: store.normPhone(m.from) } : null);
     if (!infoKey) {
       sessions.set(m.chatId, { stage: 'askCustomer', items: null, at: Date.now() });
+      if (mobileOnly()) {
+        return reply(
+          t(
+            "Send the customer's 10-digit mobile number — I'll show you their full details and due balance.",
+            'Customer ka 10 digit mobile number bhejiye — poori detail aur due balance bata deta hoon.',
+          ),
+        );
+      }
       return reply(
         t(
           "Send the customer's phone number or GST number (or their name) — I'll show you their full details and due balance.",
@@ -1553,6 +1613,7 @@ async function handle(bot, m, text, reply, t) {
 
   // 1c1. The customer's NAME, after "kis customer ke liye?".
   if (s && s.stage === 'askCustomer' && !readCustomerKey(text) && !findKeyIn(text) && looksLikeName(text)) {
+    if (mobileOnly()) return reply(askMobile(t));
     if (s.intent === 'ledger' || s.intent === 'invoice') {
       const found = await findCustomers(text).catch(() => ({ top: [] }));
       if (found.top.length === 1) {
@@ -1823,8 +1884,8 @@ async function handle(bot, m, text, reply, t) {
   if (analysisAsk) {
     let hits = { total: 0, top: [] };
     try {
-      hits = await findCustomers(analysisAsk.customer);
-      if (!hits.total) hits = await findCustomersFuzzy(analysisAsk.customer);
+      hits = await customersFor(analysisAsk.customer);
+      if (hits.needMobile) return reply(askMobile(t));
     } catch (e) {
       store.log('sales', 'customer search failed: ' + String((e && e.message) || e).slice(0, 120));
     }
@@ -1930,8 +1991,7 @@ async function handle(bot, m, text, reply, t) {
     let found = { total: 0, top: [] };
     let failed = false;
     try {
-      found = await findCustomers(eng.customer);
-      if (!found.total) found = await findCustomersFuzzy(eng.customer);
+      found = await customersFor(eng.customer);
     } catch (e) {
       failed = true;
       store.log('sales', 'customer search failed: ' + String((e && e.message) || e).slice(0, 120));
@@ -1955,6 +2015,7 @@ async function handle(bot, m, text, reply, t) {
     // mortor discount") it can only be about a customer - it must not be
     // looked up as a part.
     if (!eng.part) {
+      if (found.needMobile) return reply(askMobile(t));
       if (failed) {
         return reply(t("I can't open the customer list right now - try again in a minute?", 'Customer list abhi khul nahi rahi - ek minute mein phir poochhiye?'));
       }
@@ -1975,7 +2036,7 @@ async function handle(bot, m, text, reply, t) {
   if (about) {
     let match;
     try {
-      match = await findCustomers(about.customer);
+      match = mobileOnly() ? await customersFor(about.customer) : await findCustomers(about.customer);
     } catch (e) {
       store.log('sales', 'customer search failed: ' + String((e && e.message) || e).slice(0, 140));
       return reply(
@@ -1986,6 +2047,7 @@ async function handle(bot, m, text, reply, t) {
       );
     }
     if (!match.total) {
+      if (match.needMobile) return reply(askMobile(t));
       return reply(
         t(
           'No customer called "' + about.customer + '" - can you give me a bit more of the name?',
@@ -2037,14 +2099,14 @@ async function handle(bot, m, text, reply, t) {
     store.log('sales', m.from + ' wants to order for a customer not yet named');
     return reply(
       t(
-        "Which customer is it for? Send the customer's phone number or GST number (or their full name).",
-        'Kis customer ke liye? Customer ka phone number ya GST number bhejiye (ya poora naam).',
+        mobileOnly() ? "Which customer is it for? Send the customer's 10-digit mobile number." : "Which customer is it for? Send the customer's phone number or GST number (or their full name).",
+        mobileOnly() ? 'Kis customer ke liye? Customer ka 10 digit mobile number bhejiye.' : 'Kis customer ke liye? Customer ka phone number ya GST number bhejiye (ya poora naam).',
       ),
     );
   }
   let found;
   try {
-    found = await findCustomers(req.customer);
+    found = mobileOnly() ? await customersFor(req.customer) : await findCustomers(req.customer);
   } catch (e) {
     store.log('sales', 'customer search failed: ' + String((e && e.message) || e).slice(0, 140));
     if (req.weak) return false;
@@ -2052,6 +2114,11 @@ async function handle(bot, m, text, reply, t) {
   }
   if (!found.total) {
     if (req.weak) return false;
+    if (found.needMobile) {
+      sessions.set(m.chatId, { stage: 'askCustomer', items: req.items || takeItems(m.chatId), at: Date.now() });
+      store.log('sales', m.from + ' named "' + req.customer + '" - customers are searched by mobile only');
+      return reply(askMobile(t));
+    }
     return reply(
       t(
         "Couldn't find a customer called \"" + req.customer + '" - can you give me a bit more of the name?',
@@ -2093,6 +2160,8 @@ function _resetDirectory() {
 module.exports = {
   customerCard,
   readCustomerKey,
+  mobileOnly,
+  askMobile,
   findByKey,
   holdItems,
   takeItems,

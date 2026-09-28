@@ -135,6 +135,7 @@ function build(now = new Date()) {
     `Discounts approved: ${count('discount', 'approved')}` + (count('discount', 'rejected') ? `, rejected ${count('discount', 'rejected')}` : ''),
     `Orders approved: ${count('order', 'approved')}` + (count('order', 'rejected') ? `, rejected ${count('order', 'rejected')}` : '') + (count('order', 'failed') ? `, refused by the portal ${count('order', 'failed')}` : ''),
     count('payment', 'settled') || pending.some((e) => e.kind === 'payment') ? `Payments settled: ${count('payment', 'settled')}` + (pending.filter((e) => e.kind === 'payment').length ? `, waiting ${pending.filter((e) => e.kind === 'payment').length}` : '') : null,
+    count('advance', 'booked') || count('advance', 'declined') ? `Advance orders (ETA accepted): ${count('advance', 'booked')}` + (count('advance', 'declined') ? `, declined ${count('advance', 'declined')}` : '') : null,
     pending.length ? `Still waiting: ${pending.length}` : null,
   ]
     .filter(Boolean)

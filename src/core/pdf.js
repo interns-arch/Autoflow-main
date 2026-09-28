@@ -82,7 +82,7 @@ async function ledgerPdf(s, c = {}) {
   const who = [
     c.phone ? 'Phone: ' + c.phone : null,
     c.gst ? 'GSTIN: ' + c.gst : null,
-    c.portalId ? 'Portal id: ' + c.portalId : null,
+    c.portalId ? 'Account id: ' + c.portalId : null,
     c.creditLimit != null ? `Credit: ${rs(c.creditLimit)}${c.creditDays != null ? ' / ' + c.creditDays + ' day(s)' : ''}` : null,
   ].filter(Boolean);
   if (who.length) doc.text(who.join('   ·   '));

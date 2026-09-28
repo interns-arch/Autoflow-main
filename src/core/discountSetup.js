@@ -74,8 +74,15 @@ function describe(r, t) {
   return lines.filter(Boolean).join('\n');
 }
 
-// What the portal is sent, once the account exists.
-function toPortal(r, dealerId, customerName, from = new Date()) {
+// What the portal is sent, once the account exists. `target` is what
+// dealerPortal.dealerIdForAccount found: { dealerId, accountId, odooPartnerId }.
+// The rule carries the account and Odoo partner it was resolved from, and
+// createDiscountRule reads the dealer back and refuses a mismatch
+// (integrations/portalContracts). A bare number is taken as a dealer id only
+// in tests (mock portal).
+function toPortal(r, target, customerName, from = new Date()) {
+  const tg = target && typeof target === 'object' ? target : { dealerId: target };
+  const dealerId = tg.dealerId;
   const start = new Date(from);
   let end = null;
   if (r.days) {
@@ -103,7 +110,13 @@ function toPortal(r, dealerId, customerName, from = new Date()) {
     // The name carries the customer as the PORTAL has them, which may differ
     // from what was typed into the form.
     rule_name: ruleName(customerName || r.customer, r.target, r.value),
-    rule_metadata: { source: 'whatsapp-bot', requestId: r.requestId, setBy: r.setBy || null },
+    rule_metadata: {
+      source: 'whatsapp-bot',
+      requestId: r.requestId,
+      setBy: r.setBy || null,
+      ...(tg.accountId ? { account_id: tg.accountId } : {}),
+      ...(tg.odooPartnerId ? { odoo_partner_id: tg.odooPartnerId } : {}),
+    },
   };
 }
 
@@ -125,6 +138,10 @@ const counts = (r) =>
   r &&
   r.is_active !== false &&
   String(r.discount_mode || 'PERCENT').toUpperCase() === 'PERCENT' &&
+  // Rejected on the portal never counts, the bot's own included (26 Sep:
+  // rule 2869, written to the wrong dealer and rejected in Super Admin,
+  // still priced that dealer's parts at 15% off).
+  String(r.approval_status || '').toUpperCase() !== 'REJECTED' &&
   (String(r.approval_status || '').toUpperCase() === 'APPROVED' || (r.rule_metadata && r.rule_metadata.source === 'whatsapp-bot'));
 
 function ruleFor(rules, { dealerId, partNo, brand, qty = 1, now = new Date() } = {}) {

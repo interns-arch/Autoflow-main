@@ -78,6 +78,8 @@ function enabled() {
   return Boolean(dp.baseUrl && (dp.token || (dp.username && dp.password)));
 }
 const isMock = () => !enabled();
+const mockEta = new Map(); // partNo -> eta-mapping rows (tests)
+const mockAdvance = []; // advance-order bodies sent in mock mode (tests)
 
 // ---------------------------------------------------------------- transport
 
@@ -581,6 +583,77 @@ async function discountRules() {
 function forgetDiscountRules() {
   rulesCache = { at: 0, rows: null };
 }
+// ACCOUNT -> DEALER (integrations/portalContracts). A discount rule names a
+// DEALER; everything the bot finds a customer by gives an ACCOUNT. The one
+// link is the Odoo partner both carry. Exactly one active dealer with the
+// account's odoo_partner_id, or no answer at all - never a guess.
+// -> { dealerId, dealerName, odooPartnerId, accountId, accountName } | { dealerId: null, why }
+const DEALER_INDEX_MS = 6 * 60 * 60 * 1000;
+let dealerIndex = { at: 0, byPartner: null };
+const acctDealer = new Map(); // accountId -> { at, result }
+const mockDealerOf = new Map(); // tests: accountId -> result
+async function dealersByPartner(fresh = false) {
+  if (!fresh && dealerIndex.byPartner && Date.now() - dealerIndex.at < DEALER_INDEX_MS) return dealerIndex.byPartner;
+  const data = await api('GET', '/dealers/', null, true, 'admin', 120000);
+  const rows = Array.isArray(data) ? data : (data && (data.items || data.data || data.results)) || [];
+  const byPartner = new Map();
+  for (const d of rows) {
+    const p = Number(d.odoo_partner_id);
+    if (!p) continue;
+    if (!byPartner.has(p)) byPartner.set(p, []);
+    byPartner.get(p).push(d);
+  }
+  dealerIndex = { at: Date.now(), byPartner };
+  store.log('portal', `dealer index: ${rows.length} dealer(s), ${byPartner.size} with an Odoo partner`);
+  return byPartner;
+}
+async function dealerIdForAccount(accountId, known = null) {
+  const id = Number(accountId);
+  if (!id) return { dealerId: null, why: 'no account id' };
+  if (isMock()) return mockDealerOf.get(id) || { dealerId: id, dealerName: null, odooPartnerId: null, accountId: id, accountName: null };
+  const hit = acctDealer.get(id);
+  if (hit && Date.now() - hit.at < DEALER_INDEX_MS) return hit.result;
+  // The account as the portal has it: its Odoo partner. A row already in hand
+  // is used only when it IS that account and carries the partner.
+  let acct = known && Number(known.id) === id && known.odoo_partner_id ? known : null;
+  if (!acct) acct = await api('GET', '/accounts/' + id, null, true, 'admin');
+  const partner = Number(acct && acct.odoo_partner_id);
+  let result;
+  if (!partner) {
+    result = { dealerId: null, accountId: id, accountName: (acct && acct.name) || null, why: 'the account has no Odoo partner, so its dealer record cannot be told' };
+  } else {
+    let list = (await dealersByPartner()).get(partner) || [];
+    if (!list.length) list = (await dealersByPartner(true)).get(partner) || []; // a dealer made since the last read
+    const active = list.filter((d) => d.is_active !== false);
+    const pick = active.length ? active : list;
+    result =
+      pick.length === 1
+        ? { dealerId: Number(pick[0].dealer_id), dealerName: pick[0].dealer_name || null, odooPartnerId: partner, accountId: id, accountName: acct.name || null }
+        : {
+            dealerId: null,
+            odooPartnerId: partner,
+            accountId: id,
+            accountName: acct.name || null,
+            why: pick.length ? `${pick.length} dealer records share Odoo partner ${partner} (${pick.map((d) => d.dealer_id).join(', ')})` : `no dealer record carries Odoo partner ${partner}`,
+          };
+  }
+  acctDealer.set(id, { at: Date.now(), result });
+  if (!result.dealerId) store.log('portal', `account ${id} -> no dealer: ${result.why}`);
+  return result;
+}
+
+// A rule about to be written must name the dealer of the customer it was
+// meant for: the dealer is read back, and its Odoo partner must be the one
+// dealerIdForAccount found. Anything else is refused before it is sent.
+async function assertRuleDealer(body) {
+  const meta = body.rule_metadata || {};
+  if (!meta.odoo_partner_id) throw new Error('refused: rule has no verified customer (rule_metadata.odoo_partner_id) - dealer_id ' + body.dealer_id + ' was not resolved from an account');
+  const d = await api('GET', '/dealers/' + encodeURIComponent(body.dealer_id), null, true, 'admin');
+  if (Number(d && d.odoo_partner_id) !== Number(meta.odoo_partner_id)) {
+    throw new Error(`refused: dealer ${body.dealer_id} is "${(d && d.dealer_name) || '?'}" (Odoo partner ${(d && d.odoo_partner_id) || '-'}), not the customer's Odoo partner ${meta.odoo_partner_id}`);
+  }
+}
+
 async function withDiscountRules(rows, accountId, lines) {
   let rules;
   try {
@@ -589,13 +662,21 @@ async function withDiscountRules(rows, accountId, lines) {
     store.log('portal', 'discount rules could not be read — prices left as the portal gave them: ' + String((e && e.message) || e).slice(0, 80));
     return rows;
   }
+  // Rules name DEALERS; this customer is an ACCOUNT.
+  let dealerId = null;
+  try {
+    dealerId = (await dealerIdForAccount(accountId)).dealerId;
+  } catch (e) {
+    store.log('portal', `account ${accountId}: dealer not resolved — no discount applied: ` + String((e && e.message) || e).slice(0, 80));
+  }
+  if (!dealerId) return rows;
   const { ruleFor } = require('../core/discountSetup');
   const round2 = (v) => Math.round(v * 100) / 100;
   for (const row of rows) {
     const mrp = Number(row.mrp);
     if (!(mrp > 0) || Number(row.discount_percent) > 0) continue; // the portal already priced it
     const line = (lines || []).find((l) => norm(l.partNo || l.item) === norm(row.part_no));
-    const rule = ruleFor(rules, { dealerId: accountId, partNo: row.part_no, brand: row.brand, qty: Number(row.requested_qty) || (line && Number(line.qty)) || 1 });
+    const rule = ruleFor(rules, { dealerId, partNo: row.part_no, brand: row.brand, qty: Number(row.requested_qty) || (line && Number(line.qty)) || 1 });
     if (!rule) continue;
     const pct = Number(rule.discount_value);
     const price = round2(mrp * (1 - pct / 100));
@@ -886,6 +967,14 @@ module.exports = {
   },
   setMockStock,
   setMockCustomers,
+  // The portal's ETA record for a part (GET /eta-mapping): the rows of the
+  // purchase orders it is coming in on, newest first. [] when none.
+  async etaMapping(partNo) {
+    if (isMock()) return mockEta.get(String(partNo).toUpperCase()) || [];
+    const rows = await api('GET', `/eta-mapping?partNo=${encodeURIComponent(partNo)}&limit=20`);
+    return Array.isArray(rows) ? rows : (rows && (rows.items || rows.data)) || [];
+  },
+  _setMockEta: (partNo, rows) => mockEta.set(String(partNo).toUpperCase(), rows || []),
   _setMockDuplicates: (rows) => { mockDuplicates = rows || []; },
   // Pulled at boot so the first customer who types a GSTIN is not the
   // one who finds out it takes 84 seconds.
@@ -1009,6 +1098,7 @@ module.exports = {
       mockDiscountRules.push(rule);
       return rule;
     }
+    await assertRuleDealer(body);
     const data = await api('POST', '/discount-rules/', body, true, 'admin');
     forgetDiscountRules();
     store.log('portal', `discount rule created: "${body.rule_name || ''}" (${body.rule_type}, ${body.discount_value}${body.discount_mode === 'percent' ? '%' : ''})`);
@@ -1022,6 +1112,8 @@ module.exports = {
       Object.assign(r, body);
       return r;
     }
+    // Moving a rule to another dealer is checked like a new one.
+    if (body.rule_metadata && body.rule_metadata.odoo_partner_id) await assertRuleDealer(body);
     const data = await api('PUT', '/discount-rules/' + encodeURIComponent(ruleId), body, true, 'admin');
     forgetDiscountRules();
     store.log('portal', `discount rule ${ruleId} updated: ${JSON.stringify(body).slice(0, 120)}`);
@@ -1053,11 +1145,18 @@ module.exports = {
   },
   // The customer's discounts that apply today (core/discountSetup.activeRules),
   // from the same five-minute copy of the rules the prices use.
-  async activeDiscounts(dealerId) {
+  // Takes the customer's ACCOUNT id (every caller has one); rules are
+  // matched on the account's DEALER id (portalContracts).
+  async activeDiscounts(accountId) {
+    if (!accountId) return [];
+    const { dealerId } = await dealerIdForAccount(accountId);
     if (!dealerId) return [];
     const rules = isMock() ? mockDiscountRules.slice() : await discountRules();
     return require('../core/discountSetup').activeRules(rules, dealerId);
   },
+  dealerIdForAccount,
+  _setMockDealerFor: (accountId, result) => mockDealerOf.set(Number(accountId), result),
+  _resetDealerCache: () => { acctDealer.clear(); mockDealerOf.clear(); },
   _setMockDiscountRules: (list) => {
     mockDiscountRules.length = 0;
     for (const r of list || []) mockDiscountRules.push(r);
@@ -1894,4 +1993,54 @@ module.exports = {
     store.log('portal', `sales order punched: ${result.soNumber}`);
     return result;
   },
+
+  // AN ADVANCE ORDER: parts with no stock, booked for the customer once they
+  // accept the ETA (founder, 26 Sep). The same confirm route, asked for the
+  // portal's UNALLOCATED order: each line "Not Available" with its whole
+  // quantity as the shortfall and no dealer allocation - the shape
+  // commercial-analyze itself returns for such a part.
+  //   adv = { id, ctx: portalCustomer, lines: [{ partNo, item, qty, price }], etaDate, actorUserId }
+  async advanceOrder(adv) {
+    const body = advanceBody(adv);
+    if (isMock()) {
+      const soNumber = 'ADV-' + store.nextSeq('so');
+      mockAdvance.push(body);
+      store.log('portal', `MOCK advance order: ${soNumber} (${body.lines.length} lines)`);
+      return { soNumber, body };
+    }
+    const data = await api('POST', dp.confirmPath, body);
+    const result = readConfirmResponse(data);
+    store.log('portal', `advance order placed: ${result.soNumber} (unallocated ${result.unallocatedOrderId || '-'})`);
+    return result;
+  },
+  _advanceBody: (adv) => advanceBody(adv),
+  _mockAdvance: () => mockAdvance,
 };
+
+function advanceBody(adv) {
+  const ctx = adv.ctx || {};
+  const days = adv.etaDate ? Math.max(1, Math.round((new Date(adv.etaDate + 'T00:00:00Z') - Date.now()) / 86400000)) : null;
+  const body = {
+    user_id: dp.userId,
+    ...(ctx.buyerId ? { selected_buyer_id: Number(ctx.buyerId) } : {}),
+    external_order_reference: `${adv.id}-ADV`,
+    include_unallocated: true,
+    allow_empty_dealers: true,
+    client_source: 'whatsapp-bot',
+    remarks: `Advance order - customer accepted ETA${adv.etaDate ? ' ' + adv.etaDate : ''} on WhatsApp (${adv.id})`,
+    lines: adv.lines.map((l) => ({
+      part_no: portalPartNo(l.partNo || l.item),
+      ...(l.partName || l.item ? { part_name: l.partName || l.item } : {}),
+      requested_qty: Number(l.qty) || 1,
+      status: 'Not Available',
+      shortfall: Number(l.qty) || 1,
+      dealers: [],
+      ...(l.price != null ? { price: Number(l.price) } : {}),
+      ...(days ? { tat_days: days } : {}),
+    })),
+  };
+  const branch = ctx.branchId || dp.sourceBranchDealerId;
+  if (branch) body.source_branch_dealer_id = Number(branch);
+  if (adv.actorUserId) body.actor_user_id = Number(adv.actorUserId);
+  return body;
+}
