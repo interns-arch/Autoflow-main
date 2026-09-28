@@ -312,11 +312,14 @@ async function portalDiscounts(list) {
     // yes or no - the date a "discounts approved on 28 Sep" count reads.
     if (r && !d.decidedAt && /approved|rejected|expired/.test(d.status)) d.decidedAt = r.updated_at || null;
   }
-  // Customer rules on the portal the bot did not ask for (typed on the
-  // portal, or before the bot kept a log): one row each.
+  // Rules the BOT wrote on the portal that its log does not have (written
+  // before the log kept them). Only the bot's (founder, 28 Sep: "take data
+  // from portal only bot report, not all report") - a rule typed on the
+  // portal by someone is the portal's business, not this dashboard's.
   for (const r of rules) {
     const id = Number(r.rule_id || r.id);
     if (seen.has(id) || !r.dealer_id) continue;
+    if (!(r.rule_metadata && r.rule_metadata.source === 'whatsapp-bot')) continue;
     list.push({
       id: 'RULE-' + id,
       ruleId: id,
