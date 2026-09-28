@@ -55,6 +55,10 @@
   .login { max-width: 420px; margin: 80px auto; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 24px; }
   .login button { margin-top: 10px; padding: 8px 14px; border: 0; border-radius: 8px; background: var(--accent); color: #fff; font: inherit; cursor: pointer; }
   .err { color: var(--bad); margin-top: 8px; font-size: 13px; }
+  .links { display: flex; gap: 14px; align-items: center; }
+  .links a { color: var(--accent); text-decoration: none; font-weight: 600; }
+  .links a.muted { color: var(--muted); font-weight: 400; }
+  .links a:hover { text-decoration: underline; }
   @media (max-width: 640px) { header, main { padding-left: 16px; padding-right: 16px; } }
 </style>
 </head>
@@ -62,6 +66,7 @@
 <header>
   <div><h1>Cartrends Bot Dashboard</h1><div class="sub" id="updated">—</div></div>
   <div class="sub">Customers · Orders · Discounts · Payments — refreshes every minute</div>
+  <nav class="links"><a href="/" id="console-link">Console →</a><a href="/logout" class="muted">Sign out</a></nav>
 </header>
 <main id="app"></main>
 <script>

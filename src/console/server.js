@@ -16,6 +16,109 @@ const inquiries = require('../core/inquiries');
 const knowledge = require('../core/knowledge');
 const { SimTransport } = require('../wa/transport');
 
+// ---- THE KEY IN FRONT OF THE WHOLE CONSOLE (founder, 28 Sep: the dashboard
+// on port 3010, with the console one click from it) ----
+//
+// The console serves customers' chats and photos, customer lists, logs, a
+// simulator that posts as any customer and a broadcast to every customer. It
+// was safe only while the port was reachable from the server alone. With the
+// port open, every page and API behind it needs DASHBOARD_KEY: entered once on
+// /login (or on the dashboard), then carried as an HttpOnly cookie. Only the
+// Meta webhook stays open - it is checked by its own signature.
+const crypto = require('crypto');
+const COOKIE = 'cf_console';
+const SESSION_S = 12 * 60 * 60;
+const sessionToken = () => crypto.createHmac('sha256', config.dashboardKey).update('console-session-v1').digest('hex');
+function sameSecret(a, b) {
+  const x = Buffer.from(String(a || ''));
+  const y = Buffer.from(String(b || ''));
+  return x.length === y.length && x.length > 0 && crypto.timingSafeEqual(x, y);
+}
+const keyOk = (k) => Boolean(config.dashboardKey) && sameSecret(k, config.dashboardKey);
+function cookieOf(req) {
+  const hit = String(req.headers.cookie || '').split(/;\s*/).find((c) => c.startsWith(COOKIE + '='));
+  return hit ? decodeURIComponent(hit.slice(COOKIE.length + 1)) : '';
+}
+const signedIn = (req) => Boolean(config.dashboardKey) && sameSecret(cookieOf(req), sessionToken());
+// Behind the Cloudflare Tunnel every request arrives from the tunnel on this
+// machine, so the visitor is read from Cloudflare's own header - trusted only
+// when the connection itself is local (the tunnel), never from the open net.
+const loopback = (req) => /^(::1|127\.|::ffff:127\.)/.test(String((req.socket && req.socket.remoteAddress) || ''));
+function visitor(req) {
+  const cf = req.headers['cf-connecting-ip'];
+  if (cf && loopback(req)) return String(cf).trim();
+  return (req.socket && req.socket.remoteAddress) || '?';
+}
+const overHttps = (req) => String(req.headers['x-forwarded-proto'] || '').includes('https') || /"scheme":"https"/.test(String(req.headers['cf-visitor'] || ''));
+function signIn(res, req) {
+  res.setHeader('Set-Cookie', `${COOKIE}=${sessionToken()}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_S}${req && overHttps(req) ? '; Secure' : ''}`);
+}
+// Wrong keys, per visitor: ten in fifteen minutes and that visitor waits.
+const misses = new Map();
+function tooMany(req) {
+  const ip = visitor(req);
+  const m = misses.get(ip);
+  return Boolean(m && Date.now() - m.at < 15 * 60 * 1000 && m.n >= 10);
+}
+function missed(req) {
+  const ip = visitor(req);
+  const m = misses.get(ip);
+  const fresh = m && Date.now() - m.at < 15 * 60 * 1000;
+  misses.set(ip, { n: fresh ? m.n + 1 : 1, at: fresh ? m.at : Date.now() });
+  store.log('console', `wrong dashboard key from ${ip}`);
+}
+const OPEN_PATHS = new Set(['/webhook/wa', '/login', '/logout', '/dashboard', '/api/dashboard', '/favicon.ico']);
+
+function loginPage(msg, next) {
+  const esc = (s) => String(s || '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Cartrends Console</title>
+<style>:root{--bg:#f5f6f8;--panel:#fff;--ink:#1b1f24;--muted:#667085;--line:#e4e7ec;--accent:#1f5fbf;--bad:#b42318}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1216;--panel:#171b21;--ink:#e8eaed;--muted:#98a2b3;--line:#2a3038;--accent:#7aa7ff;--bad:#ff8a80}}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+form{max-width:380px;margin:12vh auto;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:24px}
+h1{font-size:18px;margin:0 0 6px}p{color:var(--muted);margin:0 0 14px}
+input{width:100%;box-sizing:border-box;padding:9px 12px;border:1px solid var(--line);border-radius:8px;background:var(--panel);color:var(--ink);font:inherit}
+button{margin-top:12px;padding:9px 16px;border:0;border-radius:8px;background:var(--accent);color:#fff;font:inherit;cursor:pointer}.err{color:var(--bad);margin-top:10px}</style></head>
+<body><form method="post" action="/login"><h1>Cartrends Console</h1><p>Enter the dashboard key (DASHBOARD_KEY on the server).</p>
+<input type="password" name="key" autofocus autocomplete="current-password" placeholder="key"><input type="hidden" name="next" value="${esc(next)}">
+<button type="submit">Open</button>${msg ? `<div class="err">${esc(msg)}</div>` : ''}</form></body></html>`;
+}
+const safeNext = (n) => (typeof n === 'string' && /^\/(?!\/)[^\s]*$/.test(n) ? n : '/dashboard');
+
+function mountGate(app) {
+  app.use(express.urlencoded({ extended: false, limit: '4kb' }));
+  app.get('/login', (req, res) => res.type('html').send(loginPage('', safeNext(req.query.next))));
+  app.post('/login', (req, res) => {
+    const next = safeNext(req.body && req.body.next);
+    if (tooMany(req)) return res.status(429).type('html').send(loginPage('Too many wrong keys — wait 15 minutes.', next));
+    if (!keyOk(req.body && req.body.key)) {
+      missed(req);
+      return res.status(401).type('html').send(loginPage(config.dashboardKey ? 'Wrong key.' : 'DASHBOARD_KEY is not set on the server.', next));
+    }
+    signIn(res, req);
+    res.redirect(303, next);
+  });
+  app.get('/logout', (req, res) => {
+    res.setHeader('Set-Cookie', `${COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0`);
+    res.redirect(303, '/login');
+  });
+  app.use((req, res, next) => {
+    if (OPEN_PATHS.has(req.path)) return next();
+    if (signedIn(req)) return next();
+    const k = req.get('x-dashboard-key');
+    if (k && !tooMany(req) && keyOk(k)) {
+      signIn(res, req);
+      return next();
+    }
+    if (k) missed(req);
+    // No key set on this machine: the console answers only on the machine
+    // itself, as it did before the port was opened.
+    if (!config.dashboardKey && loopback(req)) return next();
+    if (req.path.startsWith('/api/')) return res.status(401).json({ error: 'sign in with the dashboard key' });
+    return res.redirect(302, '/login?next=' + encodeURIComponent(req.originalUrl || '/'));
+  });
+}
+
 // ---- the dashboard (founder, 26 Sep) ----
 // Customers created, orders placed, discounts and payments: who asked, who
 // approved, where each stands. The page is public/dashboard.html; its data
@@ -26,9 +129,16 @@ function mountDashboard(app) {
   app.get('/api/dashboard', async (req, res) => {
     const key = String(req.query.key || req.get('x-dashboard-key') || '');
     if (!config.dashboardKey) return res.status(503).json({ error: 'DASHBOARD_KEY is not set on the server' });
-    const a = Buffer.from(key);
-    const b = Buffer.from(config.dashboardKey);
-    if (a.length !== b.length || !require('crypto').timingSafeEqual(a, b)) return res.status(401).json({ error: 'wrong key' });
+    if (!signedIn(req)) {
+      if (tooMany(req)) return res.status(429).json({ error: 'too many wrong keys — wait 15 minutes' });
+      if (!keyOk(key)) {
+        missed(req);
+        return res.status(401).json({ error: 'wrong key' });
+      }
+      // The same key opens the console: the dashboard's "Console" link
+      // needs no second sign-in.
+      signIn(res, req);
+    }
     try {
       res.json(await require('../core/dashboardData').buildLive());
     } catch (e) {
@@ -60,6 +170,9 @@ function start(bots) {
   // The RAW body is kept: a re-serialised object hashes differently, so the
   // Meta signature can only be checked against the bytes that arrived.
   app.use(express.json({ limit: '15mb', verify: (req, res, buf) => { req.rawBody = buf; } }));
+  // Everything below needs the dashboard key (mountGate) - the static pages
+  // included, so the gate goes in before them.
+  mountGate(app);
   app.use(express.static(path.join(__dirname, 'public')));
 
   // ---- Meta Cloud API webhook (GET = verify handshake, POST = messages) ----
