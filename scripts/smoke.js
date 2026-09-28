@@ -429,6 +429,17 @@ async function main() {
   markAsked('sim-' + BLOCKED);
   await dm(customer, BLOCKED, 'yes');
   check('any other refusal reads the same to the customer, and still reaches a person', /system order accept nahi|system is not taking/i.test(sent(customer)) && alerts7.length > 0);
+  // 28 Sep, founder: "if order punch reject it also show that" - on the
+  // dashboard, whichever path punched it (this one: straight from the chat,
+  // so the order stays a draft).
+  {
+    const draft7 = orders.findDraft('sim-' + BLOCKED);
+    check('a refused punch is kept on the order, with why', draft7 && draft7.punchRefused && /portal refused/.test(draft7.punchRefused.why), JSON.stringify(draft7 && draft7.punchRefused));
+    const dash7 = await require('../src/core/dashboardData').buildLive().catch((e) => ({ error: String(e.message) }));
+    const row7 = ((dash7 && dash7.orders) || []).find((o) => draft7 && o.id === draft7.id);
+    check('...and the dashboard shows it as refused by portal, with the reason', row7 && row7.status === 'refused by portal' && /portal refused/.test(row7.note || ''), JSON.stringify(row7 || dash7.error));
+    check('...counted on the Orders card', dash7.summary && dash7.summary.orders.refused >= 1, JSON.stringify(dash7.summary && dash7.summary.orders));
+  }
   customer.transport.sendText = hadText7;
   portal.confirm = realConfirm7;
 

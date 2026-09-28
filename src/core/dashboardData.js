@@ -122,11 +122,15 @@ function orders(events) {
     ({ confirmed: 'placed', approval: 'waiting for approval', awaitingPayment: 'waiting for payment', rejected: 'rejected' })[o.status] || null;
   const out = [];
   for (const o of store.orders()) {
-    const st = status(o);
+    // A punch the portal refused is shown whatever state the order was left
+    // in - a cart confirmed straight from the chat stays a draft when the
+    // portal says no, and used to vanish from here.
+    const refusedHere = o.punchRefused && o.status !== 'confirmed';
+    const st = status(o) || (refusedHere ? 'refused by portal' : null);
     if (!st) continue; // drafts and carts nobody confirmed
     const log = logByOrder.get('order:' + o.id) || [];
     const req = log.find((e) => e.event === 'requested');
-    const failed = log.find((e) => e.event === 'failed');
+    const failed = [...log].reverse().find((e) => e.event === 'failed') || (refusedHere ? { detail: o.punchRefused.why, at: o.punchRefused.at } : null);
     const pc = o.portalCustomer || (typeof o.customer === 'object' ? o.customer : null) || {};
     const chatPhone = phoneOf(o.chatId);
     // Who placed it, as recorded when it was asked for; the number's role
@@ -141,7 +145,7 @@ function orders(events) {
     const amount = punched.reduce((s, l) => s + (Number(l.rate) || Number(l.mrp) || 0) * Math.min(Number(l.qty) || 0, Number(l.available) || 0), 0);
     out.push({
       id: o.id,
-      at: o.confirmedAt || o.approvalAskedAt || o.createdAt || null,
+      at: o.confirmedAt || o.approvalAskedAt || (refusedHere && o.punchRefused.at) || o.createdAt || null,
       status: failed && st !== 'placed' ? 'refused by portal' : st,
       customer: pc.name || (typeof o.customer === 'string' && !/@/.test(o.customer) ? o.customer : null),
       customerId: pc.buyerId || null,
@@ -206,6 +210,7 @@ function build() {
         placed: count(o, 'placed'),
         waiting: count(o, 'waiting for approval') + count(o, 'waiting for payment'),
         rejected: count(o, 'rejected'),
+        refused: count(o, 'refused by portal'),
         value: Math.round(o.filter((x) => x.status === 'placed').reduce((s, x) => s + x.amount, 0)),
       },
       discounts: { total: d.length, approved: count(d, 'approved'), waiting: count(d, 'waiting for approval'), rejected: count(d, 'rejected') },

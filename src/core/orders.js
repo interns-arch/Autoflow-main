@@ -385,7 +385,25 @@ async function punch(order, opts = {}) {
 
   const placed = [];
   for (const [ref, lines] of groups) {
-    const res = await portal.confirm({ ...order, lines, customerRef: ref || null });
+    let res;
+    try {
+      res = await portal.confirm({ ...order, lines, customerRef: ref || null });
+    } catch (e) {
+      // THE PORTAL REFUSED THE PUNCH (founder, 28 Sep: "if order punch reject
+      // it also show that"). Kept on the order and logged once, here, where
+      // every punch passes - the Sales Head's OK, the agent's confirm_order and
+      // the desk alike - so the dashboard shows it whoever pressed the button.
+      const full = String((e && e.message) || e);
+      const why = /credit control/i.test(full) ? 'portal: customer on credit control' : 'portal refused: ' + full.slice(0, 160);
+      order.punchRefused = { at: new Date().toISOString(), why, by: opts.approvedBy || null };
+      store.save();
+      try {
+        require('./approvalLog').record({ kind: 'order', id: order.id, event: 'failed', by: opts.approvedBy || null, customer: (order.portalCustomer && order.portalCustomer.name) || null, detail: why });
+      } catch (_) {
+        /* the refusal is on the order either way */
+      }
+      throw e;
+    }
     const soNumber = res.soNumber;
     // A punch can make TWO portal orders - what is in stock, and what is on
     // order - and the draft SO review has to show both.
@@ -405,6 +423,7 @@ async function punch(order, opts = {}) {
 
   order.soNumber = placed[0].soNumber;
   order.placed = placed;
+  delete order.punchRefused; // a later punch that went through
   order.status = 'confirmed';
   order.confirmedAt = new Date().toISOString();
   store.save();

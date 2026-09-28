@@ -133,7 +133,7 @@
     const n = (list, st) => list.filter((x) => x.status === st).length;
     return {
       customers: { created: n(c, 'created'), waiting: n(c, 'waiting for approval'), rejected: n(c, 'rejected') },
-      orders: { placed: n(o, 'placed'), waiting: n(o, 'waiting for approval') + n(o, 'waiting for payment'), rejected: n(o, 'rejected'), value: Math.round(o.filter((x) => x.status === 'placed').reduce((s, x) => s + (Number(x.amount) || 0), 0)) },
+      orders: { placed: n(o, 'placed'), waiting: n(o, 'waiting for approval') + n(o, 'waiting for payment'), rejected: n(o, 'rejected'), refused: n(o, 'refused by portal'), value: Math.round(o.filter((x) => x.status === 'placed').reduce((s, x) => s + (Number(x.amount) || 0), 0)) },
       discounts: { approved: n(d, 'approved'), waiting: n(d, 'waiting for approval'), rejected: n(d, 'rejected') },
       payments: { settled: n(p, 'settled'), open: p.length - n(p, 'settled') },
     };
@@ -186,7 +186,7 @@
     orders: {
       label: 'Orders', statuses: ['placed', 'waiting for approval', 'waiting for payment', 'rejected', 'refused by portal'],
       cols: ['When', 'Order', 'Customer', 'Placed by', 'Status', 'Approved / rejected by', 'Portal order', 'Amount'],
-      row: (o) => [when(o.at), esc(o.id), `<b>${esc(o.customer || '—')}</b>`, esc(o.placedBy), pill(o.status), esc(o.approvedBy || o.rejectedBy || '—'), esc(o.portalOrder || '—'), `<span class="num">${rs(o.amount)}</span>`],
+      row: (o) => [when(o.at), esc(o.id), `<b>${esc(o.customer || '—')}</b>`, esc(o.placedBy), pill(o.status) + (o.status === 'refused by portal' && o.note ? `<div class="muted" style="font-size:12px;margin-top:4px">${esc(o.note)}</div>` : ''), esc(o.approvedBy || o.rejectedBy || '—'), esc(o.portalOrder || '—'), `<span class="num">${rs(o.amount)}</span>`],
       detail: (o) => grid([['Parts', o.lines], ['Customer portal id', o.customerId], ['Payment hold', o.paymentHold], ['Note', o.note]]),
     },
     discounts: {
@@ -210,7 +210,7 @@
     const s = summaryOf();
     const cards = `<div class="cards">
       <div class="card"><div class="k">Customers</div><div class="v">${s.customers.created}</div><div class="d">created · ${s.customers.waiting} waiting · ${s.customers.rejected} rejected</div></div>
-      <div class="card"><div class="k">Orders placed</div><div class="v">${s.orders.placed}</div><div class="d">${rs(s.orders.value)} · ${s.orders.waiting} waiting · ${s.orders.rejected} rejected</div></div>
+      <div class="card"><div class="k">Orders placed</div><div class="v">${s.orders.placed}</div><div class="d">${rs(s.orders.value)} · ${s.orders.waiting} waiting · ${s.orders.rejected} rejected${s.orders.refused ? ` · <span class="pill bad" style="padding:0 6px">${s.orders.refused} refused by portal</span>` : ' · 0 refused by portal'}</div></div>
       <div class="card"><div class="k">Discounts</div><div class="v">${s.discounts.approved}</div><div class="d">approved · ${s.discounts.waiting} waiting · ${s.discounts.rejected} rejected</div></div>
       <div class="card"><div class="k">Payments</div><div class="v">${s.payments.settled}</div><div class="d">settled · ${s.payments.open} open</div></div>
     </div>`;

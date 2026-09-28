@@ -4238,8 +4238,8 @@ class CustomerBot {
       res = await orders.confirm(order, { approvedBy: who });
     } catch (e) {
       const full = String((e && e.message) || e);
+      // Recorded once, by core/orders.confirm, for every punch the portal refuses.
       store.log(this.key, `${order.id} approved by ${who} but the portal refused it: ${full.slice(0, 600)}`);
-      approvalLog.record({ kind: 'order', id: order.id, event: 'failed', by: who, customer: (order.portalCustomer && order.portalCustomer.name) || null, detail: /credit control/i.test(full) ? 'portal: customer on credit control' : 'portal refused: ' + full.slice(0, 120) });
       // 25 Sep: MIYA JI MOTORS's order came back 409 "Customer credit control
       // blocked order confirmation" — a credit limit or overdue bills. That
       // is for the Sales Head to clear on the portal, so it is named as such.
