@@ -16,7 +16,46 @@ const inquiries = require('../core/inquiries');
 const knowledge = require('../core/knowledge');
 const { SimTransport } = require('../wa/transport');
 
+// ---- the dashboard (founder, 26 Sep) ----
+// Customers created, orders placed, discounts and payments: who asked, who
+// approved, where each stands. The page is public/dashboard.html; its data
+// needs DASHBOARD_KEY (?key= or the x-dashboard-key header).
+function mountDashboard(app) {
+  app.get('/', (req, res) => res.redirect('/dashboard'));
+  app.get('/dashboard', (req, res) => res.sendFile(path.join(__dirname, 'public', 'dashboard.html')));
+  app.get('/api/dashboard', async (req, res) => {
+    const key = String(req.query.key || req.get('x-dashboard-key') || '');
+    if (!config.dashboardKey) return res.status(503).json({ error: 'DASHBOARD_KEY is not set on the server' });
+    const a = Buffer.from(key);
+    const b = Buffer.from(config.dashboardKey);
+    if (a.length !== b.length || !require('crypto').timingSafeEqual(a, b)) return res.status(401).json({ error: 'wrong key' });
+    try {
+      res.json(await require('../core/dashboardData').buildLive());
+    } catch (e) {
+      res.status(500).json({ error: String((e && e.message) || e) });
+    }
+  });
+}
+
+// THE DASHBOARD ALONE, ON ITS OWN PORT (founder, 28 Sep: "deploy the
+// dashboard" - reachable by the team, not only through an SSH tunnel). The
+// console on consolePort serves chats, media, customer lists, a simulator that
+// posts as any customer and a broadcast to every customer - none of it behind a
+// key - so that port stays on 127.0.0.1. This one serves the dashboard page and
+// its key-checked data, and nothing else: no static folder, no other route.
+function startDashboard() {
+  if (!config.dashboardPort) return null;
+  const app = express();
+  app.disable('x-powered-by');
+  mountDashboard(app);
+  app.use((req, res) => res.sendStatus(404));
+  return app.listen(config.dashboardPort, () => {
+    store.log('boot', `dashboard (only) on port ${config.dashboardPort}${config.dashboardKey ? '' : ' — DASHBOARD_KEY is not set, it will show nothing'}`);
+  });
+}
+
 function start(bots) {
+  startDashboard();
   const app = express();
   // The RAW body is kept: a re-serialised object hashes differently, so the
   // Meta signature can only be checked against the bytes that arrived.
@@ -46,23 +85,7 @@ function start(bots) {
     for (const t of cloudTransports()) t.handleWebhook(req.body).catch(() => {});
   });
 
-  // ---- the dashboard (founder, 26 Sep) ----
-  // Customers created, orders placed, discounts and payments: who asked, who
-  // approved, where each stands. The page is public/dashboard.html; its data
-  // needs DASHBOARD_KEY (?key= or the x-dashboard-key header).
-  app.get('/dashboard', (req, res) => res.sendFile(path.join(__dirname, 'public', 'dashboard.html')));
-  app.get('/api/dashboard', async (req, res) => {
-    const key = String(req.query.key || req.get('x-dashboard-key') || '');
-    if (!config.dashboardKey) return res.status(503).json({ error: 'DASHBOARD_KEY is not set on the server' });
-    const a = Buffer.from(key);
-    const b = Buffer.from(config.dashboardKey);
-    if (a.length !== b.length || !require('crypto').timingSafeEqual(a, b)) return res.status(401).json({ error: 'wrong key' });
-    try {
-      res.json(await require('../core/dashboardData').buildLive());
-    } catch (e) {
-      res.status(500).json({ error: String((e && e.message) || e) });
-    }
-  });
+  mountDashboard(app);
 
   app.get('/api/status', (req, res) => {
     const out = {};
@@ -279,4 +302,4 @@ function start(bots) {
   return app;
 }
 
-module.exports = { start };
+module.exports = { start, _startDashboard: startDashboard };

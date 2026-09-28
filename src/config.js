@@ -212,6 +212,9 @@ const config = {
   reminderTime: (process.env.REMINDER_TIME || '10:00').trim(),
   // The dashboard (/dashboard): its data is shown only with this key. Unset = off.
   dashboardKey: (process.env.DASHBOARD_KEY || '').trim(),
+  // A second port that serves ONLY the dashboard (console/server.startDashboard),
+  // for opening to the team. 0 / unset = off.
+  dashboardPort: parseInt(process.env.DASHBOARD_PORT || '0', 10) || 0,
 
   // human-confirm escalation: confusion par is number ko DM, itni der jawab
   // ka intezar, phir customer ko fallback reply. Helper ka jawab PERMANENTLY
