@@ -309,8 +309,21 @@ function contextMiddleware({ createMiddleware, z }) {
       // AN ACCOUNT FORM PART-WAY THROUGH. Without this "07AABCU9603R1ZM" is a
       // part number to look up, not the GST number the form asked for.
       const form = chatId ? require('../core/customerCreate').pending(chatId) : null;
+      // AN ETA OFFER WAITING ON THEIR ANSWER (core/advanceOrders): "haan",
+      // "ok", "kab tak aayega?" after it are about the offer.
+      const adv = require('../core/advanceOrders');
+      const eta = chatId ? adv.pending(chatId) : null;
       const extra = [
         cartNote(chatId),
+        eta
+          ? 'ETA OFFER OPEN: after their order ' +
+            (eta.soNumber || eta.orderId) +
+            ' was placed, we offered them ' +
+            eta.lines.map((l) => l.partNo + ' x' + l.qty).join(', ') +
+            ' (not in stock) as an advance order, expected ' +
+            adv.pretty(eta.etaDate) +
+            '. A yes to it (haan, ok, yes, book kar do, theek hai) — call eta_offer with action "accept". A no — action "decline". A question about it (when, what ETA means) — action "show", then answer. Never accept without a clear yes.'
+          : '',
         form
           ? 'ACCOUNT FORM OPEN: this customer is part-way through opening an account' +
             (form.forSomeoneElse ? ' for someone else' : '') +

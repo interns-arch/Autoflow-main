@@ -593,8 +593,81 @@ async function agentChecks() {
   }
 }
 
+// ------------------------------------------------ the ETA offer, as a tool
+// 26 Sep: the parts of a placed order that were not in stock are offered to
+// the customer with an ETA; their answer is the AGENT's to act on, through
+// eta_offer - and the agent is told every tool it has.
+async function etaChecks() {
+  console.log('\nTHE ETA OFFER AND THE TOOL LIST (offline)\n');
+  const agentMod = require('../src/agent');
+  const { etaOffer } = require('../src/agent/tools/advance');
+  const adv = require('../src/core/advanceOrders');
+  const portal = require('../src/integrations/dealerPortal');
+  const CustomerBot = require('../src/bots/customerBot');
+
+  const index = agentMod._toolIndex(agentMod.TOOLS);
+  ok('the prompt lists every tool the agent can call', agentMod.TOOLS.every((t) => index.includes('- ' + t.name + ':')), index);
+  ok('...eta_offer among them', /- eta_offer:/.test(index));
+
+  // A bot that only sends: the real etaOfferAnswered on a fake transport.
+  const sent = [];
+  const bot = {
+    key: 'customer',
+    transport: {
+      sendToChat: async (to, text) => {
+        sent.push({ to, text });
+        return 'wamid.' + sent.length;
+      },
+      sendText: async (to, text) => {
+        sent.push({ to, text });
+        return 'wamid.' + sent.length;
+      },
+    },
+    recordOutgoing() {},
+    toApprovers: async (text) => {
+      sent.push({ to: 'approvers', text });
+      return 1;
+    },
+  };
+  bot.etaOfferAnswered = CustomerBot.prototype.etaOfferAnswered.bind(bot);
+  const CHAT = '919000000891@cloud';
+  const order = { id: 'ORD-ETA1', portalCustomer: { buyerId: 345, name: 'Eta Motors' }, lines: [] };
+  await adv.offer(bot, { order, res: { skipped: [{ partNo: 'Q1', item: 'Q1', qty: 3 }], short: [] }, soNumber: 'SO-1', to: CHAT, customerName: 'Eta Motors', agentChat: 'agentchat@cloud', agentName: 'Shubham' });
+  const cfg = { configurable: { chatId: CHAT, bot } };
+
+  const shown = JSON.parse(await etaOffer.invoke({ action: 'show' }, cfg));
+  ok('"show" gives the parts, the ETA date and what ETA means', shown.open && shown.parts[0].partNo === 'Q1' && shown.parts[0].qty === 3 && /estimated time of arrival/.test(shown.whatEtaMeans), JSON.stringify(shown));
+
+  // The context the model is sent names the open offer.
+  const { createMiddleware } = require('langchain');
+  const { SystemMessage } = require('@langchain/core/messages');
+  const { z } = require('zod');
+  const mw = require('../src/agent/memory').contextMiddleware({ createMiddleware, z });
+  let sys = '';
+  await mw.wrapModelCall({ messages: [], state: {}, systemMessage: new SystemMessage('X'), runtime: { configurable: { chatId: CHAT } } }, async (req) => {
+    sys = String(req.systemMessage.content);
+    return null;
+  });
+  ok('the model is told an ETA offer is open, and which tool answers it', /ETA OFFER OPEN[\s\S]*Q1 x3[\s\S]*eta_offer/.test(sys), sys.slice(-400));
+
+  const before = (portal._mockAdvance() || []).length;
+  const booked = JSON.parse(await etaOffer.invoke({ action: 'accept' }, cfg));
+  ok('"accept" books the advance order and returns its number', booked.booked && /^ADV-/.test(booked.advanceOrderNo) && portal._mockAdvance().length === before + 1, JSON.stringify(booked));
+  ok('...the salesman who punched it is told', sent.some((s) => s.to === 'agentchat@cloud' && /advance order/i.test(s.text)));
+  ok('...and the Sales Heads', sent.some((s) => s.to === 'approvers' && /Advance order/.test(s.text)));
+  const again = JSON.parse(await etaOffer.invoke({ action: 'accept' }, cfg));
+  ok('a second "accept" books nothing more', again.open === false && portal._mockAdvance().length === before + 1, JSON.stringify(again));
+
+  await adv.offer(bot, { order: { ...order, id: 'ORD-ETA2' }, res: { skipped: [{ partNo: 'Q2', item: 'Q2', qty: 1 }], short: [] }, soNumber: 'SO-2', to: CHAT, customerName: 'Eta Motors' });
+  const no = JSON.parse(await etaOffer.invoke({ action: 'decline' }, cfg));
+  ok('"decline" books nothing', no.declined && portal._mockAdvance().length === before + 1, JSON.stringify(no));
+  const none = JSON.parse(await etaOffer.invoke({ action: 'show' }, { configurable: { chatId: 'nobody@cloud', bot } }));
+  ok('with no offer open, the tool says so', none.open === false);
+}
+
 (async () => {
   await toolChecks();
+  await etaChecks();
   await agentChecks();
   console.log('\n' + pass + ' passed, ' + fail + ' failed' + (skip ? ', ' + skip + ' skipped' : '') + '\n');
   process.exit(fail ? 1 : 0);

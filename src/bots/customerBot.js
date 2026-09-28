@@ -4218,15 +4218,15 @@ class CustomerBot {
     }
   }
 
-  // A reply to a standing ETA offer. true when it was one.
-  async answerEtaOffer(m, reply, t) {
-    const o = advanceOrders.pending(m.chatId);
-    if (!o) return false;
-    const said = String(m.body || '').trim();
-    const answer = advanceOrders.readReply(said, m.buttonId);
-    if (!answer) return false;
+  // THE CUSTOMER'S ANSWER TO AN ETA OFFER, acted on - shared by the agent's
+  // eta_offer tool (agent/tools/advance) and the fixed yes/no path below.
+  // Returns FACTS; whoever talks to the customer words them.
+  //   -> { none } | { declined, offer } | { booked, orderNo, offer } | { bookingFailed, offer }
+  async etaOfferAnswered(chatId, yes) {
+    const o = advanceOrders.pending(chatId);
+    if (!o) return { none: true };
     const tellAgent = async (en, hi) => {
-      if (!o.agentChat || o.agentChat === m.chatId) return;
+      if (!o.agentChat || o.agentChat === chatId) return;
       try {
         const text = lang.for(o.agentChat)(en, hi);
         const id = await this.transport.sendToChat(o.agentChat, text);
@@ -4235,30 +4235,46 @@ class CustomerBot {
         /* the customer's answer stands either way */
       }
     };
-    if (answer === 'no') {
-      advanceOrders.decline(m.chatId);
-      await reply(t('No problem — nothing has been booked. Just message us whenever you need them.', 'Koi baat nahi — kuch book nahi kiya. Jab zaroorat ho, bas message kar dijiye.'));
+    if (!yes) {
+      advanceOrders.decline(chatId);
       await tellAgent(`${o.customerName || 'The customer'} said NO to the ETA for ${o.orderId} — nothing booked.`, `${o.customerName || 'Customer'} ne ${o.orderId} ki ETA ke liye NA kaha — kuch book nahi hua.`);
-      return true;
+      return { declined: true, offer: o };
     }
     let done;
     try {
-      done = await advanceOrders.accept(this, m.chatId);
+      done = await advanceOrders.accept(this, chatId);
     } catch (e) {
       const why = String((e && e.message) || e).slice(0, 200);
       store.log(this.key, `${o.orderId}: advance order refused by the portal: ${why}`);
-      await reply(t('Thank you! Our team is booking these for you and will confirm shortly.', 'Shukriya! Hamari team inhe aapke liye book kar rahi hai, thodi der mein confirm karenge.'));
-      await this.toApprovers(`⚠️ Advance order for ${o.customerName || m.chatId} (${o.orderId}) — the customer accepted ETA ${advanceOrders.pretty(o.etaDate)}, but the portal refused it: ${why}\nParts:\n${o.lines.map((l) => `• ${l.partNo} × ${l.qty}`).join('\n')}\nPlease book it on the portal by hand.`).catch(() => {});
-      return true;
+      await this.toApprovers(`⚠️ Advance order for ${o.customerName || chatId} (${o.orderId}) — the customer accepted ETA ${advanceOrders.pretty(o.etaDate)}, but the portal refused it: ${why}\nParts:\n${o.lines.map((l) => `• ${l.partNo} × ${l.qty}`).join('\n')}\nPlease book it on the portal by hand.`).catch(() => {});
+      return { bookingFailed: true, offer: o };
     }
-    if (!done) return false;
-    await reply(advanceOrders.bookedText(o, done.soNumber, t));
+    if (!done) return { none: true };
     await tellAgent(
       `✅ ${o.customerName || 'The customer'} accepted the ETA — ${o.lines.length} part(s) of ${o.orderId} booked as advance order ${done.soNumber} (expected ${advanceOrders.pretty(o.etaDate)}).`,
       `✅ ${o.customerName || 'Customer'} ne ETA maan li — ${o.orderId} ke ${o.lines.length} part advance order ${done.soNumber} mein book (${advanceOrders.pretty(o.etaDate)} tak).`,
     );
-    await this.toApprovers(`📦 *Advance order* ${done.soNumber} — ${o.customerName || m.chatId} accepted ETA ${advanceOrders.pretty(o.etaDate)} for ${o.orderId}:\n${o.lines.map((l) => `• ${l.partNo} × ${l.qty}`).join('\n')}`).catch(() => {});
-    return true;
+    await this.toApprovers(`📦 *Advance order* ${done.soNumber} — ${o.customerName || chatId} accepted ETA ${advanceOrders.pretty(o.etaDate)} for ${o.orderId}:\n${o.lines.map((l) => `• ${l.partNo} × ${l.qty}`).join('\n')}`).catch(() => {});
+    return { booked: true, orderNo: done.soNumber, offer: o };
+  }
+
+  // A plain yes/no to a standing ETA offer, answered without the agent: for
+  // a salesman asked on the customer's behalf (staff never reach the agent),
+  // and for a customer while the agent cannot run. A customer's reply
+  // otherwise goes to the agent, which calls eta_offer itself. true when it
+  // was one.
+  async answerEtaOffer(m, reply, t) {
+    const o = advanceOrders.pending(m.chatId);
+    if (!o) return false;
+    if (!this.isOperator(m) && agent.enabled()) return false;
+    const said = String(m.body || '').trim();
+    const answer = advanceOrders.readReply(said, m.buttonId);
+    if (!answer) return false;
+    const r = await this.etaOfferAnswered(m.chatId, answer === 'yes');
+    if (r.none) return false;
+    if (r.declined) return reply(t('No problem — nothing has been booked. Just message us whenever you need them.', 'Koi baat nahi — kuch book nahi kiya. Jab zaroorat ho, bas message kar dijiye.'));
+    if (r.bookingFailed) return reply(t('Thank you! Our team is booking these for you and will confirm shortly.', 'Shukriya! Hamari team inhe aapke liye book kar rahi hai, thodi der mein confirm karenge.'));
+    return reply(advanceOrders.bookedText(o, r.orderNo, t));
   }
 
   whereWeAre(m, t, { unclear = false } = {}) {

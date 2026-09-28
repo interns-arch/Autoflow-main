@@ -41,6 +41,7 @@ const fulfilment = require('./tools/fulfilment');
 const escalation = require('./tools/escalation');
 const web = require('./tools/web');
 const workflows = require('./tools/workflows');
+const advance = require('./tools/advance');
 
 const TOOLS = [
   parts.lookupKnownPart,
@@ -69,7 +70,25 @@ const TOOLS = [
   workflows.accountForm,
   workflows.lookupVehicle,
   workflows.myAccount,
+  advance.etaOffer,
 ];
+
+// EVERY TOOL, ONE LINE EACH, in the prompt (founder, 26 Sep: "agent should be
+// aware of all the tools"). Built from TOOLS itself, so the list the model
+// reads is always the list it can call: a tool added above is in it, a tool
+// taken out is gone. The first sentence of each tool's own description.
+function toolIndex(tools) {
+  const first = (d) => {
+    // "e.g." and "i.e." are not the end of a sentence.
+    const s = String(d || '').replace(/\s+/g, ' ').trim().replace(/\b(e\.g|i\.e)\./gi, (x) => x.replace(/\./g, '․'));
+    const cut = s.search(/[.!?](\s|$)/);
+    return (cut > 0 ? s.slice(0, cut + 1) : s).slice(0, 220).replace(/․/g, '.');
+  };
+  return (
+    'YOUR TOOLS — all of them. Reach for the one that fits; never say you cannot do something one of these does:\n' +
+    tools.map((t) => '- ' + t.name + ': ' + first(t.description)).join('\n')
+  );
+}
 
 let agent = null;
 // WHICH checkpointer the cached agent holds.
@@ -115,7 +134,7 @@ function build() {
       temperature: 0.2,
     }),
     tools: TOOLS,
-    systemPrompt: SYSTEM,
+    systemPrompt: SYSTEM + '\n\n' + toolIndex(TOOLS),
     // The conversation, keyed on chat id. Durable, because a paused question
     // has to survive a deploy — see memory.js.
     checkpointer: builtWith,
@@ -408,4 +427,4 @@ function textOf(msg) {
   return '';
 }
 
-module.exports = { handle, resume, followUp, warmUp, enabled, lastFailure: () => lastFailure, TOOLS, _build: build, _inventedMoney: inventedMoney, _claimsSentForApproval: claimsSentForApproval, _approvalThisTurn: approvalThisTurn };
+module.exports = { handle, resume, followUp, warmUp, enabled, lastFailure: () => lastFailure, TOOLS, _toolIndex: toolIndex, _build: build, _inventedMoney: inventedMoney, _claimsSentForApproval: claimsSentForApproval, _approvalThisTurn: approvalThisTurn };
