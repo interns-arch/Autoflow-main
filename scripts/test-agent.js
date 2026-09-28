@@ -222,6 +222,28 @@ async function toolChecks() {
   ok('an unregistered number opens its OWN account, first question as a fact', f1 && f1.started === true && typeof f1.nextQuestion === 'string', JSON.stringify(f1));
   ok('...and an answer moves the form on', f3 && typeof f3.inProgress === 'boolean', JSON.stringify(f3));
 
+  // "hi" starts a fresh conversation (founder, 28 Sep) - but never while a
+  // question is with the specialist, whose answer resumes that thread.
+  {
+    const ag = require('../src/agent');
+    const C = 'fresh-test@c.us';
+    ag._sessions.delete(C);
+    ok('a chat starts on its own id, so existing threads are unchanged', ag._threadOf(C) === C);
+    ok('"hii" on its own starts a fresh conversation', ag._freshOnGreeting(C, 'hii') === true && ag._threadOf(C) === C + '#1');
+    ok('"hi, 16510M65L10 ka rate?" is not a bare greeting', ag._freshOnGreeting(C, 'hi, 16510M65L10 ka rate?') === false && ag._threadOf(C) === C + '#1');
+    ag._markPaused(C, true);
+    ok('while a question is with the specialist, "hi" keeps the conversation', ag._freshOnGreeting(C, 'hi') === false && ag._threadOf(C) === C + '#1');
+    ag._markPaused(C, false);
+    ag._sessions.delete(C);
+  }
+  // No account, no cart (founder, 28 Sep).
+  {
+    const ordersTool = require('../src/agent/tools/orders');
+    const r = JSON.parse(await ordersTool.addToOrder.invoke({ items: [{ partNumber: '16510M65L10', qty: 2 }] }, { configurable: { chatId: 'noacct-test@c.us', phone: '919000000999', customer: null } }));
+    ok('an unregistered number: nothing goes into the cart, and they are told the account comes first', r.added === false && r.noAccount === true && /account has to be created first/.test(r.tellCustomer), JSON.stringify(r));
+    ok('...and no draft is made for them', !require('../src/core/orders').findDraft('noacct-test@c.us'));
+  }
+
   // ...nor set a discount: not passed to a person either.
   const esc = require('../src/agent/tools/escalation');
   const noBot = { configurable: { chatId: 'esc-test@c.us', phone: '919000000991', bot: { key: 'test' } } };

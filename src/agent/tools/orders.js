@@ -71,6 +71,21 @@ const addToOrder = tool(
     const bad = wanted.find((i) => !Number.isInteger(Number(i.qty)) || Number(i.qty) < 1);
     if (bad) return JSON.stringify({ error: 'quantity for ' + bad.partNumber + ' must be a whole number of at least 1 — ask the customer how many they want' });
 
+    // NO ACCOUNT, NO CART (founder, 28 Sep): a number with no account on the
+    // portal can search parts and hear prices, but nothing goes into a cart
+    // until the account exists - there is nobody to bill it to. Said at once,
+    // at the moment they want to add it, not after a cart has been built.
+    if (!(ctx.customer && (ctx.customer.buyerId || ctx.customer.accountId))) {
+      store.log('agent', `${ctx.phone}: wanted ${wanted.map((i) => i.partNumber + ' x' + i.qty).join(', ')} in the cart — no account yet, nothing added`);
+      return JSON.stringify({
+        added: false,
+        noAccount: true,
+        wanted: wanted.map((i) => ({ partNumber: i.partNumber, qty: Number(i.qty) })),
+        tellCustomer:
+          'Nothing was added: this number has no account with us yet, and an order needs one. Tell them warmly and respectfully, in their language, that their account has to be created first and that you will add these parts to the cart as soon as it is; offer to create it now (account_form "start"). Do not say anything was added or reserved.',
+      });
+    }
+
     let resolved = [];
     try {
       resolved = await availability.resolve(

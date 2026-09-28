@@ -28,7 +28,7 @@ const lookupCustomer = tool(
     if (!who || !who.found) {
       return JSON.stringify({
         known: false,
-        note: 'this number is not registered with us. They can still be quoted MRP and can still order, but they will not get their own rate. Do not mention accounts unless they ask.',
+        note: 'this number is not registered with us. They can search parts and be quoted MRP, but nothing can go into a cart until their account is created - say so warmly the moment they want to order, and offer to create it (account_form "start"). Until then, do not bring up accounts.',
       });
     }
     // The account id itself is deliberately NOT returned: pricing already

@@ -154,6 +154,40 @@ function build() {
   return agent;
 }
 
+// A FRESH CONVERSATION ON "HI" (founder, 28 Sep: "when any customer say hii in
+// chat it start new context for agent and start listening all new messages
+// fresh"). The thread - and with it the history and its summary - is keyed on
+// the chat plus a session number; a greeting on its own moves to the next
+// session. Session 0 is the bare chat id, so every conversation that existed
+// before this keeps its thread. Not while a question is paused for the
+// specialist: his answer resumes THAT thread, and a new one would never hear it.
+const chatState = require('../core/chatState');
+const sessions = chatState.slot('agent.session'); // chatId -> { n, paused, at }
+const GREETING_ONLY = /^\s*(h+i+|h+e+y+|h+e+l+o+|hlo+|hii+|helo|namaste|namaskar|namaskaar|pranam|good\s*(morning|afternoon|evening)|gm|salam|salaam|sat\s*sri\s*akal|ram\s*ram|jai\s*shree\s*krishna|radhe\s*radhe)(\s+(ji|sir|bhai|bhaiya|madam|mam|dost|there))?[\s.!🙏👋😊]*$/iu;
+function threadOf(chatId) {
+  const s = sessions.get(chatId);
+  return s && s.n ? chatId + '#' + s.n : chatId;
+}
+// -> true when this message started a fresh session.
+function freshOnGreeting(chatId, text) {
+  if (!chatId || !GREETING_ONLY.test(String(text || ''))) return false;
+  const s = sessions.get(chatId) || { n: 0 };
+  // A pause older than six hours is one a restart lost: it no longer holds.
+  if (s.paused && Date.now() - (s.at || 0) < 6 * 60 * 60 * 1000) {
+    store.log('agent', `${chatId} said hi, but a question is with the specialist — same conversation kept`);
+    return false;
+  }
+  sessions.set(chatId, { n: (s.n || 0) + 1, paused: false, at: Date.now() });
+  store.log('agent', `${chatId} said hi — fresh conversation (session ${(s.n || 0) + 1})`);
+  return true;
+}
+function markPaused(chatId, paused) {
+  if (!chatId) return;
+  const s = sessions.get(chatId) || { n: 0 };
+  if (Boolean(s.paused) === Boolean(paused)) return;
+  sessions.set(chatId, { ...s, paused: Boolean(paused), at: Date.now() });
+}
+
 function configFor({ chatId, phone, customer, bot, message }) {
   return {
     configurable: {
@@ -161,8 +195,10 @@ function configFor({ chatId, phone, customer, bot, message }) {
       // words — a shop photo or a dropped pin for the account form.
       message: message || null,
       // The memory key AND the identity, in one object. Nothing here is ever
-      // shown to the model: the tools read it, the prompt does not.
-      thread_id: chatId,
+      // shown to the model: the tools read it, the prompt does not. The
+      // thread carries the session number (freshOnGreeting); every tool
+      // still works on the chat itself.
+      thread_id: threadOf(chatId),
       chatId,
       phone,
       customer: customer || null,
@@ -204,6 +240,8 @@ function pausedAt(out) {
 async function handle({ bot, chatId, phone, customer, text, message }) {
   const said = String(text || '').trim();
   if (!said) return { handled: false, reply: null };
+  // Their own words, not the notes in front of them.
+  freshOnGreeting(chatId, message && typeof message.body === 'string' ? message.body : said);
   return await run({ bot, chatId, phone, customer, message }, { messages: [{ role: 'user', content: said }] }, 'turn');
 }
 
@@ -309,6 +347,7 @@ async function run(who, input, what) {
   const calls = messages.filter((m) => (m.getType ? m.getType() : '') === 'tool').map((m) => m.name);
 
   const stop = pausedAt(out);
+  markPaused(who.chatId, Boolean(stop));
   if (stop) {
     store.log(
       'agent',
@@ -428,4 +467,4 @@ function textOf(msg) {
   return '';
 }
 
-module.exports = { handle, resume, followUp, warmUp, enabled, lastFailure: () => lastFailure, TOOLS, _toolIndex: toolIndex, _build: build, _inventedMoney: inventedMoney, _claimsSentForApproval: claimsSentForApproval, _approvalThisTurn: approvalThisTurn };
+module.exports = { handle, resume, followUp, warmUp, enabled, lastFailure: () => lastFailure, TOOLS, _toolIndex: toolIndex, _threadOf: threadOf, _freshOnGreeting: freshOnGreeting, _markPaused: markPaused, _sessions: sessions, _build: build, _inventedMoney: inventedMoney, _claimsSentForApproval: claimsSentForApproval, _approvalThisTurn: approvalThisTurn };
