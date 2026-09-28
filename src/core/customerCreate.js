@@ -871,13 +871,20 @@ async function refuseIfTaken(form, field, value, t) {
         form,
       };
     }
+    // A CUSTOMER typing a GST number that is already an account is NOT that
+    // account (founder, 28 Sep): the order would be billed to whoever the
+    // number belongs to, and anyone can type anyone's GSTIN. So nothing is
+    // offered on it - no "send the part number, I will place the order" -
+    // and the form stays at the GST question for their OWN one. The firm's
+    // owner writing from a new number is told how that is done, without being
+    // shown whose account it is.
+    open.set(form.chatId, form);
     return {
       reply: t(
-        'There is already an account on this GST number. Send the part number and quantity and I will place the order.',
-        'Is GST number par account pehle se bana hua hai. Part number aur quantity bhejiye, order laga deta hoon.',
+        'This GST number is already registered with another account, so a new account cannot be opened on it. Please send YOUR OWN valid 15-character GST number. If that firm is yours and you are writing from a new number, our sales team can add this number to your account.',
+        'Ye GST number pehle se kisi aur account pe registered hai, is par naya account nahi khul sakta. Apna khud ka sahi 15 character ka GST number bhejiye. Agar ye firm aapki hi hai aur aap naye number se message kar rahe hain, to hamari sales team ye number aapke account mein jod degi.',
       ),
       done: false,
-      closed: true,
       form,
     };
   }
@@ -913,8 +920,10 @@ async function fillFromGst(form, gstin, t) {
   // Wrong shape. Caught before the network, so a typo never costs a credit.
   if (firm && firm.error === 'shape') {
     return gstFail(form, 'shape', t(
-      'That is not a GST number — they are 15 characters, like 07AABCU9603R1ZM. Send it again.',
-      'Ye GST number nahi lag raha — 15 character ka hota hai, jaise 07AABCU9603R1ZM. Dobara bhejiye.',
+      // No sample number: 28 Sep, live, a customer sent the sample back as
+      // their own GSTIN.
+      'That is not a GST number — a GST number has 15 characters (2 digits, 10 letters and digits of the PAN, then 3 more). Please check and send yours again.',
+      'Ye GST number nahi lag raha — GST number 15 character ka hota hai (2 digit, phir PAN ke 10 character, phir 3 aur). Check karke apna dobara bhejiye.',
     ), t);
   }
 

@@ -649,7 +649,20 @@ class CustomerBot {
         }
       }
       store.log(this.key, `${m.from} asked to open an account${forElse ? ' for someone else' : ''}${agent ? ' (agent: ' + agent + ')' : ''}`);
-      return reply(customerCreate.start(m.chatId, m.from, t, { forSomeoneElse: forElse }));
+      const opened = customerCreate.start(m.chatId, m.from, t, { forSomeoneElse: forElse });
+      // THE NUMBER IN THE REQUEST (founder, 28 Sep): "customer bana do
+      // 9812345678" is that customer's account - their number is the form's
+      // first answer, not asked for again. The form's own checks still run on
+      // it (already a customer? then it says so and asks for another).
+      const key = (agent || forElse) && salesOrder.findKeyIn(text);
+      if (key && key.phone && customerCreate.pending(m.chatId)) {
+        const step = await customerCreate.answer(m.chatId, { ...m, body: key.phone.slice(-10) }, key.phone.slice(-10), t);
+        if (step && step.reply) {
+          store.log(this.key, `${m.from}: account form for ${key.phone.slice(-10)}, the number in the request`);
+          return reply(t(`Opening an account for ${key.phone.slice(-10)}.`, `${key.phone.slice(-10)} ka account bana rahe hain.`) + '\n\n' + step.reply);
+        }
+      }
+      return reply(opened);
     }
 
     // AN EXISTING CUSTOMER'S DISCOUNT, CHANGED. Asked for in words; the
@@ -3230,10 +3243,37 @@ class CustomerBot {
       );
     }
     const st = { mode: 'change', step: 'customer', draft: {}, count: 0, setBy: agent || m.profileName || m.from };
+    // THE CUSTOMER IN THE REQUEST ITSELF (founder, 28 Sep): "discount create
+    // karna hai 9122781913" is that customer's - their rules come back at once,
+    // with no "whose discount?" and no "this one?", because the desk just said.
+    const key = salesOrder.findKeyIn(text);
+    if (key) {
+      const rows = await salesOrder.findByKey(key).catch(() => []);
+      if (rows.length === 1) {
+        st.row = rows[0];
+        st.step = 'confirmCustomer';
+        discountSetup.save(m.chatId, st);
+        const card = await salesOrder.customerCard(rows[0], t);
+        store.log(this.key, `${m.from}: discount for ${rows[0].name}, named by number in the request`);
+        return this.answerDiscount({ ...m, body: 'haan', buttonId: 'DSC_YES' }, 'haan', (x) => reply(card + '\n\n' + x), t);
+      }
+      if (rows.length > 1) {
+        st.candidates = rows.slice(0, 9);
+        discountSetup.save(m.chatId, st);
+        return reply(t('Which account?\n', 'Kaunsa account?\n') + st.candidates.map((r, i) => `${i + 1}. ${r.name}${r.state_name ? ' (' + r.state_name + ')' : ''}`).join('\n'));
+      }
+      const what = key.phone ? key.phone.slice(-10) : key.gst;
+      discountSetup.save(m.chatId, st);
+      return reply(t(`No customer on the portal with ${what}. Send the right customer's number.`, `${what} pe portal mein koi customer nahi mila. Sahi customer ka number bhejiye.`));
+    }
+    // The customer the desk is already on - being ordered for, or just looked
+    // up - is offered, with one yes/no, instead of asking for the number again.
     const picked = salesOrder.activeCustomer(m.chatId);
     if (picked && picked.buyerId) {
       return this.confirmDiscountCustomer(m, st, { ...(picked.raw || {}), id: picked.buyerId, name: picked.name }, reply, t);
     }
+    const known = salesOrder.lastLookedUp(m.chatId);
+    if (known && known.id) return this.confirmDiscountCustomer(m, st, known, reply, t);
     discountSetup.save(m.chatId, st);
     return reply(
       salesOrder.mobileOnly()

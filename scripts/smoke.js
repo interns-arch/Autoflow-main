@@ -5550,12 +5550,15 @@ async function main() {
     const dup66 = await cc66.answer(CHD, {}, '33AAACC1206D1ZN', t66);
     gst66.lookup = countWas66;
     check('a GSTIN already on the portal costs no paid GST lookup', paid66 === 0);
-    // A CUSTOMER is told the account exists - never whose it is - and sent
-    // on to ordering. A GSTIN on the portal is an account; there is nothing
-    // "different" to send.
-    check('a GSTIN already on the portal tells the customer the account exists', /account pehle se bana hua hai/i.test(dup66.reply));
+    // A CUSTOMER typing another firm's GSTIN is NOT that firm (founder, 28
+    // Sep): told it is registered elsewhere, asked for their OWN, and never
+    // offered an order on it - nor told whose it is.
+    check('a GSTIN already on the portal: the customer is told it belongs to another account', /pehle se kisi aur account pe registered/i.test(dup66.reply), dup66.reply);
+    check('...and asked for their OWN valid GST number', /apna khud ka sahi 15 character ka GST number/i.test(dup66.reply));
+    check('...never offered an order on it', !/order laga|part number aur quantity/i.test(dup66.reply));
     check('...without saying whose it is', !/Existing Traders/.test(dup66.reply));
-    check('...and the form is closed', !cc66.pending(CHD));
+    check('...and the form stays open at the GST question', Boolean(cc66.pending(CHD)) && !cc66.pending(CHD).answers.gstNo);
+    cc66.cancel(CHD);
 
     // A SALES AGENT is told whose it is, so they take the order there.
     cfg66.team = { ...(teamWas66 || {}), 919811100066: 'Shubham' };
@@ -6093,6 +6096,51 @@ async function main() {
         config.customerSearchBy = 'any';
         config.salesTeamNumbers.splice(config.salesTeamNumbers.indexOf(S74), 1);
         so74._resetDirectory();
+      }
+
+      // 28 Sep, founder: "agent say order karna hai 8800556388 so bot understand
+      // the msg and start taking order for that customer - not 'ok send
+      // customer no.'"; and a customer already known is not asked for again.
+      console.log('\n[74a] the desk names the customer in the order itself');
+      config.salesTeamNumbers.push(S74);
+      try {
+        so74._resetDirectory();
+        if (orders.findDraft(C74)) orders.cancel(orders.findDraft(C74));
+        const o74 = await say74('order karna hai 9811122233');
+        check('"order karna hai <number>" does not ask for the number', !/number bhejiye|send the customer/i.test(o74), o74);
+        check('...it asks only which of that number\'s accounts', /order kiske liye/i.test(o74) && /Kalra Motors/.test(o74), o74);
+        const pick74 = (o74.match(/(\d)\. Kalra Motors/) || [])[1] || '2';
+        const p74 = await say74(pick74);
+        check('...and the pick starts the order for them, asking for the parts', /Kalra Motors ka order — parts bataiye/.test(p74), p74);
+        check('...with Kalra Motors as the customer being ordered for', (so74.activeCustomer(C74) || {}).name === 'Kalra Motors');
+        so74._resetDirectory();
+        const op74 = await say74('9811122233 ka order punch karo 16510M65L10 2');
+        const pp74 = await say74((op74.match(/(\d)\. Kalra Motors/) || [])[1] || '2');
+        check('parts in the same message are checked for that customer, not asked for again', /16510M65L10/.test(pp74) && !/parts bataiye/i.test(pp74), pp74);
+        if (orders.findDraft(C74)) orders.cancel(orders.findDraft(C74));
+        // Just looked up: "order punch karna hai" is for them.
+        so74._resetDirectory();
+        so74.rememberLookedUp(C74, { id: 265, name: 'Kalra Motors', phone: '9811122233' });
+        const k74 = await say74('order punch karna hai');
+        check('"order punch karna hai" right after a customer is for that customer — no number asked', /Kalra Motors/.test(k74) && /parts bataiye/.test(k74) && !/number bhejiye\b(?!.*Kisi aur)/.test(k74.replace(/\(Kisi aur[^)]*\)/g, '')), k74);
+        so74._resetDirectory();
+        const n74 = await say74('order karna hai');
+        check('...and with no customer known, whose is asked', /Kis customer ke liye/.test(n74), n74);
+        so74._resetDirectory();
+        // The same for a discount and for a new account.
+        const ds74 = require('../src/core/discountSetup');
+        ds74.cancel(C74);
+        const d74 = await say74('discount create karna hai 9811122233');
+        check('"discount create karna hai <number>" does not ask whose', !/Kis customer ka discount/.test(d74) && /Kalra Motors/.test(d74), d74);
+        ds74.cancel(C74);
+        require('../src/core/customerCreate').cancel(C74);
+        const c74 = await say74('customer bana do 9812345670');
+        check('"customer bana do <number>" opens the form for that number, not asking it again', /9812345670 ka account bana rahe hain/.test(c74) && !/WhatsApp number bhejiye/i.test(c74), c74);
+        require('../src/core/customerCreate').cancel(C74);
+      } finally {
+        config.salesTeamNumbers.splice(config.salesTeamNumbers.indexOf(S74), 1);
+        so74._resetDirectory();
+        if (orders.findDraft(C74)) orders.cancel(orders.findDraft(C74));
       }
 
       // 28 Sep, live (7355374975): invoices of a customer, then "ledger" -

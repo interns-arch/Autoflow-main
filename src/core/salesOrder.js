@@ -940,6 +940,59 @@ function lastLookedUp(chatId) {
   return l.row;
 }
 
+// THE DESK IS ORDERING FOR THIS CUSTOMER NOW (the one `choose` just made
+// active): the parts that came with the request go into their draft, or the
+// parts are asked for.
+async function orderFor(bot, m, chosen, reply, t, lead = null) {
+  const orders = require('./orders'); // loaded late, like the rest of this file: orders requires this module
+  const c = chosen.customer;
+  rememberLookedUp(m.chatId, { ...(c.raw || {}), id: c.buyerId, name: c.name });
+  // Parts gathered before the customer was picked belong to nobody: they
+  // must not ride along into this customer's SO.
+  const old = orders.findDraft(m.chatId);
+  let dropped = 0;
+  if (old && old.lines.length && !(old.portalCustomer && old.portalCustomer.buyerId === c.buyerId)) {
+    dropped = old.lines.length;
+    orders.cancel(old);
+  }
+  store.log('sales', m.from + ' is ordering for ' + c.name + ' (buyer ' + c.buyerId + ')' + (dropped ? ', cleared ' + dropped + ' earlier line(s)' : ''));
+  const note = dropped ? t(' (cleared the earlier ' + dropped + ' item(s))', ' (pichhle ' + dropped + ' item hata diye)') : '';
+  if (chosen.items) {
+    const lines = require('./ai').parseLinesBlock(chosen.items) || [];
+    if (lines.length) {
+      return bot.processOrderLines(m, lines, reply, (lead ? lead + '\n\n' : '') + t('Draft for ' + c.name + note + ':', c.name + ' ka draft' + note + ':'));
+    }
+  }
+  return reply((lead ? lead + '\n\n' : '') + t('Order for ' + c.name + note + ' — send the parts.', c.name + note + ' ka order — parts bataiye.'));
+}
+
+// "order karna hai 8800556388", "8800556388 ka order punch karo", "SO bana
+// do 9812345678: 16510M65L10 2" (founder, 28 Sep: "bot understand the msg and
+// start taking order for that customer - not 'ok send customer no.'"). The
+// number in an ORDER request is the customer: one account for it, and the
+// order is theirs straight away; several, and which is asked.
+const ORDER_ASK = /\b(order|orders|so|s\.o\.?|punch|sale\s*order|sales\s*order)\b/i;
+// An order wanted, and nothing else in the message: no customer, no part.
+const ORDER_WANT = /^\s*(?:(?:mujhe|muje|hume|humein|mereko|sir|bhai|ji)\s+)?(?:(?:ek|naya|new|a|an)\s+)?(?:order|so|s\.o\.?|sale\s*order|sales\s*order)\s+(?:(?:punch|place)\s+)?(?:karna|karni|krna|krni|lagana|lgana|banana|bnana|dalna|daalna|dena|lena)\s*(?:hai|h|he|tha)?[\s.!?]*$|^\s*(?:new|naya)\s+(?:order|so)[\s.!?]*$/i;
+function orderKeyIn(text) {
+  const s = String(text || '');
+  if (!ORDER_ASK.test(s) || STATUS.test(s) || LEDGER_RE.test(s) || INVOICE_RE.test(s)) return null;
+  return findKeyIn(s);
+}
+// The request with its trigger words and the customer's number taken out:
+// whatever is left is parts.
+function partsAfterKey(text, key) {
+  let s = String(text || '');
+  const digits = key && key.phone ? key.phone.slice(-10) : null;
+  if (digits) s = s.replace(new RegExp('(?:\\+?91[\\s-]?)?' + digits.slice(0, 5) + '[\\s-]?' + digits.slice(5)), ' ');
+  if (key && key.gst) s = s.replace(new RegExp(key.gst, 'i'), ' ');
+  s = s
+    .replace(/\b(order|orders|so|s\.o\.?|sale\s*order|sales\s*order|punch|karna|karni|karo|kar|kr|do|de|dena|hai|h|ka|ki|ke|liye|lie|for|this|customer|cust|party|number|no|mobile|bana|banao|laga|lagao|please|pls|sir|ji|bhai|ye|yeh|is|iska|iske|isko|of|place|create|book|make)\b\.?/gi, ' ')
+    .replace(/^[\s.,:;-]+|[\s.,:;-]+$/g, '')
+    .trim();
+  return s || null;
+}
+
 // What an agent asked for, once the customer is known.
 async function deliverFor(bot, m, row, intent, reply, t) {
   rememberLookedUp(m.chatId, row);
@@ -1678,6 +1731,35 @@ async function handle(bot, m, text, reply, t) {
     return searchByName(m, text, s.items || takeItems(m.chatId), reply, t);
   }
 
+  // 1c-order. AN ORDER NAMING ITS CUSTOMER BY NUMBER: "order karna hai
+  //   8800556388" - the order is theirs at once, no "send the number" and no
+  //   "is it for this customer?" (the desk just said it is).
+  const oKey = !infoKey && !(s && s.stage === 'choose') ? orderKeyIn(text) : null;
+  if (oKey) {
+    let rows = [];
+    try {
+      rows = await findByKey(oKey);
+    } catch (e) {
+      store.log('sales', 'order customer by number failed: ' + String((e && e.message) || e).slice(0, 120));
+      return reply(t("I can't reach the customer list right now - try again in a minute?", 'Customer list abhi khul nahi rahi - ek minute mein phir bhejiye?'));
+    }
+    const what = oKey.phone ? oKey.phone.slice(-10) : oKey.gst;
+    const items = [takeItems(m.chatId), partsAfterKey(text, oKey)].filter(Boolean).join('\n') || null;
+    if (!rows.length) {
+      if (items) holdItems(m.chatId, require('./ai').parseLinesBlock(items) || []);
+      return reply(t('No customer on the portal with ' + what + '. To open a new account for them, write "customer bana do ' + what + '".', what + ' pe portal mein koi customer nahi mila. Naya account kholna hai to "customer bana do ' + what + '" likhiye.'));
+    }
+    store.log('sales', m.from + ' asked for an order for ' + what + ': ' + rows.length + ' account(s)');
+    if (rows.length === 1) {
+      start(m.chatId, rows, items);
+      const card = await customerCard(rows[0], t);
+      return orderFor(bot, m, await choose(m.chatId, 0), reply, t, card);
+    }
+    start(m.chatId, rows.slice(0, MAX_CANDIDATES), items);
+    const listed = rows.slice(0, MAX_CANDIDATES).map((r, i) => i + 1 + '. ' + label(r)).join('\n');
+    return reply(t(what + ' has ' + rows.length + ' accounts — which one is the order for?\n' + listed, what + ' pe ' + rows.length + ' account hain — order kiske liye?\n' + listed));
+  }
+
   // 1c. THE CUSTOMER BY PHONE OR GSTIN. Not while a list is open: "2" there is
   // a pick, and a list answer never looks like a phone number anyway.
   const key = infoKey || (!(s && s.stage === 'choose' && readChoice(text, s.candidates.length) !== null) ? readCustomerKey(text) : null);
@@ -1754,28 +1836,7 @@ async function handle(bot, m, text, reply, t) {
         if (s.intent === 'ledger') await sendLedgerPdf(bot, m, row, t);
         return true;
       }
-      const chosen = await choose(m.chatId, pick);
-      const c = chosen.customer;
-      // Parts gathered before the customer was picked belong to nobody: they
-      // must not ride along into this customer's SO.
-      const old = orders.findDraft(m.chatId);
-      let dropped = 0;
-      if (old && old.lines.length && !(old.portalCustomer && old.portalCustomer.buyerId === c.buyerId)) {
-        dropped = old.lines.length;
-        orders.cancel(old);
-      }
-      store.log(
-        'sales',
-        m.from + ' is ordering for ' + c.name + ' (buyer ' + c.buyerId + ')' + (dropped ? ', cleared ' + dropped + ' earlier line(s)' : ''),
-      );
-      const note = dropped ? t(' (cleared the earlier ' + dropped + ' item(s))', ' (pichhle ' + dropped + ' item hata diye)') : '';
-      if (chosen.items) {
-        const lines = require('./ai').parseLinesBlock(chosen.items) || [];
-        if (lines.length) {
-          return bot.processOrderLines(m, lines, reply, t('Draft for ' + c.name + note + ':', c.name + ' ka draft' + note + ':'));
-        }
-      }
-      return reply(t('Got it - ' + c.name + note + '. Send the parts.', 'Theek hai, ' + c.name + note + '. Parts bataiye.'));
+      return orderFor(bot, m, await choose(m.chatId, pick), reply, t);
     }
     // Not an answer. A new "X ka SO" starts over; anything else gets the
     // question again. Never a fall-through: a stray "haan" here would reach
@@ -2142,6 +2203,30 @@ async function handle(bot, m, text, reply, t) {
     );
   }
 
+  // 4-. "order karna hai", "order punch karna hai", "SO banana hai" - an
+  //   order, nobody named (28 Sep, live: it went to small talk, "Haan sir,
+  //   part number bhej dijiye", with no customer at all). The customer the
+  //   desk already has in front of it is used - the one being ordered for, or
+  //   the one just looked up - and not asked for again; with none, whose.
+  if (ORDER_WANT.test(text)) {
+    const active = activeCustomer(m.chatId);
+    if (active) return reply(t('Order for ' + active.name + ' — send the parts. (For another customer, send their number.)', active.name + ' ka order — parts bataiye. (Kisi aur customer ka ho to uska number bhejiye.)'));
+    const known = lastLookedUp(m.chatId);
+    if (known && known.id) {
+      store.log('sales', m.from + ' wants an order - for ' + known.name + ', the customer just looked up');
+      start(m.chatId, [known], takeItems(m.chatId));
+      return orderFor(bot, m, await choose(m.chatId, 0), reply, t, t(known.name + ' — the customer we were just on. (For another customer, send their number.)', known.name + ' — jo customer abhi dekha tha. (Kisi aur ka ho to uska number bhejiye.)'));
+    }
+    sessions.set(m.chatId, { stage: 'askCustomer', items: takeItems(m.chatId), at: Date.now() });
+    store.log('sales', m.from + ' wants an order for a customer not yet named');
+    return reply(
+      t(
+        mobileOnly() ? "Which customer is it for? Send the customer's 10-digit mobile number." : "Which customer is it for? Send the customer's phone number or GST number (or their full name).",
+        mobileOnly() ? 'Kis customer ke liye? Customer ka 10 digit mobile number bhejiye.' : 'Kis customer ke liye? Customer ka phone number ya GST number bhejiye (ya poora naam).',
+      ),
+    );
+  }
+
   // 4. "X ka SO bana do".
   const req = parseOrderFor(text);
   if (!req) return false;
@@ -2213,6 +2298,9 @@ function _resetDirectory() {
 module.exports = {
   orderAsked,
   customerCard,
+  findKeyIn,
+  lastLookedUp,
+  rememberLookedUp,
   readCustomerKey,
   mobileOnly,
   askMobile,

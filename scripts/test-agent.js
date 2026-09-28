@@ -195,27 +195,32 @@ async function toolChecks() {
   ok('...and a number the portal does not know comes back with its close match', o3 && o3.status === 'close_match_only' && o3.closeMatch.partNo === 'GONEX5PK' && o3.closeMatch.packOf === 5, JSON.stringify(o3));
   ok('...as facts: no sentence, no stock count', !/found and added|did not match|\bavailable\b/i.test(JSON.stringify(ol)));
 
-  // CUSTOMERS CANNOT OPEN A NEW ACCOUNT (founder, 28 Sep): our sales team
-  // does. "start" opens nothing, for them or for someone else. A form opened
-  // before that still finishes.
+  // A CUSTOMER OPENS ONLY THEIR OWN ACCOUNT (founder, 28 Sep). One number
+  // cannot open an account for another: that is the sales team's.
+  const cust = require('../src/core/customers');
   const cc = require('../src/core/customerCreate');
+  const resolveCustWas = cust.resolve;
   const formCfg = { configurable: { chatId: 'form-test@c.us', phone: '919000000990', bot: { finishNewCustomer: async () => true, reviewNewCustomer: async () => true } } };
   cc.cancel('form-test@c.us');
+  let f0;
   let f1;
   let f2;
   let f3;
   try {
-    f1 = JSON.parse(await workflows.accountForm.invoke({ action: 'start' }, formCfg));
+    cust.resolve = async () => ({ found: true, name: 'Miya Ji Motors' });
+    f0 = JSON.parse(await workflows.accountForm.invoke({ action: 'start' }, formCfg));
+    cust.resolve = async () => ({ found: false });
     f2 = JSON.parse(await workflows.accountForm.invoke({ action: 'start', forSomeoneElse: true }, formCfg));
-    const openedBefore = !cc.pending('form-test@c.us');
-    cc.start('form-test@c.us', '919000000990', (en) => en, { forSomeoneElse: true }); // as one opened before 28 Sep
-    f3 = JSON.parse(await workflows.accountForm.invoke({ action: 'answer', answer: '9812345678' }, formCfg));
-    ok('a customer asking for an account opens no form, and is told the sales team does it', f1 && f1.started === false && f1.refused === 'account_by_sales_team' && /sales team/.test(f1.tellCustomer) && openedBefore, JSON.stringify(f1));
-    ok('...nor "for someone else"', f2 && f2.started === false && f2.refused === 'account_by_sales_team', JSON.stringify(f2));
+    f1 = JSON.parse(await workflows.accountForm.invoke({ action: 'start' }, formCfg));
+    f3 = JSON.parse(await workflows.accountForm.invoke({ action: 'answer', answer: 'MY SHOP' }, formCfg));
   } finally {
+    cust.resolve = resolveCustWas;
     cc.cancel('form-test@c.us');
   }
-  ok('a form already open still moves on', f3 && f3.inProgress === true && typeof f3.formSays === 'string', JSON.stringify(f3));
+  ok('a registered number asking for an account is told it has one', f0 && f0.alreadyRegistered === true && f0.name === 'Miya Ji Motors', JSON.stringify(f0));
+  ok('an account for someone else is not opened here — the sales team does it', f2 && f2.started === false && f2.refused === 'account_for_someone_else', JSON.stringify(f2));
+  ok('an unregistered number opens its OWN account, first question as a fact', f1 && f1.started === true && typeof f1.nextQuestion === 'string', JSON.stringify(f1));
+  ok('...and an answer moves the form on', f3 && typeof f3.inProgress === 'boolean', JSON.stringify(f3));
 
   // ...nor set a discount: not passed to a person either.
   const esc = require('../src/agent/tools/escalation');
@@ -519,10 +524,10 @@ const CASES = [
     why: 'did not check the list with resolve_order_list, or wrote the old template',
   },
   {
-    name: 'a customer asking to open an account is told the sales team does it',
-    say: 'mujhe naya account khulwana hai',
-    check: (reply) => /sales team|sales/i.test(reply) && !/GST/i.test(reply),
-    why: 'started an account form, or did not say the sales team opens accounts',
+    name: 'a customer opening their own account goes through account_form',
+    say: 'mujhe apna naya account khulwana hai',
+    check: (_reply, tools) => tools.includes('account_form'),
+    why: 'did not use account_form',
   },
   {
     name: 'a customer asking to set a discount is told the sales team does it',

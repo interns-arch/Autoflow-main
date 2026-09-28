@@ -99,7 +99,7 @@ function customerOnlyRefusal(text) {
     return { kind: 'discount_by_sales_team', say: 'Discounts are set by our sales team, not on this chat. Tell them that in a line, in their language, and offer to help with parts or an order. Do not say anyone will call or confirm.' };
   }
   if (WANTS_ACCOUNT.test(s)) {
-    return { kind: 'account_by_sales_team', say: 'New customer accounts are opened by our sales team, not on this chat. Tell them that in a line, in their language. Do not start a form and do not say anyone will call.' };
+    return { kind: 'account_by_sales_team', say: 'Not a question for a person. Their OWN account: open it with account_form "start". An account for someone else: our sales team opens it (or that person messages from their own number) — say so in a line.' };
   }
   return null;
 }
