@@ -109,6 +109,14 @@ console.log('\nNOTHING REACHES THE PORTAL BEFORE APPROVAL\n');
   ok('the percentage is carried as given', body.discount_mode === 'PERCENT' && body.discount_value === 12);
   ok('the quantity floor is carried', body.min_qty === 5);
   ok('an end date is set when a duration was given', Boolean(body.valid_to));
+  // 28 Sep, live: a rule starting "now" in IST only counted on the portal
+  // 5.5 hours later (it checks the start against UTC).
+  {
+    const at = new Date(2026, 8, 28, 11, 44, 52);
+    const b = d.toPortal({ kind: 'brand', target: 'MARUTI', value: 10, days: 30 }, 8895, 'Customer Testing', at);
+    ok('a new rule starts at midnight the day before, so it counts at once', b.valid_from === '2026-09-27T00:00:00', b.valid_from);
+    ok('...and still ends the given days from today', b.valid_to === '2026-10-28T23:59:59', b.valid_to);
+  }
   ok('the rule is named after the customer the portal knows', /MIYA JI MOTORS/.test(body.rule_name), body.rule_name);
   ok('it is tagged as the bot\'s, with the request it came from', body.rule_metadata.source === 'whatsapp-bot' && body.rule_metadata.requestId === 'DSC-TEST');
 

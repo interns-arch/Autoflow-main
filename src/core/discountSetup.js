@@ -90,6 +90,16 @@ function toPortal(r, target, customerName, from = new Date()) {
     end.setHours(23, 59, 59, 0);
   }
   const iso = (d) => new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 19);
+  // THE RULE STARTS AT MIDNIGHT YESTERDAY, not "now". valid_from is written
+  // in IST with no zone, and the portal's rule check at order punch compares
+  // it with the time in UTC - so a rule made at 11:44 IST only began to count
+  // at 17:14 IST. 28 Sep, live: rule 2873 (Customer Testing, MARUTI 10%,
+  // APPROVED) was not even a candidate on SO 1458, punched at 12:42 IST
+  // (discount_rule_eval: {winner: null, candidates: []}). A day's head start
+  // covers any zone; the end date is still counted from today.
+  const opens = new Date(start);
+  opens.setDate(opens.getDate() - 1);
+  opens.setHours(0, 0, 0, 0);
   return {
     rule_type: r.kind === 'brand' ? 'BRAND' : 'ITEM',
     brand: r.kind === 'brand' ? r.target : null,
@@ -104,7 +114,7 @@ function toPortal(r, target, customerName, from = new Date()) {
     is_active: true,
     // Only ever sent after a Sales Head said "OK DSC-…" on WhatsApp.
     approval_status: 'APPROVED',
-    valid_from: iso(start),
+    valid_from: iso(opens),
     valid_to: end ? iso(end) : null,
     priority: 100,
     // The name carries the customer as the PORTAL has them, which may differ
