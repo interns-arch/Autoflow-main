@@ -55,6 +55,9 @@
   .login { max-width: 420px; margin: 80px auto; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 24px; }
   .login button { margin-top: 10px; padding: 8px 14px; border: 0; border-radius: 8px; background: var(--accent); color: #fff; font: inherit; cursor: pointer; }
   .err { color: var(--bad); margin-top: 8px; font-size: 13px; }
+  .datebar select, .datebar input[type=date] { padding: 6px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--ink); font: inherit; font-size: 13px; }
+  .datebar input[type=date]:disabled { opacity: .5; }
+  .datebar label { display: inline-flex; gap: 6px; align-items: center; }
   .links { display: flex; gap: 14px; align-items: center; }
   .links a { color: var(--accent); text-decoration: none; font-weight: 600; }
   .links a.muted { color: var(--muted); font-weight: 400; }
@@ -78,6 +81,64 @@
   if (q) { key = q; try { localStorage.setItem('dashKey', q); } catch (_) {} history.replaceState(null, '', location.pathname); }
 
   let data = null, tab = 'customers', filter = 'all', search = '', open = new Set();
+
+  // DATE FILTER (founder, 28 Sep): every tab, the cards and the downloads show
+  // only what happened in the range picked. The day a row belongs to is the
+  // day it was asked for (customers, discounts) or placed (orders, payments).
+  // Days are the viewer's own (India) days: from 00:00 to 23:59:59.
+  let range = 'all', fromDay = '', toDay = '';
+  try { const r = JSON.parse(localStorage.getItem('dashRange') || 'null'); if (r) ({ range, fromDay, toDay } = r); } catch (_) {}
+  const DAY_OF = { customers: 'requestedAt', discounts: 'requestedAt', orders: 'at', payments: 'at' };
+  const ymd = (d) => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+  function bounds() {
+    const now = new Date();
+    const start = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate());
+    const day = 86400000;
+    const today = start(now);
+    switch (range) {
+      case 'today': return [today, new Date(+today + day)];
+      case 'yesterday': return [new Date(+today - day), today];
+      case '7d': return [new Date(+today - 6 * day), new Date(+today + day)];
+      case '30d': return [new Date(+today - 29 * day), new Date(+today + day)];
+      case 'month': return [new Date(now.getFullYear(), now.getMonth(), 1), new Date(+today + day)];
+      case 'lastmonth': return [new Date(now.getFullYear(), now.getMonth() - 1, 1), new Date(now.getFullYear(), now.getMonth(), 1)];
+      case 'custom': {
+        const f = fromDay ? new Date(fromDay + 'T00:00:00') : null;
+        const t = toDay ? new Date(+new Date(toDay + 'T00:00:00') + day) : null;
+        return [f, t];
+      }
+      default: return [null, null];
+    }
+  }
+  function inRange(which, x) {
+    if (range === 'all') return true;
+    const [f, t] = bounds();
+    const v = x[DAY_OF[which]];
+    if (!v) return false;
+    const ms = new Date(v).getTime();
+    return (!f || ms >= +f) && (!t || ms < +t);
+  }
+  const rowsOf = (which) => (data[which] || []).filter((x) => inRange(which, x));
+  function rangeLabel() {
+    if (range === 'all') return 'All time';
+    const [f, t] = bounds();
+    const show = (d) => d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
+    const last = t ? new Date(+t - 1) : null;
+    if (f && last && ymd(f) === ymd(last)) return show(f);
+    return (f ? show(f) : 'Start') + ' – ' + (last ? show(last) : 'today');
+  }
+  // The cards, counted from the rows in range - the same rules as the server.
+  function summaryOf() {
+    const c = rowsOf('customers'), o = rowsOf('orders'), d = rowsOf('discounts'), p = rowsOf('payments');
+    const n = (list, st) => list.filter((x) => x.status === st).length;
+    return {
+      customers: { created: n(c, 'created'), waiting: n(c, 'waiting for approval'), rejected: n(c, 'rejected') },
+      orders: { placed: n(o, 'placed'), waiting: n(o, 'waiting for approval') + n(o, 'waiting for payment'), rejected: n(o, 'rejected'), value: Math.round(o.filter((x) => x.status === 'placed').reduce((s, x) => s + (Number(x.amount) || 0), 0)) },
+      discounts: { approved: n(d, 'approved'), waiting: n(d, 'waiting for approval'), rejected: n(d, 'rejected') },
+      payments: { settled: n(p, 'settled'), open: p.length - n(p, 'settled') },
+    };
+  }
+  const saveRange = () => { try { localStorage.setItem('dashRange', JSON.stringify({ range, fromDay, toDay })); } catch (_) {} };
   const esc = (v) => String(v == null ? '' : v).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
   const when = (iso) => iso ? new Date(iso).toLocaleString('en-IN', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : '';
   const rs = (v) => v || v === 0 ? '₹' + Number(v).toLocaleString('en-IN', { maximumFractionDigits: 2 }) : '';
@@ -146,7 +207,7 @@
   }
 
   function render() {
-    const s = data.summary;
+    const s = summaryOf();
     const cards = `<div class="cards">
       <div class="card"><div class="k">Customers</div><div class="v">${s.customers.created}</div><div class="d">created · ${s.customers.waiting} waiting · ${s.customers.rejected} rejected</div></div>
       <div class="card"><div class="k">Orders placed</div><div class="v">${s.orders.placed}</div><div class="d">${rs(s.orders.value)} · ${s.orders.waiting} waiting · ${s.orders.rejected} rejected</div></div>
@@ -154,15 +215,21 @@
       <div class="card"><div class="k">Payments</div><div class="v">${s.payments.settled}</div><div class="d">settled · ${s.payments.open} open</div></div>
     </div>`;
     const T = TABS[tab];
-    const list = data[tab].filter((x) => (filter === 'all' || x.status === filter) && (!search || JSON.stringify(x).toLowerCase().includes(search)));
-    const tabs = `<div class="tabs">${Object.entries(TABS).map(([k, v]) => `<button data-tab="${k}" class="${k === tab ? 'on' : ''}">${v.label} (${data[k].length})</button>`).join('')}</div>`;
+    const list = rowsOf(tab).filter((x) => (filter === 'all' || x.status === filter) && (!search || JSON.stringify(x).toLowerCase().includes(search)));
+    const tabs = `<div class="tabs">${Object.entries(TABS).map(([k, v]) => `<button data-tab="${k}" class="${k === tab ? 'on' : ''}">${v.label} (${rowsOf(k).length})</button>`).join('')}</div>`;
+    const PRESETS = [['all', 'All time'], ['today', 'Today'], ['yesterday', 'Yesterday'], ['7d', 'Last 7 days'], ['30d', 'Last 30 days'], ['month', 'This month'], ['lastmonth', 'Last month'], ['custom', 'Custom']];
+    const dates = `<div class="bar datebar"><span class="muted" style="font-size:12px">Date</span>
+      <select id="rng">${PRESETS.map(([v, l]) => `<option value="${v}"${v === range ? ' selected' : ''}>${l}</option>`).join('')}</select>
+      <label class="muted" style="font-size:12px">From <input type="date" id="dFrom" value="${esc(fromDay)}"${range === 'custom' ? '' : ' disabled'} /></label>
+      <label class="muted" style="font-size:12px">To <input type="date" id="dTo" value="${esc(toDay)}"${range === 'custom' ? '' : ' disabled'} /></label>
+      <span class="pill info">${esc(rangeLabel())}</span></div>`;
     const chips = `<div class="chips">${['all', ...T.statuses].map((st) => `<button data-f="${esc(st)}" class="${st === filter ? 'on' : ''}">${esc(st)}</button>`).join('')}</div>`;
     const rows = list.map((x, i) => {
       const id = tab + ':' + (x.id || i);
       const main = `<tr class="row" data-id="${esc(id)}">${T.row(x).map((c) => `<td>${c}</td>`).join('')}</tr>`;
       return open.has(id) ? main + `<tr class="detail"><td colspan="${T.cols.length}">${T.detail(x)}</td></tr>` : main;
     }).join('');
-    app.innerHTML = cards +
+    app.innerHTML = dates + cards +
       `<div class="bar">${tabs}<input type="search" id="q" placeholder="Search name, phone, GSTIN, order, agent…" value="${esc(search)}" /></div>
        <div class="bar">${chips}<span style="flex:1"></span>
          <button class="dl" id="dl1" title="Every field of the rows shown below">⬇ Download CSV (${list.length})</button>
@@ -172,12 +239,22 @@
     app.querySelectorAll('[data-tab]').forEach((b) => (b.onclick = () => { tab = b.dataset.tab; filter = 'all'; render(); }));
     app.querySelectorAll('[data-f]').forEach((b) => (b.onclick = () => { filter = b.dataset.f; render(); }));
     app.querySelectorAll('tr.row').forEach((r) => (r.onclick = () => { const id = r.dataset.id; open.has(id) ? open.delete(id) : open.add(id); render(); }));
+    const rng = document.getElementById('rng');
+    rng.onchange = () => {
+      range = rng.value;
+      if (range === 'custom' && !fromDay && !toDay) { const t = ymd(new Date()); fromDay = t; toDay = t; }
+      saveRange();
+      render();
+    };
+    const setDay = (which) => (e) => { if (which === 'from') fromDay = e.target.value; else toDay = e.target.value; range = 'custom'; saveRange(); render(); };
+    document.getElementById('dFrom').onchange = setDay('from');
+    document.getElementById('dTo').onchange = setDay('to');
     const qi = document.getElementById('q');
     qi.oninput = () => { search = qi.value.trim().toLowerCase(); const pos = qi.selectionStart; render(); const n = document.getElementById('q'); n.focus(); n.setSelectionRange(pos, pos); };
     document.getElementById('dl1').onclick = () => download(tab, list, filter);
     document.getElementById('dlAll').onclick = () => {
       Object.keys(TABS).forEach((k, i) =>
-        setTimeout(() => download(k, data[k].filter((x) => !search || JSON.stringify(x).toLowerCase().includes(search)), 'all'), i * 400),
+        setTimeout(() => download(k, rowsOf(k).filter((x) => !search || JSON.stringify(x).toLowerCase().includes(search)), 'all'), i * 400),
       );
     };
   }
@@ -217,7 +294,10 @@
     for (const r of rows) lines.push(keys.map((k) => csvCell(fmt(k, r[k]))).join(','));
     const blob = new Blob(['﻿' + lines.join('\r\n') + '\r\n'], { type: 'text/csv;charset=utf-8' });
     const day = new Date().toISOString().slice(0, 10);
-    const name = ['cartrends', which, flt && flt !== 'all' ? flt.replace(/\s+/g, '-') : null, search ? 'search-' + search.replace(/[^a-z0-9]+/gi, '-').slice(0, 20) : null, day].filter(Boolean).join('_') + '.csv';
+    // The date range in the file name, so a download says which days it holds.
+    const [bf, bt] = bounds();
+    const span = range === 'all' ? null : (bf ? ymd(bf) : 'start') + '-to-' + (bt ? ymd(new Date(+bt - 1)) : day);
+    const name = ['cartrends', which, flt && flt !== 'all' ? flt.replace(/\s+/g, '-') : null, span, search ? 'search-' + search.replace(/[^a-z0-9]+/gi, '-').slice(0, 20) : null, day].filter(Boolean).join('_') + '.csv';
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
     a.download = name;
