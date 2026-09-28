@@ -88,6 +88,22 @@ function waitForSpecialist(key, escalationId, what, tellCustomer) {
   });
 }
 
+// A customer asking to have a discount SET or CHANGED, or a new customer
+// account OPENED. Asking what discount they get is not this: my_discounts
+// answers that.
+const WANTS_DISCOUNT = /\b(discount|disc|chhoot|chhut|chut|chuut|scheme)\b[^.?\n]{0,40}\b(set|create|chahiye|chaiye|de\s?do|dedo|do|kar\s?do|kardo|karo|badha\w*|increase|more|zyada|jyada|change|laga\w*|add|bana\w*|lagwa\w*|milega|mil sakta|kar sakta|karne)\b|\b(set|create|badha\w*|increase|change|laga\w*|add|bana\w*)\b[^.?\n]{0,25}\b(discount|chhoot|chhut|scheme)\b/i;
+const WANTS_ACCOUNT = /\b(new|naya|nayi|naye)\s+(customer|account|khata|party|dealer)\b|\b(account|khata|registration|register|customer)\b[^.?\n]{0,30}\b(open|create|khol\w*|bana\w*|kar\s?do|karo|register|add)\b|\b(open|create|register)\b[^.?\n]{0,20}\b(account|customer)\b/i;
+function customerOnlyRefusal(text) {
+  const s = String(text || '');
+  if (WANTS_DISCOUNT.test(s)) {
+    return { kind: 'discount_by_sales_team', say: 'Discounts are set by our sales team, not on this chat. Tell them that in a line, in their language, and offer to help with parts or an order. Do not say anyone will call or confirm.' };
+  }
+  if (WANTS_ACCOUNT.test(s)) {
+    return { kind: 'account_by_sales_team', say: 'New customer accounts are opened by our sales team, not on this chat. Tell them that in a line, in their language. Do not start a form and do not say anyone will call.' };
+  }
+  return null;
+}
+
 const askAPerson = tool(
   async ({ item, qty, reason, whatYouTried, webCandidates, tellCustomer }, config) => {
     const ctx = contextFrom(config);
@@ -96,6 +112,14 @@ const askAPerson = tool(
 
     const what = String(item || '').trim();
     if (!what) return JSON.stringify({ asked: false, why: 'nothing to ask about' });
+
+    // NOT FOR CUSTOMERS (founder, 28 Sep): setting a discount and opening a
+    // new customer account are done by our sales team. A customer asking for
+    // either is told so - not passed to a person, who would only have to say
+    // the same. (Every caller of this tool is a customer: staff never reach
+    // the agent, bots/customerBot.isOperator.)
+    const salesOnly = customerOnlyRefusal(what);
+    if (salesOnly) return JSON.stringify({ asked: false, refused: salesOnly.kind, tellCustomer: salesOnly.say });
 
     const key = flightKey(ctx.chatId, what);
     // A re-run of this node. The specialist has already been asked; all that

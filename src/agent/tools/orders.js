@@ -175,7 +175,7 @@ const confirmOrder = tool(
     if (res && res.busy) return JSON.stringify({ placed: false, why: 'this order is already being placed — say nothing further about it' });
     // A number the portal has no account for: there is nobody to bill.
     if (res && res.noCustomer) {
-      return JSON.stringify({ placed: false, why: 'this number has no account on our system, so the order cannot be placed yet — offer to open an account (account_form), or ask_a_person' });
+      return JSON.stringify({ placed: false, why: 'this number has no account on our system, so the order cannot be placed yet. New accounts are opened by our sales team, not on this chat: tell them that in a line. Do not start an account form.' });
     }
     // Placing is switched off: the order goes to the Sales Head, and his
     // "OK ORD-…" places it on the portal (customerBot.decideOrder). 25 Sep,

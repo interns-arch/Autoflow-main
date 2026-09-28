@@ -195,13 +195,10 @@ async function toolChecks() {
   ok('...and a number the portal does not know comes back with its close match', o3 && o3.status === 'close_match_only' && o3.closeMatch.partNo === 'GONEX5PK' && o3.closeMatch.packOf === 5, JSON.stringify(o3));
   ok('...as facts: no sentence, no stock count', !/found and added|did not match|\bavailable\b/i.test(JSON.stringify(ol)));
 
-  // The account form, driven by the agent: a registered customer is asked
-  // whether it is for someone else; then the form's questions come back as
-  // facts for the agent to ask in its own words.
-  const cust = require('../src/core/customers');
+  // CUSTOMERS CANNOT OPEN A NEW ACCOUNT (founder, 28 Sep): our sales team
+  // does. "start" opens nothing, for them or for someone else. A form opened
+  // before that still finishes.
   const cc = require('../src/core/customerCreate');
-  const resolveCustWas = cust.resolve;
-  cust.resolve = async () => ({ found: true, name: 'Miya Ji Motors' });
   const formCfg = { configurable: { chatId: 'form-test@c.us', phone: '919000000990', bot: { finishNewCustomer: async () => true, reviewNewCustomer: async () => true } } };
   cc.cancel('form-test@c.us');
   let f1;
@@ -210,14 +207,24 @@ async function toolChecks() {
   try {
     f1 = JSON.parse(await workflows.accountForm.invoke({ action: 'start' }, formCfg));
     f2 = JSON.parse(await workflows.accountForm.invoke({ action: 'start', forSomeoneElse: true }, formCfg));
+    const openedBefore = !cc.pending('form-test@c.us');
+    cc.start('form-test@c.us', '919000000990', (en) => en, { forSomeoneElse: true }); // as one opened before 28 Sep
     f3 = JSON.parse(await workflows.accountForm.invoke({ action: 'answer', answer: '9812345678' }, formCfg));
+    ok('a customer asking for an account opens no form, and is told the sales team does it', f1 && f1.started === false && f1.refused === 'account_by_sales_team' && /sales team/.test(f1.tellCustomer) && openedBefore, JSON.stringify(f1));
+    ok('...nor "for someone else"', f2 && f2.started === false && f2.refused === 'account_by_sales_team', JSON.stringify(f2));
   } finally {
-    cust.resolve = resolveCustWas;
     cc.cancel('form-test@c.us');
   }
-  ok('a registered customer asking for an account is found to have one already', f1 && f1.alreadyRegistered === true && f1.name === 'Miya Ji Motors', JSON.stringify(f1));
-  ok('...and "for someone else" opens the form, with its first question as a fact', f2 && f2.started === true && /number|WhatsApp/i.test(f2.nextQuestion), JSON.stringify(f2));
-  ok('...and an answer moves the form on', f3 && f3.inProgress === true && typeof f3.formSays === 'string', JSON.stringify(f3));
+  ok('a form already open still moves on', f3 && f3.inProgress === true && typeof f3.formSays === 'string', JSON.stringify(f3));
+
+  // ...nor set a discount: not passed to a person either.
+  const esc = require('../src/agent/tools/escalation');
+  const noBot = { configurable: { chatId: 'esc-test@c.us', phone: '919000000991', bot: { key: 'test' } } };
+  const d1 = JSON.parse(await esc.askAPerson.invoke({ item: 'customer wants discount set on Maruti parts', qty: 1, reason: 'business_question', whatYouTried: 'answer_business_question' }, noBot));
+  const d2 = JSON.parse(await esc.askAPerson.invoke({ item: 'Mujhe discount create karne hai kar sakta hu', qty: 1, reason: 'business_question', whatYouTried: '-' }, noBot));
+  const d3 = JSON.parse(await esc.askAPerson.invoke({ item: 'naya account khulwana hai', qty: 1, reason: 'business_question', whatYouTried: '-' }, noBot));
+  ok('a customer\'s discount request is not passed to a person', d1.asked === false && d1.refused === 'discount_by_sales_team' && d2.refused === 'discount_by_sales_team', JSON.stringify([d1, d2]));
+  ok('...nor an account request', d3.asked === false && d3.refused === 'account_by_sales_team', JSON.stringify(d3));
 
   // A number plate, looked up.
   const vahan = require('../src/integrations/vahan');
@@ -512,10 +519,16 @@ const CASES = [
     why: 'did not check the list with resolve_order_list, or wrote the old template',
   },
   {
-    name: 'opening an account goes through account_form',
+    name: 'a customer asking to open an account is told the sales team does it',
     say: 'mujhe naya account khulwana hai',
-    check: (_reply, tools) => tools.includes('account_form'),
-    why: 'did not use account_form',
+    check: (reply) => /sales team|sales/i.test(reply) && !/GST/i.test(reply),
+    why: 'started an account form, or did not say the sales team opens accounts',
+  },
+  {
+    name: 'a customer asking to set a discount is told the sales team does it',
+    say: 'Mujhe discount create karna hai',
+    check: (reply, tools) => /sales team|sales/i.test(reply) && !tools.includes('ask_a_person'),
+    why: 'passed it to a person, or did not say the sales team sets discounts',
   },
   {
     name: 'a number plate is looked up, not guessed at',

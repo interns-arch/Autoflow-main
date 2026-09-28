@@ -21,7 +21,6 @@ const availability = require('../../core/availability');
 const { partFacts } = require('./partFacts');
 const { STATUS_HELP, discountsOf } = require('./commerce');
 const customerCreate = require('../../core/customerCreate');
-const customers = require('../../core/customers');
 const lookup = require('../../core/customerLookup');
 const vahan = require('../../integrations/vahan');
 const store = require('../../store');
@@ -149,23 +148,19 @@ const accountForm = tool(
 
     if (action === 'start') {
       if (open) return JSON.stringify({ alreadyInProgress: true, note: 'a form is already open — use action "answer" with what they say' });
-      if (!forSomeoneElse) {
-        // A registered customer asking for "an account" is, almost always,
-        // opening one for somebody else — a friend's garage, a second shop.
-        const already = await customers.resolve(ctx.phone).catch(() => ({ found: null }));
-        if (already && already.found === null) return JSON.stringify({ error: 'the portal is not answering, so we cannot tell whether they already have an account — ask them to try again in a few minutes' });
-        if (already && already.found) {
-          return JSON.stringify({
-            alreadyRegistered: true,
-            name: already.name || null,
-            note: 'they already have an account. Ask whether this one is for someone else; if yes, call again with forSomeoneElse: true',
-          });
-        }
-      }
-      const first = customerCreate.start(chatId, ctx.phone, facts, { forSomeoneElse: Boolean(forSomeoneElse) });
-      return JSON.stringify({ started: true, forSomeoneElse: Boolean(forSomeoneElse), nextQuestion: first });
+      // NOT FOR CUSTOMERS (founder, 28 Sep): a new customer account - theirs
+      // or anyone else's - is opened by our sales team, not on this chat.
+      // Every caller of this tool is a customer (staff never reach the agent),
+      // so "start" never opens a form. A form opened before this still
+      // finishes ("answer" below).
+      store.log('agent', `${ctx.phone}: asked to open an account${forSomeoneElse ? ' for someone else' : ''} — customers cannot; told the sales team does it`);
+      return JSON.stringify({
+        started: false,
+        refused: 'account_by_sales_team',
+        tellCustomer:
+          'New customer accounts are opened by our sales team, not on this chat. Tell them that in a line, in their language. Do not ask for a GST number or anything else for an account, and do not say anyone will call.',
+      });
     }
-
     if (action === 'answer') {
       if (!open) return JSON.stringify({ inProgress: false, note: 'no account form is open' });
       // The message itself, so a shop photo or a dropped pin reaches the form.
@@ -192,8 +187,8 @@ const accountForm = tool(
   {
     name: 'account_form',
     description:
-      'Open a customer account on the portal, one question at a time: GST number, shop name, a photo of the shop, a location pin and so on. The request then goes to the Sales Head for approval. ' +
-      'action "start" when they ask to open an account (forSomeoneElse: true when it is for someone else); "answer" with what they said whenever a form is open — a photo or a location they send is passed on automatically; "cancel" if they drop it; "status" to check. ' +
+      'A customer account form that is ALREADY OPEN in this chat. Customers cannot open a new account here - our sales team opens new accounts - so "start" only returns that answer: tell them so in a line. ' +
+      '"answer" with what they said whenever a form is open (your instructions say so) — a photo or a location they send is passed on automatically; "cancel" if they drop it; "status" to check. ' +
       'It returns what the form needs next ("nextQuestion" / "formSays") as a fact: ask it in your own words and the customer\'s language, one question at a time. ' +
       'The shop photo and the shop location are REQUIRED: if they say they cannot send one ("photo not available", "location nahi hai"), still call "answer" with exactly what they said — the form explains it is required and asks again; tell them that. A photo taken with a GPS camera app carries the location, and then the location is not asked for. Owner date of birth and bank details are optional ("skip" moves on). ' +
       'The request has gone for approval ONLY when this tool returns done:true with a requestId — then say so and give the requestId. Until then it has NOT been sent: never say it has, and never name an approver.',
