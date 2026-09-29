@@ -1774,7 +1774,7 @@ async function handle(bot, m, text, reply, t) {
     const items = [takeItems(m.chatId), partsAfterKey(text, oKey)].filter(Boolean).join('\n') || null;
     if (!rows.length) {
       if (items) holdItems(m.chatId, require('./ai').parseLinesBlock(items) || []);
-      return reply(t('No customer on the portal with ' + what + '. To open a new account for them, write "customer bana do ' + what + '".', what + ' pe portal mein koi customer nahi mila. Naya account kholna hai to "customer bana do ' + what + '" likhiye.'));
+      return reply(askToOpen(m, what, oKey, t));
     }
     store.log('sales', m.from + ' asked for an order for ' + what + ': ' + rows.length + ' account(s)');
     if (rows.length === 1) {
@@ -1800,12 +1800,7 @@ async function handle(bot, m, text, reply, t) {
     }
     const what = key.phone ? key.phone.slice(-10) : key.gst;
     if (!rows.length) {
-      return reply(
-        t(
-          'No customer on the portal with ' + what + '. To open a new account for them, write "customer bana do".',
-          what + ' pe portal mein koi customer nahi mila. Naya account kholna hai to "customer bana do" likhiye.',
-        ),
-      );
+      return reply(askToOpen(m, what, key, t));
     }
     if (s && s.stage === 'askCustomer' && (s.intent === 'ledger' || s.intent === 'invoice')) {
       if (rows.length === 1) {
@@ -2320,6 +2315,17 @@ function _resetDirectory() {
   discussingMap.clear();
   lastLists.clear();
   lookedUp.clear();
+}
+
+// NO SUCH CUSTOMER: ASKED, NOT TOLD WHAT TO TYPE (29 Sep, live: Nirmal answered
+// 'Naya account kholna hai to "customer bana do" likhiye' with "Ha", and got
+// small talk). The question is remembered with the number, so a yes in any
+// words opens the account form for it (customerBot, createAsk).
+function askToOpen(m, what, key, t) {
+  const phone = key && key.phone ? '91' + String(key.phone).replace(/\D/g, '').slice(-10) : null;
+  const question = t(`No customer on the portal with ${what}. Shall I open a new account for them? (yes / no)`, `${what} pe portal mein koi customer nahi mila. Iska naya account khol dun? (haan / nahi)`);
+  require('./chatState').slot('createAsk').set(m.chatId, { at: Date.now(), phone, question });
+  return question;
 }
 
 module.exports = {

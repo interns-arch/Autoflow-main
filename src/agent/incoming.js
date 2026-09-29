@@ -121,6 +121,12 @@ function describeAttachment(a) {
   }
   if (a.kind === 'photo') {
     if (a.forForm) return '[Sent a photo]';
+    // Several photos sent one after another: ONE message, answered once
+    // (bots/customerBot answerCustomer).
+    if (a.album > 1) {
+      const head = `[Sent ${a.album} PHOTOS together — answer them as ONE list, in one reply: every part, in stock or not${a.unread ? `; ${a.unread} of the photos had no readable part number` : ''}.`;
+      return a.lines && a.lines.length ? `${head} Together they read as ${a.lines.length} order line(s):\n${listed(a.lines)}]` : `${head} No part number could be read from any of them. If they want something from them, ask_a_person]`;
+    }
     if (a.lines && a.lines.length) return `[Sent a PHOTO. It reads as ${a.lines.length} order line(s):\n${listed(a.lines)}]`;
     return `[Sent a photo; no part number could be read from it${a.note ? ' (' + a.note + ')' : ''}. If they want something from it, ask_a_person — the photo goes with it]`;
   }

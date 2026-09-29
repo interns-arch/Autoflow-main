@@ -41,6 +41,7 @@ process.env.GEMINI_API_KEY = ''; // voice notes are not transcribed in the suite
 // actually returned for scripts/fixtures/test_order.png. The suite is about
 // what the bot does with the lines, not about who read them off the picture.
 process.env.ORDER_CONFIRM_ENABLED = 'true'; // mock portal — safe to punch here
+process.env.PHOTO_ALBUM_WAIT_MS = '0'; // each photo answered at once; the album has its own test
 
 const path = require('path');
 const fs = require('fs');
@@ -137,6 +138,28 @@ async function main() {
     subject: 'Delhi Dealers',
     customer: '919899000888',
   });
+
+  // SEVERAL PHOTOS ARE ONE MESSAGE (29 Sep, live: four screenshots, four
+  // replies, one only "senior se confirm karke batata hoon").
+  {
+    process.env.PHOTO_ALBUM_WAIT_MS = '60';
+    const ab = new CustomerBot();
+    const asked = [];
+    ab.answerRead = async (m, text, att) => (asked.push({ chat: m.chatId, att }), true);
+    const mm = (n) => ({ chatId: 'sim-album', from: '919811100077', id: 'p' + n });
+    const photo = (lines) => ({ kind: 'photo', lines });
+    ab.collectPhoto(mm(1), '', photo([{ item: '22100M83K40', qty: 1 }, { item: '22400M83K02', qty: 1 }]), async () => true, (en) => en);
+    ab.collectPhoto(mm(2), '', photo([{ item: '29938434', qty: 5 }]), async () => true, (en) => en);
+    ab.collectPhoto(mm(3), '', photo([]), async () => true, (en) => en);
+    await new Promise((r) => setTimeout(r, 150));
+    const one = asked[0] && asked[0].att;
+    check('photos sent together are answered once, every line in one message', asked.length === 1 && one.album === 3 && one.unread === 1 && one.lines.map((l) => l.item).join(',') === '22100M83K40,22400M83K02,29938434');
+    check('...and the agent is told to answer them as one list', /Sent 3 PHOTOS together — answer them as ONE list/.test(require('../src/agent/incoming').describeAttachment(one)) && /3\. 29938434 x 5/.test(require('../src/agent/incoming').describeAttachment(one)));
+    ab.collectPhoto(mm(4), '', photo([{ item: '37995M79M02', qty: 10 }]), async () => true, (en) => en);
+    await new Promise((r) => setTimeout(r, 150));
+    check('...a single photo is still answered on its own', asked.length === 2 && !asked[1].att.album && asked[1].att.lines[0].item === '37995M79M02');
+    process.env.PHOTO_ALBUM_WAIT_MS = '0';
+  }
 
   // A CHEQUE GIVEN AND NOT YET IN ODOO COUNTS AS PAID ONCE RECEIVED (29 Sep).
   {
@@ -6396,6 +6419,16 @@ async function main() {
         require('../src/core/customerCreate').cancel(C74);
         const c74 = await say74('customer bana do 9812345670');
         check('"customer bana do <number>" opens the form for that number, not asking it again', /9812345670 ka account bana rahe hain/.test(c74) && !/WhatsApp number bhejiye/i.test(c74), c74);
+        require('../src/core/customerCreate').cancel(C74);
+        // 29 Sep, live (Nirmal): a number with no account is ASKED about, and
+        // "Ha" opens the account for it.
+        so74._resetDirectory();
+        const lookupWas74 = portal.lookupCustomer;
+        portal.lookupCustomer = async (mob) => (String(mob).endsWith('9812345671') ? { found: false } : lookupWas74.call(portal, mob));
+        const q74 = await say74('9812345671').finally(() => (portal.lookupCustomer = lookupWas74));
+        check('a number with no account: "open one?" is asked, not "type customer bana do"', /Iska naya account khol dun\? \(haan \/ nahi\)/.test(q74) && !/likhiye/.test(q74), q74);
+        const h74 = await say74('Ha');
+        check('...and "Ha" opens it for that number', /9812345671 ka account bana rahe hain/.test(h74) && require('../src/core/customerCreate').pending(C74), h74);
         require('../src/core/customerCreate').cancel(C74);
       } finally {
         config.salesTeamNumbers.splice(config.salesTeamNumbers.indexOf(S74), 1);

@@ -113,6 +113,11 @@ const rateOptions = require('../core/chatState').slot('rateOptions');
 const discountSetup = require('../core/discountSetup');
 const replyReader = require('../core/replyReader');
 
+// PHOTOS SENT TOGETHER ARE ANSWERED TOGETHER (answerCustomer): how long after
+// the last one to wait for another. 0 answers each photo on its own.
+const albumWaitMs = () => parseInt(process.env.PHOTO_ALBUM_WAIT_MS == null ? '8000' : process.env.PHOTO_ALBUM_WAIT_MS, 10) || 0;
+const albums = new Map(); // chatId -> { items: [{ m, text, attachment }], timer, reply, t }
+
 // WHAT EACH STEP OF THE DISCOUNT SETUP WANTS, for Gemini to read the reply
 // against (core/replyReader.readFormReply). The value it pulls out is then
 // read by the step exactly as if it had been typed that way.
@@ -669,6 +674,13 @@ class CustomerBot {
       if (Date.now() - (askedCreate.at || 0) > CREATE_ASK_MS) createAsk.delete(m.chatId);
       else if (customerCreate.wantsSomeoneElse(text) || NEAR_YES.test(text)) createAnswer = 'yes';
       else if (customerCreate.declinedCreate(text) || NEAR_NO.test(text)) createAnswer = 'no';
+      // Said another way ("hn bna do", "ofcourse"): Gemini reads it against
+      // the question. A message of its own is not an answer.
+      else if (askedCreate.question && text.split(/\s+/).length <= 8) {
+        const a = await replyReader.readYesNo({ question: askedCreate.question, reply: text, options: { yes: 'open a new customer account', no: 'do not open one' }, phone: store.normPhone(m.from) }).catch(() => 'other');
+        if (a === 'yes' || a === 'no') createAnswer = a;
+        else createAsk.delete(m.chatId);
+      }
       // Anything else: they have moved on. A "haan" ten messages later is
       // about something else entirely.
       else createAsk.delete(m.chatId);
@@ -743,7 +755,9 @@ class CustomerBot {
       // 9812345678" is that customer's account - their number is the form's
       // first answer, not asked for again. The form's own checks still run on
       // it (already a customer? then it says so and asks for another).
-      const key = (agent || forElse) && salesOrder.findKeyIn(text);
+      // ...or the number the bot asked about ("…koi customer nahi mila. Iska
+      // naya account khol dun?" - "Ha").
+      const key = (agent || forElse) && (salesOrder.findKeyIn(text) || (createAnswer === 'yes' && askedCreate && askedCreate.phone ? { phone: askedCreate.phone } : null));
       if (key && key.phone && customerCreate.pending(m.chatId)) {
         const step = await customerCreate.answer(m.chatId, { ...m, body: key.phone.slice(-10) }, key.phone.slice(-10), t);
         if (step && step.reply) {
@@ -3147,6 +3161,62 @@ Baaki ${payments.money(hold.due)} pay hone tak ${order.id} hold pe hai${custPhon
     if (text) text = ai.normalizeOrderText(text);
     if (!text && !read.attachment && !incoming.isEvent(m)) return false;
 
+    // SEVERAL PHOTOS ARE ONE MESSAGE (29 Sep, live: four screenshots of one
+    // order list got four replies, one of them only "senior se confirm karke
+    // batata hoon"). A photo is read at once but answered only when no more
+    // come for PHOTO_ALBUM_WAIT_MS (8 s) - then all of them together, in one reply.
+    const att = read.attachment;
+    if (att && att.kind === 'photo' && !att.forForm && albumWaitMs() > 0) return this.collectPhoto(m, text, att, reply, t);
+    // Anything else while photos are being collected: they are answered first,
+    // so nothing is answered out of order.
+    if (albums.has(m.chatId)) await this.flushAlbum(m.chatId);
+    return this.answerRead(m, text, att, reply, t);
+  }
+
+  // One photo into the chat's album; the timer restarts with each.
+  collectPhoto(m, text, attachment, reply, t) {
+    let a = albums.get(m.chatId);
+    if (!a) {
+      a = { items: [] };
+      albums.set(m.chatId, a);
+    }
+    a.items.push({ m, text, attachment });
+    a.reply = reply;
+    a.t = t;
+    clearTimeout(a.timer);
+    a.timer = setTimeout(() => {
+      this.flushAlbum(m.chatId).catch((e) => store.log(this.key, `photo album for ${m.chatId} failed: ${String((e && e.message) || e).slice(0, 100)}`));
+    }, albumWaitMs());
+    if (a.timer.unref) a.timer.unref();
+    store.log(this.key, `${m.chatId}: photo ${a.items.length} held for the album (${(attachment.lines || []).length} line(s) read)`);
+    return true;
+  }
+
+  // The album, answered as one message: every line read from every photo.
+  async flushAlbum(chatId) {
+    const a = albums.get(chatId);
+    if (!a) return false;
+    albums.delete(chatId);
+    clearTimeout(a.timer);
+    const last = a.items[a.items.length - 1];
+    if (a.items.length === 1) return this.answerRead(last.m, last.text, last.attachment, a.reply, a.t);
+    const lines = [];
+    let unread = 0;
+    for (const it of a.items) {
+      if (it.attachment.lines && it.attachment.lines.length) lines.push(...it.attachment.lines);
+      else unread++;
+    }
+    const attachment = { kind: 'photo', album: a.items.length, unread, lines };
+    const text = a.items
+      .map((it) => it.text)
+      .filter(Boolean)
+      .join('\n');
+    store.log(this.key, `${chatId}: ${a.items.length} photos answered together (${lines.length} line(s), ${unread} unreadable)`);
+    return this.answerRead(last.m, text, attachment, a.reply, a.t);
+  }
+
+  async answerRead(m, text, attachment, reply, t) {
+    const read = { attachment };
     if (agent.enabled()) {
       const done = await this.askAgent(m, text, reply, t, read.attachment);
       if (done !== null) return done;
