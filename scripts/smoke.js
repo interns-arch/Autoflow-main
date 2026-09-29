@@ -54,6 +54,7 @@ config.customerSearchBy = 'any';
 // check with the real model (npm run test:staff). Some sections below set a
 // stand-in Gemini key, and the staff agent must not try it.
 config.agent.staffEnabled = false;
+config.etaOffers = true; // off live for now (29 Sep); the offer flow is still tested
 config.dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'autoflow-smoke-'));
 config.customerDms = ['919899555001'];
 config.adminNumbers = ['919800000009'];

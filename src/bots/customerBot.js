@@ -4531,6 +4531,13 @@ class CustomerBot {
   // (core/advanceOrders). With no customer number on a salesman's order, the
   // salesman is asked instead. The salesman hears either way.
   async offerEta(order, res, so) {
+    // OFF FOR NOW (founder, 29 Sep: "for now dont escalate eta to customer and
+    // prateek sir"): no ETA offer to the customer, no note to whoever placed
+    // the order. ETA_OFFERS=true turns it back on.
+    if (!config.etaOffers) {
+      store.log(this.key, `${order.id}: ETA offer skipped (ETA_OFFERS is off)`);
+      return null;
+    }
     const custChat = this.customerChatOf(order);
     const to = custChat || order.chatId;
     if (!to) return null;

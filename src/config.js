@@ -83,6 +83,11 @@ const config = {
   // number is only ever in groups it created, so this matters for the linked
   // WhatsApp transport.)
   groupsAnswerAll: String(process.env.GROUPS_ANSWER_ALL || '').toLowerCase() === 'true',
+  // ETA_OFFERS=true: after an order is punched with parts not in stock, offer
+  // those parts to the customer as an advance order with their ETA
+  // (core/advanceOrders), and tell whoever placed it. OFF for now (founder,
+  // 29 Sep).
+  etaOffers: String(process.env.ETA_OFFERS || '').toLowerCase() === 'true',
   internalWarehouseName: process.env.INTERNAL_WAREHOUSE_NAME || 'Bijwasan',
 
   stockBroadcastTimes: times(process.env.STOCK_BROADCAST_TIMES, ['09:30', '16:00']),
