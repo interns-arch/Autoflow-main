@@ -554,9 +554,10 @@ function modelAvailable() {
 }
 
 // user may be a plain string or a content-block array (for images)
-async function model(system, user) {
+// opts: { modelName, timeoutMs } for a call that wants a lighter model.
+async function model(system, user, opts) {
   if (modelStub) return modelStub(system, user);
-  return geminiJson(system, user);
+  return geminiJson(system, user, opts);
 }
 
 // The same call with Google Search behind it, for facts the model should look
@@ -1045,5 +1046,6 @@ module.exports = {
   _setModel: (fn) => {
     modelStub = fn || null;
   },
+  _stubbed: () => Boolean(modelStub),
   // exported for tests
   _internals: { scanPartTokens, maxTokensPerLine, isPartToken, isJunkItem, joinSpacedPartNumbers, sanitizeOrderLines, PART_TOKEN_RE, QTY_UNIT_TOKEN } };

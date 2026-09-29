@@ -2587,6 +2587,37 @@ async function main() {
       check('...and is told only once', (await require('../src/core/discountWatch').checkOnce(customer)).length === 0);
       cr20.team = teamWas22;
 
+      // ---- a yes typed any way at all (29 Sep, live: Shubham Maurya) ----
+      // "Hnnn", "Hn", "Ofcourse", "Haaaaan" were each answered with the same
+      // question again. The model reads the reply against the question; with
+      // no model, the fallback still reads a stretched word as its short self.
+      const rr25 = require('../src/core/replyReader');
+      check('fallback: the six live yeses are yes', ['Hnnn', 'Hnnn', 'Hn', 'Ofcourse', 'Haaaaan', 'Hn'].every((x) => rr25._fallback(x) === 'yes'));
+      check('fallback: a no, and a message of its own, are not yes', rr25._fallback('nhi rehne do') === 'no' && rr25._fallback('Maruti ka headlight kitne ka hai') === 'other' && rr25._fallback('16510M68K00 2') === 'other');
+      const ai25 = require('../src/core/ai');
+      const keyWas25 = require('../src/config').gemini.apiKey;
+      const asked25 = [];
+      require('../src/config').gemini.apiKey = 'test-key';
+      ai25._setModel(async (system, user) => {
+        if (!/^You read one WhatsApp reply to a yes\/no question/.test(system)) return { intent: 'other' };
+        asked25.push(user);
+        return { answer: /jhakaas/.test(user) ? 'yes' : 'other', why: 'stub' };
+      });
+      try {
+        portal.setMockCustomers([{ id: 1, name: 'Mock Customer', phone: '919000000304', gst_no: '07AAAAA0000A1Z5', address: 'Karol Bagh, Delhi', credit_limit: '50000.00', credit_days: 7, balance: '1200' }]);
+        cr20.team = { ...(cr20.team || {}), [AGENT20]: 'Shubham' };
+        await say20(AGENT20, 'discount change karna hai');
+        await say20(AGENT20, '9000000304');
+        const on25 = text20(await say20(AGENT20, 'jhakaas'));
+        check('model: a yes no list knows goes on to the rules', /discount rules/i.test(on25) && /1\. Mock Customer CARTRENDS/.test(on25), on25);
+        check('...read with the question that was asked', asked25.some((u) => /Mock Customer ka discount setup karein\?/.test(u) && /Their reply:\njhakaas/.test(u)));
+      } finally {
+        ai25._setModel(null);
+        require('../src/config').gemini.apiKey = keyWas25;
+        cr20.team = teamWas22;
+        ds20.cancel(agentChat20);
+      }
+
       // ---- the same flow with NOTHING TAPPED ----
       // The bot sends no buttons any more, so every step above has to work
       // typed. No buttonId anywhere below.

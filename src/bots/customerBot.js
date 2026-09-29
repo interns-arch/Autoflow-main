@@ -111,6 +111,7 @@ const quotable = require('../core/chatState').slot('quotable');
 // it. chatId -> { base, parts: [{ partNo, name }], at }
 const rateOptions = require('../core/chatState').slot('rateOptions');
 const discountSetup = require('../core/discountSetup');
+const replyReader = require('../core/replyReader');
 const approvalLog = require('../core/approvalLog');
 const payments = require('../core/payments');
 const advanceOrders = require('../core/advanceOrders');
@@ -3427,6 +3428,15 @@ class CustomerBot {
     }
   }
 
+  // A yes/no step of the discount setup, answered in the agent's own words:
+  // the model reads the reply against the question (core/replyReader). A
+  // tapped button needs no reading. -> 'yes' | 'no' | 'other'
+  async readDiscountYesNo(m, said, question, options) {
+    if (m.buttonId === 'DSC_YES' || m.buttonId === 'DSC_MORE_YES') return 'yes';
+    if (m.buttonId === 'DSC_NO' || m.buttonId === 'DSC_MORE_NO') return 'no';
+    return replyReader.readYesNo({ question, reply: said, options, phone: store.normPhone(m.from) });
+  }
+
   async answerDiscount(m, said, reply, t) {
     const st = discountSetup.get(m.chatId);
     const d = st.draft;
@@ -3510,7 +3520,18 @@ class CustomerBot {
       }
       // ---- the agent has seen the customer's details: this one? ----
       case 'confirmCustomer': {
-        if (discountSetup.NO.test(said) || m.buttonId === 'DSC_NO') {
+        // Another phone or GST number here is another customer.
+        if (!m.buttonId && salesOrder.readCustomerKey(said)) {
+          st.step = 'customer';
+          delete st.row;
+          discountSetup.save(m.chatId, st);
+          return this.answerDiscount(m, said, reply, t);
+        }
+        const ans = await this.readDiscountYesNo(m, said, t(`Set up the discount for ${st.row.name}?`, `${st.row.name} ka discount setup karein?`), {
+          yes: `this is the right customer, go on with the discount setup for ${st.row.name}`,
+          no: 'wrong customer, or do not set it up',
+        });
+        if (ans === 'no') {
           delete st.row;
           return next(
             'customer',
@@ -3519,14 +3540,7 @@ class CustomerBot {
               : t("Then send the right customer's phone number or GST number.", 'Theek hai — sahi customer ka phone number ya GST number bhejiye.'),
           );
         }
-        if (!discountSetup.YES.test(said) && m.buttonId !== 'DSC_YES') {
-          // Another phone or GST number here is another customer.
-          if (salesOrder.readCustomerKey(said)) {
-            st.step = 'customer';
-            delete st.row;
-            discountSetup.save(m.chatId, st);
-            return this.answerDiscount(m, said, reply, t);
-          }
+        if (ans !== 'yes') {
           return next('confirmCustomer', t(`Set up the discount for ${st.row.name}? yes or no`, `${st.row.name} ka discount setup karein? haan ya nahi`));
         }
         // The row is an ACCOUNT (its id is the account id). A rule is made
@@ -3605,11 +3619,12 @@ class CustomerBot {
       // — is not an answer, goes on to be answered, and the change waits.
       // (25 Sep, live: that message was read as a no and the change died.)
       case 'confirmChange': {
-        if (discountSetup.NO.test(said) || m.buttonId === 'DSC_NO') {
+        const ans = await this.readDiscountYesNo(m, said, t('Send this change for approval?', 'Ye change approval ke liye bhejun?'), { yes: 'send the discount change', no: 'do not send it' });
+        if (ans === 'no') {
           discountSetup.cancel(m.chatId);
           return reply(t('Not sent. Nothing was changed.', 'Theek hai, nahi bheja. Kuch change nahi hua.'));
         }
-        if (!discountSetup.YES.test(said) && m.buttonId !== 'DSC_YES') return null;
+        if (ans !== 'yes') return null;
         return this.sendDiscountChange(m, st, submit, reply, t);
       }
 
@@ -3713,14 +3728,19 @@ class CustomerBot {
         ]);
       }
       case 'confirm': {
-        if (discountSetup.NO.test(said) || m.buttonId === 'DSC_NO') {
+        const ans = await this.readDiscountYesNo(m, said, discountSetup.describe(d, t) + '\n' + t('Send this rule to the Dealer Portal for approval?', 'Ye rule Dealer Portal pe approval ke liye bhejun?'), {
+          yes: 'send this rule for approval',
+          no: 'do not send it, start the rule again',
+        });
+        if (ans === 'no') {
           st.draft = {};
           return next('type', t('Again, then — brand-wise or part-wise?', 'Theek hai, dobara — Brand wise ya Part wise?'), this.discountTypeButtons(t));
         }
-        // Anything longer than a word or two is a message of its own, not an
-        // answer: it goes on, and the rule waits for its yes.
-        if (!discountSetup.YES.test(said) && m.buttonId !== 'DSC_YES' && said.split(/\s+/).length > 2) return null;
-        if (!discountSetup.YES.test(said) && m.buttonId !== 'DSC_YES') {
+        // A message of its own ("Maruti ka headlight kitne ka hai?") is not
+        // an answer: it goes on, and the rule waits for its yes. A word or two
+        // that is neither is asked again.
+        if (ans !== 'yes' && said.split(/\s+/).length > 2) return null;
+        if (ans !== 'yes') {
           return next('confirm', t('Send this rule for approval? Yes or no.', 'Ye rule approval ke liye bhejun? Haan ya Nahi.'), [
             { id: 'DSC_YES', title: t('Yes', 'Haan') },
             { id: 'DSC_NO', title: t('No, start again', 'Nahi, dobara') },
@@ -3744,15 +3764,21 @@ class CustomerBot {
         // "done", "bas", "itna hi" mean STOP here, even though "done" is a yes
         // at the confirm step. With a button it never mattered which word was
         // typed; answered in words, "done" would have started another rule.
-        const finished = /^(done|bas|bas itna|itna hi|that'?s all|no more|enough)\b/i.test(said) || m.buttonId === 'DSC_MORE_NO';
-        if (!finished && (discountSetup.YES.test(said) || m.buttonId === 'DSC_MORE_YES')) {
+        const ans =
+          m.buttonId === 'DSC_MORE_NO' || /^(done|bas|bas itna|itna hi|that'?s all|no more|enough)\b/i.test(said)
+            ? 'no'
+            : await this.readDiscountYesNo(m, said, t('Another rule for this customer?', 'Is customer ke liye aur rule?'), {
+                yes: 'add another discount rule for this customer',
+                no: 'finished, no more rules',
+              });
+        if (ans === 'yes') {
           return next('type', t('Brand-wise or part-wise?', 'Brand wise ya Part wise?'), this.discountTypeButtons(t));
         }
         discountSetup.cancel(m.chatId);
         // "Maruti ka right headlight chahiye" is not an answer to "another
         // rule?" (25 Sep, live: it was swallowed and answered "Ho gaya — 1
         // discount rule…"). The setup is over; the message goes on.
-        if (!finished && !discountSetup.NO.test(said)) return null;
+        if (ans !== 'no') return null;
         return reply(
           t(
             `Done — ${st.count} discount rule(s) ${st.accountRequestId ? 'go to the Dealer Portal once the account is open' : 'are on the Dealer Portal'}, waiting for a Super Admin's approval. I will tell you as each is approved.`,
