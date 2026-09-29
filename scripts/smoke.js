@@ -2478,7 +2478,7 @@ async function main() {
   // DISCOUNT RULES (founder, 22 Sep). Every rule - set up by the agent for a
   // new account, or a change to one that exists - goes to the Sales Head as
   // "OK DSC-…" first; the portal is only touched once it is approved. A
-  // part-wise rule is set by the lowest sale price against the portal's MRP.
+  // part-wise rule is set in %, with the portal's MRP shown (29 Sep).
   {
     const cc20 = require('../src/core/customerCreate');
     const ds20 = require('../src/core/discountSetup');
@@ -2534,15 +2534,15 @@ async function main() {
       check('...for the customer as the portal has them, for 3 months from today', made20.dealer_id === 1 && made20.rule_name === 'Mock Customer CARTRENDS 12%' && Date.parse(made20.valid_to) - Date.parse(made20.valid_from) > 85 * 864e5);
       check('a customer registering themselves is not asked for a discount', !ds20.pending('sim-919000000302'));
 
-      // ---- a part-wise rule, set by the lowest sale price ----
+      // ---- a part-wise rule, set in % ----
       portal.setMockStock([{ part_no: '16510M65L10', name: 'Oil Filter', quantity: 50, price: 90, mrp: 200, vendor: 'K' }]);
       const form21 = { chatId: agentChat20, byName: 'Shubham', answers: { ...form20.answers, requestId: 'WA-DSC21', phone: '919000000303' } };
       cc20.park(form21);
       await customer.startDiscountSetup({ chatId: agentChat20, from: AGENT20 }, form21, (text) => customer.askDiscount({ chatId: agentChat20, from: AGENT20 }, text), tt20);
       await say20(AGENT20, 'Part wise', 'DSC_PART');
       const mrp21 = text20(await say20(AGENT20, '16510M65L10'));
-      check('part-wise: the portal MRP is shown and the lowest price asked', /MRP ₹200/.test(mrp21) && /Minimum kitne mein bechna/.test(mrp21));
-      check('...and the discount is worked out from it', /₹170 \/ MRP ₹200 = 15% discount/.test(text20(await say20(AGENT20, '170'))));
+      check('part-wise: the portal MRP is shown and the discount asked in %', /MRP ₹200/.test(mrp21) && /Kitna discount \(%\)/.test(mrp21) && !/bechna/.test(mrp21));
+      check('...and the price it sells at is shown', /MRP ₹200 pe 15% discount: ₹170 mein bikega/.test(text20(await say20(AGENT20, '15'))));
       for (let i = 0; i < 4; i++) await say20(AGENT20, 'skip');
       await say20(AGENT20, '30 din');
       const sent21 = await say20(AGENT20, 'Haan', 'DSC_YES');

@@ -3002,9 +3002,9 @@ class CustomerBot {
   //
   // Set up by the agent for a new account, or changed for one that exists -
   // and in every case approved by the Sales Head ("OK DSC-…") before the
-  // portal is touched (founder, 22 Sep). A part-wise rule is set by the
-  // lowest price the part may be sold at: the portal's MRP is shown, the
-  // price is asked, and the percentage is worked out from the two.
+  // portal is touched (founder, 22 Sep). A part-wise rule is set in %, like
+  // a brand rule (founder, 29 Sep - no longer by the lowest sale price): the
+  // portal's MRP is shown, the % is asked, and the price it sells at is shown.
   // STAFF, NOT CUSTOMERS. Admins, the helper and the voice helper, the
   // Sales Heads who approve accounts, the account-opening team, salesmen, the
   // sales team who ask on a customer's behalf. Their messages are commands to
@@ -3574,16 +3574,18 @@ class CustomerBot {
           if (mrp) {
             d.mrp = mrp;
             return next(
-              'changePrice',
+              'changeValue',
               t(
-                `${rule.partNo} — MRP ${money(mrp)}. Now ${rule.value}% off: sells at ${money(discountSetup.priceAt(mrp, rule.value))}.\nNew lowest sale price (₹)?`,
-                `${rule.partNo} — MRP ${money(mrp)}. Abhi ${rule.value}% discount: ${money(discountSetup.priceAt(mrp, rule.value))} mein bikta hai.\nNaya minimum sale price (₹)?`,
+                `${rule.partNo} — MRP ${money(mrp)}. Now ${rule.value}% off: sells at ${money(discountSetup.priceAt(mrp, rule.value))}.\nNew discount %?`,
+                `${rule.partNo} — MRP ${money(mrp)}. Abhi ${rule.value}% discount: ${money(discountSetup.priceAt(mrp, rule.value))} mein bikta hai.\nNaya discount %?`,
               ),
             );
           }
         }
         return next('changeValue', t(`Now ${rule.value}%. New discount %?`, `Abhi ${rule.value}% hai. Naya discount %?`));
       }
+      // Only a change left open by the build before this one (which asked for
+      // the lowest sale price) still stops here.
       case 'changePrice': {
         const price = discountSetup.readNumber(said);
         const pct = discountSetup.pctFromPrice(d.mrp, price);
@@ -3648,10 +3650,12 @@ class CustomerBot {
         const mrp = await this.mrpOf(d.target, st.accountId);
         if (mrp) {
           d.mrp = mrp;
-          return next('price', t(`${d.target} — MRP ${money(mrp)}. Lowest price to sell it at (₹)?`, `${d.target} — MRP ${money(mrp)}. Minimum kitne mein bechna hai (₹)?`));
+          return next('value', t(`${d.target} — MRP ${money(mrp)}. How much discount, in %?`, `${d.target} — MRP ${money(mrp)}. Kitna discount (%)?`));
         }
         return next('value', t(`${d.target} — the portal has no MRP for it. How much discount, in %?`, `${d.target} — portal pe MRP nahi mila. Kitna discount (%)?`));
       }
+      // Only a setup left open by the build before this one (which asked for
+      // the lowest sale price) still stops here.
       case 'price': {
         const price = discountSetup.readNumber(said);
         const pct = discountSetup.pctFromPrice(d.mrp, price);
@@ -3667,7 +3671,10 @@ class CustomerBot {
         const v = discountSetup.readNumber(said);
         if (v === null || v <= 0 || v >= 100) return next('value', t('Send the discount as a percentage, like 12.', 'Discount % mein bhejiye, jaise 12.'));
         d.value = v;
-        return next('minQty', t('Minimum quantity? (default 1 — "skip")', 'Minimum quantity? (default 1 — "skip" likh dijiye)'));
+        const sells = d.mrp
+          ? t(`${v}% off MRP ${money(d.mrp)}: sells at ${money(discountSetup.priceAt(d.mrp, v))}.\n`, `MRP ${money(d.mrp)} pe ${v}% discount: ${money(discountSetup.priceAt(d.mrp, v))} mein bikega.\n`)
+          : '';
+        return next('minQty', sells + t('Minimum quantity? (default 1 — "skip")', 'Minimum quantity? (default 1 — "skip" likh dijiye)'));
       }
       case 'minQty': {
         const v = discountSetup.SKIP.test(said) ? 1 : discountSetup.readNumber(said);
