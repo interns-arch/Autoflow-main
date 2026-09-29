@@ -364,6 +364,8 @@ class CustomerBot {
     // Orders punched and then cancelled on the portal: marked, and the
     // customer (and the salesman) told (core/cancelWatch).
     require('../core/cancelWatch').start(this);
+    // Account requests that went out while the approver's window was shut.
+    setTimeout(() => this.catchUpUndelivered().catch((e) => store.log(this.key, 'undelivered catch-up failed: ' + String((e && e.message) || e).slice(0, 80))), 30 * 1000).unref();
     // A cheque that bounces or is rejected: the staff are told (core/chequeWatch).
     require('../core/chequeWatch').start(this);
     await this.transport.start();
@@ -462,6 +464,9 @@ class CustomerBot {
     // They wrote, so their 24h window is open: an approval sent to them in
     // the next day goes as plain text, with no template in front of it.
     if (!m.isGroup && !viaAgent) escalation.noteInbound(m.from);
+    // An approver writing opens their window: whatever never reached them goes
+    // now, before their message is read (their "OK WA-…" can then follow).
+    if (!m.isGroup && !viaAgent) await this.resendUndelivered(m).catch(() => 0);
 
     // Whatever recording the last message left behind is finished with. A
     // voice note's clip is held only for as long as its own words are being
@@ -2826,6 +2831,9 @@ Baaki ${payments.money(hold.due)} pay hone tak ${order.id} hold pe hai${custPhon
           `Aapka account khul gaya hai. Part number aur quantity bhejiye, order laga deta hoon.`,
         ),
       );
+      // THE NEW CUSTOMER'S DETAILS to Tez Expert (founder, 29 Sep: Alam ji
+      // and Shubham Kumar - config.creation.accountCreatedTeam).
+      await this.tellAccountCreatedTeam(req, account, who).catch((e) => store.log(this.key, 'account-created notice failed: ' + String((e && e.message) || e).slice(0, 80)));
       // The agent's discount rules, now that there is an account to hang
       // them on: those already approved are created; the rest are created
       // when their own OK comes.
@@ -4207,6 +4215,109 @@ Baaki ${payments.money(hold.due)} pay hone tak ${order.id} hold pe hai${custPhon
       }
     }
     store.log(this.key, `${req.id}: discount ${req.type} notice sent to ${to.join(', ')}`);
+  }
+
+  // A NEW CUSTOMER, CREATED: everything about them, to the team that looks
+  // after new accounts (config.creation.accountCreatedTeam). -> how many told.
+  async tellAccountCreatedTeam(req, account, approvedBy) {
+    const team = (config.creation && config.creation.accountCreatedTeam) || {};
+    const a = req.answers || {};
+    const line = (k, v) => (v ? `${k}: ${v}` : null);
+    const text = [
+      `🆕 *New customer created* — ${a.name || a.phone}`,
+      line('Request', a.requestId),
+      line('WhatsApp', a.phone ? '+' + store.normPhone(a.phone) : null),
+      line('GSTIN', a.gstNo),
+      line('Business type', a.businessType),
+      line('Contact person', a.contactPerson),
+      line('Contact phone', a.contactPhone),
+      line('Email', a.email),
+      line('Address', [a.address, a.city, a.state, a.pin].filter(Boolean).join(', ')),
+      line('Portal login', account && account.username),
+      line('Opened by', req.byName || a.createdByName || (req.forSomeoneElse ? 'sales team' : 'the customer')),
+      line('Approved by', approvedBy),
+    ]
+      .filter(Boolean)
+      .join('\n');
+    let told = 0;
+    for (const [phone, name] of Object.entries(team)) {
+      try {
+        await escalation.ensureWindow(this.transport, phone, 'New customer created — details follow', a.name || 'New customer').catch(() => {});
+        await this.transport.sendText(phone, text);
+        told++;
+      } catch (e) {
+        store.log(this.key, `new-customer details not sent to ${name || phone}: ` + String((e && e.message) || e).slice(0, 80));
+      }
+    }
+    store.log(this.key, `${a.requestId}: new-customer details sent to ${told} of ${Object.keys(team).length} (${Object.values(team).join(', ')})`);
+    return told;
+  }
+
+  // AN APPROVER WHO WRITES TO THE BOT, with requests that never reached them
+  // (core/deliveryWatch): each still-open account request is sent again now,
+  // while their 24-hour window is open. 29 Sep, founder: an agent's customer
+  // waited because Arun Sir had not written for a day.
+  async resendUndelivered(m) {
+    const p = store.normPhone(m.from);
+    if (!p || !customerCreate.isApprover(p)) return 0;
+    const t = lang.for(m.chatId);
+    let sent = 0;
+    for (const u of deliveryWatch.allUndelivered()) {
+      if (!Object.keys(u.to || {}).includes(p)) continue;
+      const form = customerCreate.parked(u.ref);
+      if (!form) {
+        deliveryWatch.delivered(u.ref, p); // decided or gone: nothing to send
+        continue;
+      }
+      try {
+        const text = t('Waiting for you (it could not be delivered earlier):\n\n', 'Aapke liye ruka hua tha (pehle pahunch nahi paya tha):\n\n') + customerCreate.summary(form, t);
+        const id =
+          form._photo && this.transport.sendImage && form.answers.shopPhoto
+            ? await this.transport.sendImage(p, Buffer.from(form._photo, 'base64'), form.answers.shopPhoto.mime, text)
+            : await this.transport.sendText(p, text);
+        customerCreate.noteSummary(id, u.ref);
+        deliveryWatch.track(id, { ref: u.ref, to: p, requesterChat: form.chatId || null });
+        deliveryWatch.delivered(u.ref, p);
+        sent++;
+        store.log(this.key, `${u.ref}: sent again to ${p} — it had not reached them`);
+      } catch (e) {
+        store.log(this.key, `${u.ref}: could not send again to ${p}: ` + String((e && e.message) || e).slice(0, 80));
+      }
+    }
+    return sent;
+  }
+
+  // REQUESTS SENT BEFORE FAILURES WERE KEPT (runs once, after boot): an
+  // account request still waiting, sent to an approver who had not written to
+  // the bot in the 24 hours before it - WhatsApp will have refused it (the
+  // template needs billing, 28 Sep). It is marked, so the dashboard says so;
+  // and if that approver has written in the last 22 hours, it goes now.
+  async catchUpUndelivered() {
+    const chatLog = require('../core/chatLog');
+    const DAY = 24 * 60 * 60 * 1000;
+    const lastIn = (p) => chatLog.messages(p, { limit: 400 }).filter((e) => e.dir === 'in').map((e) => Date.parse(e.at)).filter(Boolean);
+    const approvers = customerCreate.accountApprovers().map((p) => store.normPhone(p));
+    let marked = 0;
+    for (const id of customerCreate.parkedIds()) {
+      const form = customerCreate.parked(id);
+      if (!form) continue;
+      const sentAt = Number(form.parkedAt || form.at) || 0;
+      for (const ap of approvers) {
+        if (deliveryWatch.undeliveredFor(id).includes(ap)) continue;
+        const before = lastIn(ap).filter((x) => x <= sentAt).pop();
+        if (!before || sentAt - before > DAY) {
+          deliveryWatch.markUndelivered(id, ap, 'the approver had not written to the bot in the 24 hours before it was sent');
+          marked++;
+        }
+      }
+    }
+    let resent = 0;
+    for (const ap of approvers) {
+      const latest = lastIn(ap).pop();
+      if (latest && Date.now() - latest < 22 * 60 * 60 * 1000) resent += await this.resendUndelivered({ from: ap, chatId: ap + '@cloud' }).catch(() => 0);
+    }
+    if (marked || resent) store.log(this.key, `account requests that never reached the approver: ${marked} marked, ${resent} sent again now`);
+    return { marked, resent };
   }
 
   // THE AGENT WHO OPENED AN ACCOUNT, told of the decision: the chat the form

@@ -167,7 +167,7 @@
     const c = rowsOf('customers'), o = rowsOf('orders'), d = rowsOf('discounts'), p = rowsOf('payments');
     const n = (list, st) => list.filter((x) => x.status === st).length;
     return {
-      customers: { created: n(c, 'created'), waiting: n(c, 'waiting for approval'), rejected: n(c, 'rejected') },
+      customers: { created: n(c, 'created'), waiting: n(c, 'waiting for approval'), rejected: n(c, 'rejected'), notDelivered: c.filter((x) => x.approvalNotDelivered).length },
       orders: { placed: n(o, 'placed'), waiting: n(o, 'waiting for approval') + n(o, 'waiting for payment'), rejected: n(o, 'rejected'), refused: n(o, 'refused by portal'), cancelled: n(o, 'cancelled on portal'), value: Math.round(o.filter((x) => x.status === 'placed').reduce((s, x) => s + (Number(x.amount) || 0), 0)) },
       discounts: { approved: n(d, 'approved'), waiting: n(d, 'waiting for approval') + n(d, 'waiting for Super Admin'), rejected: n(d, 'rejected') },
       payments: { settled: n(p, 'settled'), open: p.length - n(p, 'settled') },
@@ -219,7 +219,7 @@
     customers: {
       label: 'Customers', statuses: ['created', 'waiting for approval', 'rejected'],
       cols: ['Requested', 'Customer', 'WhatsApp', 'Status (bot)', 'On the portal', 'Opened by', 'Approved / rejected by', 'Home branch'],
-      row: (c) => [when(c.requestedAt), `<b>${esc(c.customer || '—')}</b><div class="muted">${esc(c.id)}</div>`, esc(c.phone), pill(c.status), portalPill(c.portalStatus, c.portal && c.portal.account ? 'account ' + c.portal.account : ''), esc(c.openedBy), esc(c.approvedBy || c.rejectedBy || '—'), esc(c.homeBranch || '')],
+      row: (c) => [when(c.requestedAt), `<b>${esc(c.customer || '—')}</b><div class="muted">${esc(c.id)}</div>`, esc(c.phone), pill(c.status) + (c.approvalNotDelivered ? `<div style="margin-top:4px"><span class="pill bad" style="padding:0 6px">not delivered to ${esc(c.approvalNotDelivered)}</span></div><div class="muted" style="font-size:12px;margin-top:3px">waiting for them to message the bot</div>` : ''), portalPill(c.portalStatus, c.portal && c.portal.account ? 'account ' + c.portal.account : ''), esc(c.openedBy), esc(c.approvedBy || c.rejectedBy || '—'), esc(c.homeBranch || '')],
       detail: (c) => grid([
         ['Portal', c.portalStatus], ['Portal account id', c.portal && c.portal.account], ['Portal name', c.portal && c.portal.name], ['Portal dealer', c.portal && c.portal.dealer], ['Accounts on this number', c.portal && c.portal.accounts],
         ['GSTIN', c.gst], ['Business type', c.businessType], ['Contact', c.contactPerson], ['Contact phone', c.contactPhone],
@@ -265,7 +265,7 @@
     // Each card counts over ITS tab's range, and says which.
     const lbl = (which) => { useTab(which); return `<div class="d" style="margin-top:6px"><span class="pill info" style="padding:0 6px">${esc(rangeLabel())}${range === 'all' ? '' : ' · by ' + esc((DATE_BY[which].find(([f]) => f === byField) || [, ''])[1].toLowerCase())}</span></div>`; };
     const cards = `<div class="cards">
-      <div class="card"><div class="k">Customers</div><div class="v">${s.customers.created}</div><div class="d">created · ${s.customers.waiting} waiting · ${s.customers.rejected} rejected</div>${lbl('customers')}</div>
+      <div class="card"><div class="k">Customers</div><div class="v">${s.customers.created}</div><div class="d">created · ${s.customers.waiting} waiting · ${s.customers.rejected} rejected${s.customers.notDelivered ? ` · <span class="pill bad" style="padding:0 6px">${s.customers.notDelivered} not delivered to approver</span>` : ''}</div>${lbl('customers')}</div>
       <div class="card"><div class="k">Orders placed</div><div class="v">${s.orders.placed}</div><div class="d">${rs(s.orders.value)} · ${s.orders.waiting} waiting · ${s.orders.rejected} rejected${s.orders.refused ? ` · <span class="pill bad" style="padding:0 6px">${s.orders.refused} refused by portal</span>` : ' · 0 refused by portal'}${s.orders.cancelled ? ` · <span class="pill bad" style="padding:0 6px">${s.orders.cancelled} cancelled on portal</span>` : ' · 0 cancelled on portal'}</div>${lbl('orders')}</div>
       <div class="card"><div class="k">Discounts</div><div class="v">${s.discounts.approved}</div><div class="d">approved · ${s.discounts.waiting} waiting · ${s.discounts.rejected} rejected</div>${lbl('discounts')}</div>
       <div class="card"><div class="k">Payments</div><div class="v">${s.payments.settled}</div><div class="d">settled · ${s.payments.open} open</div>${lbl('payments')}</div>

@@ -338,6 +338,9 @@ const config = {
     // Told when a new customer is approved or rejected (besides the agent who
     // opened it and the customer).
     accountDecisionNotify: nameMap(process.env.ACCOUNT_DECISION_NOTIFY || '919999492550:Prateek Sir'),
+    // WHO GETS THE NEW CUSTOMER'S DETAILS once the account is open (founder,
+    // 29 Sep: Tez Expert - Alam ji and Shubham Kumar). "phone:name,...".
+    accountCreatedTeam: nameMap(process.env.ACCOUNT_CREATED_TEAM || '919217030408:Alam ji,919122781913:Shubham Kumar'),
     // Told when an agent sets up or changes a discount. A notice only: the
     // rule is approved or rejected on the Dealer Portal by a Super Admin.
     discountSetupNotify: nameMap(process.env.DISCOUNT_SETUP_NOTIFY || '919999492550:Prateek Sir'),

@@ -69,6 +69,21 @@ function customers(events) {
       odooPartner: facts.odooPartner || null,
       note: rej && rej.note ? rej.note : null,
     });
+    // WAITING, AND THE APPROVER NEVER GOT IT (founder, 29 Sep): Arun Sir had
+    // not written to the bot for 24 hours, so WhatsApp refused the request.
+    // It goes to him again the moment he writes (customerBot.resendUndelivered).
+    const row = out[out.length - 1];
+    if (row.status === 'waiting for approval') {
+      const dw = require('./deliveryWatch');
+      const cfg = require('../config');
+      const names = { ...(cfg.creation.approvers || {}), ...(cfg.creation.accountApprovers || {}) };
+      const missed = dw.undeliveredFor(row.id);
+      if (missed.length) {
+        const who = missed.map((p) => names[p] || '+' + p).join(', ');
+        row.approvalNotDelivered = who;
+        row.note = `Approval not delivered to ${who} — WhatsApp needs them to message the bot first (24-hour window). It is sent again as soon as they do.`;
+      }
+    }
   }
   return out.sort((a, b) => String(b.requestedAt).localeCompare(String(a.requestedAt)));
 }

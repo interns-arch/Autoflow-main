@@ -580,6 +580,44 @@ async function main() {
     check('...and the customer too', /jaankari chahiye|more information/i.test(toCu9), toCu9);
   }
 
+  // 29 Sep, founder: an agent's customer whose approval never reached Arun
+  // Sir (no message from him in 24 h) shows as pending on the dashboard and
+  // goes to him when he writes; a created account's details go to Tez Expert.
+  console.log('\n[5b-vii-c] an account approval that never reached the approver; the new customer to Tez Expert');
+  {
+    const cfgC = require('../src/config').creation;
+    const apprWasC = cfgC.accountApprovers;
+    const ARUN = '919773900582';
+    cfgC.accountApprovers = { [ARUN]: 'Arun Sir' };
+    const cc = require('../src/core/customerCreate');
+    const dw = require('../src/core/deliveryWatch');
+    const formC = { chatId: 'sim-919000000291', byName: 'Nirmal', answers: { requestId: 'WA-UNDEL1', phone: '919000000292', name: 'UNDELIVERED MOTORS', businessType: 'retailer', gstNo: '08AAPCR8256F1ZU', city: 'Jaipur', state: 'Rajasthan', address: 'Mansarovar' } };
+    cc.park(formC);
+    // As finishNewCustomer records it when the form goes for approval.
+    require('../src/core/approvalLog').record({ kind: 'account', id: 'WA-UNDEL1', event: 'requested', by: 'Nirmal', ...require('../src/core/approvalLog').accountFacts(formC.answers) });
+    try {
+      dw.markUndelivered('WA-UNDEL1', ARUN, 'no message from the approver in 24 hours');
+      const rowC = require('../src/core/dashboardData').build().customers.find((c) => c.id === 'WA-UNDEL1');
+      check('the dashboard shows it pending, and that it never reached Arun Sir', rowC && rowC.status === 'waiting for approval' && rowC.approvalNotDelivered === 'Arun Sir' && /not delivered to Arun Sir/.test(rowC.note || ''), JSON.stringify(rowC));
+      customer.transport.outbox.length = 0;
+      await customer.transport.injectIncoming({ id: 'wamid.arun-hi', from: ARUN, chatId: 'sim-' + ARUN, isGroup: false, body: 'Hi', mediaType: 'chat' });
+      const toArun = customer.transport.outbox.filter((o) => String(o.to).includes(ARUN)).map((o) => o.text || '').join('\n');
+      check('when Arun Sir writes, the request that never reached him is sent to him', /UNDELIVERED MOTORS|WA-UNDEL1/.test(toArun) && /pehle pahunch nahi paya|could not be delivered earlier/i.test(toArun), toArun.slice(0, 300));
+      const rowC2 = require('../src/core/dashboardData').build().customers.find((c) => c.id === 'WA-UNDEL1');
+      check('...and the dashboard no longer says it never reached him', rowC2 && !rowC2.approvalNotDelivered, JSON.stringify(rowC2));
+      customer.transport.outbox.length = 0;
+      const told = await customer.tellAccountCreatedTeam(formC, { username: 'undelivered_motors' }, 'Arun Sir');
+      const toAlam = customer.transport.outbox.filter((o) => String(o.to).includes('919217030408')).map((o) => o.text || '').join('\n');
+      const toShubham = customer.transport.outbox.filter((o) => String(o.to).includes('919122781913')).map((o) => o.text || '').join('\n');
+      check('a created customer\'s details go to Alam ji and Shubham Kumar', told === 2 && /New customer created/.test(toAlam) && /New customer created/.test(toShubham), JSON.stringify(customer.transport.outbox.map((o) => o.to)));
+      check('...with the details: name, GSTIN, address, portal login, who opened and who approved', /UNDELIVERED MOTORS/.test(toAlam) && /08AAPCR8256F1ZU/.test(toAlam) && /Jaipur/.test(toAlam) && /undelivered_motors/.test(toAlam) && /Nirmal/.test(toAlam) && /Arun Sir/.test(toAlam), toAlam);
+    } finally {
+      cc.unpark('WA-UNDEL1');
+      dw.delivered('WA-UNDEL1', ARUN);
+      cfgC.accountApprovers = apprWasC;
+    }
+  }
+
   // 28 Sep, founder: an order punched and then CANCELLED on the portal (by the
   // Super Admin) - the customer and the salesman are told, and the dashboard
   // shows it.
