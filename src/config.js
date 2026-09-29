@@ -331,6 +331,16 @@ const config = {
     approvers: nameMap(process.env.CREATION_APPROVER_NUMBERS),
     // Told when an account is made, so the desk is not surprised by it.
     notify: nameMap(process.env.CREATION_NOTIFY_NUMBERS),
+    // NEW-CUSTOMER APPROVAL (founder, 29 Sep): the request goes ONLY to these,
+    // and only they can approve or reject it. The approvers above keep every
+    // other request (orders, the daily report).
+    accountApprovers: nameMap(process.env.ACCOUNT_APPROVER_NUMBERS || '919773900582:Arun Sir'),
+    // Told when a new customer is approved or rejected (besides the agent who
+    // opened it and the customer).
+    accountDecisionNotify: nameMap(process.env.ACCOUNT_DECISION_NOTIFY || '919999492550:Prateek Sir'),
+    // Told when an agent sets up or changes a discount. A notice only: the
+    // rule is approved or rejected on the Dealer Portal by a Super Admin.
+    discountSetupNotify: nameMap(process.env.DISCOUNT_SETUP_NOTIFY || '919999492550:Prateek Sir'),
     // The commercial terms a CUSTOMER is never asked for. A person being
     // onboarded does not set their own credit limit.
     defaultCreditDays: parseInt(process.env.CREATION_DEFAULT_CREDIT_DAYS || '1', 10),

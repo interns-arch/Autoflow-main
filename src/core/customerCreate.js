@@ -1209,11 +1209,23 @@ function readBareDecision(text) {
   return null;
 }
 
+// A customer approver is an approver too: their "OK WA-…" is read as one.
 function isApprover(phone) {
-  return Boolean(config.creation.approvers[store.normPhone(phone)]);
+  const p = store.normPhone(phone);
+  return Boolean(config.creation.approvers[p] || (config.creation.accountApprovers || {})[p]);
+}
+// Only these approve or reject a NEW CUSTOMER (founder, 29 Sep: Arun Sir).
+// With none configured, the approvers above do, as before.
+function accountApprovers() {
+  const own = Object.keys(config.creation.accountApprovers || {});
+  return own.length ? own : Object.keys(config.creation.approvers || {});
+}
+function isAccountApprover(phone) {
+  return accountApprovers().includes(store.normPhone(phone));
 }
 function approverName(phone) {
-  return config.creation.approvers[store.normPhone(phone)] || store.normPhone(phone);
+  const p = store.normPhone(phone);
+  return config.creation.approvers[p] || (config.creation.accountApprovers || {})[p] || p;
 }
 
 // Forms waiting on a yes, by request id. Kept out of the per-chat slot
@@ -1303,6 +1315,8 @@ module.exports = {
   readDecision,
   readBareDecision,
   isApprover,
+  isAccountApprover,
+  accountApprovers,
   approverName,
   park,
   parked,

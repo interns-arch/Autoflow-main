@@ -55,6 +55,11 @@ config.customerSearchBy = 'any';
 // stand-in Gemini key, and the staff agent must not try it.
 config.agent.staffEnabled = false;
 config.etaOffers = true; // off live for now (29 Sep); the offer flow is still tested
+// Set per test below (29 Sep): who approves a new customer, who hears of a
+// customer decision or a discount setup.
+config.creation.accountApprovers = {};
+config.creation.accountDecisionNotify = {};
+config.creation.discountSetupNotify = {};
 config.dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'autoflow-smoke-'));
 config.customerDms = ['919899555001'];
 config.adminNumbers = ['919800000009'];
@@ -2596,7 +2601,15 @@ async function main() {
     const dpCfg20 = require('../src/config').dealerPortal;
     const listWas20 = dpCfg20.listPriceAccountId;
     dpCfg20.listPriceAccountId = 3822; // the house account MRPs are read from, as live
-    cr20.approvers = { 919999492550: 'Prateek Sir' };
+    cr20.approvers = { 919999492550: 'Prateek Sir', 919800000666: 'Shad' };
+    // 29 Sep: a new customer is approved only by the customer approver (Arun
+    // Sir live; the approver above here), and Prateek Sir hears of every
+    // customer decision and every discount setup (a stand-in number here).
+    const PRATEEK20 = '919800000555';
+    cr20.accountApprovers = { 919999492550: 'Arun Sir' };
+    cr20.accountDecisionNotify = { [PRATEEK20]: 'Prateek Sir' };
+    cr20.discountSetupNotify = { [PRATEEK20]: 'Prateek Sir' };
+    const toPrateek20 = (out) => out.filter((o) => String(o.to).indexOf(PRATEEK20) >= 0).map((o) => o.text || '').join(String.fromCharCode(10));
     const APPR20 = '919999492550';
     const AGENT20 = '919000000301';
     const agentChat20 = 'sim-' + AGENT20;
@@ -2628,12 +2641,22 @@ async function main() {
       // 28 Sep, founder: not to the Sales Head - straight to the Dealer
       // Portal, where the Super Admin approves it.
       const sent20 = await say20(AGENT20, 'Haan', 'DSC_YES');
+      const note20 = toPrateek20(sent20);
+      check('a discount setup is told to Prateek Sir: who, for whom, what, and where it stands', /Discount setup\* by Shubham/.test(note20) && /KALRA MOTORS/.test(note20) && /Brand CARTRENDS — \*12%\*/.test(note20) && /new account WA-DSC20 is approved/.test(note20) && /approve or reject it on the Dealer Portal/.test(note20), note20);
       check('the rule is NOT sent to the Sales Head', !sent20.some((o) => o.to === APPR20));
       check('...the agent is told it goes to the Dealer Portal once the account opens', /Account WA-DSC20 khulte hi Dealer Portal pe approval/.test(text20(sent20)), text20(sent20));
       await say20(AGENT20, 'Bas itna', 'DSC_MORE_NO');
       const before20 = (await portal.listDiscountRules()).length;
       // the account is approved: the rule goes to the portal with it
+      // Only the customer approver decides a new customer.
+      customer.transport.outbox.length = 0;
+      const shad20 = text20(await say20('919800000666', 'OK WA-DSC20'));
+      check('another approver cannot approve a new customer', /Naye customer ka approval ab Arun Sir karte hain/.test(shad20) && require('../src/core/customerCreate').parked('WA-DSC20'), shad20);
+      customer.transport.outbox.length = 0;
       await customer.decideNewCustomer({ chatId: 'sim-' + APPR20, from: APPR20 }, { yes: true, requestId: 'WA-DSC20' }, async () => true, tt20);
+      const ok20 = toPrateek20(customer.transport.outbox);
+      check('an approved customer is told to Prateek Sir, with who opened it', /New customer \*KALRA MOTORS\*/.test(ok20) && /approved by Prateek Sir|approved by Arun Sir/.test(ok20) && /Opened by Shubham/.test(ok20), ok20);
+      check('...and to the customer', customer.transport.outbox.some((o) => String(o.to).indexOf('919000000302') >= 0 && /account khul gaya/i.test(o.text || '')));
       const rules20 = await portal.listDiscountRules();
       const made20 = rules20[rules20.length - 1] || {};
       check('when the account opens the rule is written to the portal', rules20.length === before20 + 1 && made20.rule_type === 'BRAND' && made20.brand === 'CARTRENDS' && made20.discount_value === 12);
@@ -2659,7 +2682,10 @@ async function main() {
       await say20(AGENT20, 'Bas itna', 'DSC_MORE_NO');
       // rejected with the account: the rule goes with it
       const waiting21 = ds20.forAccount('WA-DSC21').map((r) => r.id);
+      customer.transport.outbox.length = 0;
       await customer.decideNewCustomer({ chatId: 'sim-' + APPR20, from: APPR20 }, { yes: false, requestId: 'WA-DSC21' }, async () => true, tt20);
+      const no21 = toPrateek20(customer.transport.outbox);
+      check('a rejected customer is told to Prateek Sir, the agent and the customer', /rejected by/.test(no21) && customer.transport.outbox.some((o) => String(o.to).indexOf('919000000303') >= 0) && customer.transport.outbox.some((o) => o.to === agentChat20 || String(o.to).indexOf(AGENT20) >= 0), no21 + ' | ' + JSON.stringify(customer.transport.outbox.map((o) => o.to)));
       check('a rejected account takes its discount rules with it', waiting21.length === 1 && !ds20.find(waiting21[0]));
 
       // ---- an AGENT changes an EXISTING customer's discount ----
@@ -2683,6 +2709,8 @@ async function main() {
       // The new % sends it: there is no "Send for approval?" any more (25 Sep,
       // live — the next message was read as a no and the change was lost).
       const sent22 = await say20(AGENT20, '15');
+      const note22 = toPrateek20(sent22);
+      check('a discount change is told to Prateek Sir too', /Discount change\* by Shubham/.test(note22) && /12% → \*15%\*/.test(note22) && /rule #501/.test(note22), note22);
       check('...shown the change as it is sent', /12% → 15%/.test(text20(sent22)));
       check('the change is NOT sent to the Sales Head', !sent22.some((o) => o.to === APPR20));
       const rule22 = (await portal.listDiscountRules())[0];
@@ -2761,6 +2789,9 @@ async function main() {
       );
     } finally {
       cr20.approvers = apprWas20;
+      cr20.accountApprovers = {};
+      cr20.accountDecisionNotify = {};
+      cr20.discountSetupNotify = {};
       dpCfg20.listPriceAccountId = listWas20;
       portal._setMockDiscountRules([]);
       portal.setMockStock([

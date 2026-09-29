@@ -616,6 +616,9 @@ class CustomerBot {
       if (decision && customerCreate.isApprover(m.from)) {
         if (/^DSC-/.test(decision.requestId)) return this.decideDiscount(m, decision, reply, t);
         if (/^ORD-/.test(decision.requestId)) return this.decideOrder(m, decision, reply, t);
+        // A NEW CUSTOMER is approved only by the customer approvers (founder,
+        // 29 Sep: Arun Sir). Anyone else is told whose it is, and nothing moves.
+        if (!customerCreate.isAccountApprover(m.from)) return reply(this.accountApproverOnly(t));
         return this.decideNewCustomer(m, decision, reply, t);
       }
       if (decision) {
@@ -634,7 +637,8 @@ class CustomerBot {
         const bare = customerCreate.readBareDecision(text);
         if (bare) {
           const swiped = m.contextId && customerCreate.requestForMessage(m.contextId);
-          const open = this.openApprovals();
+          // A new customer is not theirs to decide unless they are a customer approver.
+          const open = this.openApprovals().filter((id) => !/^WA-/.test(id) || customerCreate.isAccountApprover(m.from));
           const pick = swiped && open.includes(swiped) ? [swiped] : open;
           if (pick.length === 1) {
             store.log(this.key, `"${text}" from ${m.from}: the only open request is ${pick[0]} - taken as ${bare.yes ? 'OK' : 'NO'}`);
@@ -2630,7 +2634,8 @@ Baaki ${payments.money(hold.due)} pay hone tak ${order.id} hold pe hai${custPhon
   // because that is the half of it a person actually checks — and nothing
   // is created until they answer.
   async finishNewCustomer(m, form, reply, t) {
-    const approvers = Object.keys(config.creation.approvers);
+    // Only the customer approvers - Arun Sir (founder, 29 Sep).
+    const approvers = customerCreate.accountApprovers();
     if (!approvers.length) {
       // Deliberate: without someone to say yes, the credit terms on this
       // account would be nobody's decision.
@@ -2703,7 +2708,7 @@ Baaki ${payments.money(hold.due)} pay hone tak ${order.id} hold pe hai${custPhon
   // and decide whether this firm is opened by hand.
   async reviewNewCustomer(m, step, reply, t) {
     const form = step.form;
-    const approvers = Object.keys(config.creation.approvers);
+    const approvers = customerCreate.accountApprovers();
     if (!approvers.length) {
       store.log(this.key, `${form.answers.requestId} could not verify GST and NO approver is configured`);
       return reply(step.reply);
@@ -2749,6 +2754,7 @@ Baaki ${payments.money(hold.due)} pay hone tak ${order.id} hold pe hai${custPhon
             'Account kholne se pehle team ko kuch check karna hai — aapko call aayega.',
           ),
         );
+        await this.tellAccountDecision(m, `❌ ${req.answers.name || req.answers.phone} (${decision.requestId}) — GST not verified, rejected by ${who}. The customer was told we will call.`);
         return reply(t('Rejected. The customer was told we will call.', 'Reject kar diya. Customer ko bata diya ki call karenge.'));
       }
       store.log(this.key, decision.requestId + ' (GST review) waived by ' + who);
@@ -2774,6 +2780,7 @@ Baaki ${payments.money(hold.due)} pay hone tak ${order.id} hold pe hai${custPhon
         ),
       );
       await this.tellAccountAgent(req, (tt) => tt(`❌ The account request for ${req.answers.name || req.answers.phone} (${decision.requestId}) was not approved by ${who}. The customer has been told.`, `❌ ${req.answers.name || req.answers.phone} ka account request (${decision.requestId}) ${who} ne approve nahi kiya. Customer ko bata diya hai.`));
+      await this.tellAccountDecision(m, `❌ New customer *${req.answers.name || req.answers.phone}* (${decision.requestId}) — rejected by ${who}.${req.byName ? ' Opened by ' + req.byName + '.' : ''} The customer${req.byName ? ' and the agent have' : ' has'} been told.`);
       return reply(t(`Rejected. ${req.answers.name} was told.`, `Reject kar diya. ${req.answers.name} ko bata diya.`));
     }
 
@@ -2828,7 +2835,11 @@ Baaki ${payments.money(hold.due)} pay hone tak ${order.id} hold pe hai${custPhon
           /* the rules exist either way */
         }
       }
-      for (const phone of Object.keys(config.creation.notify)) {
+      // The older "account ban gaya" list, only when nobody is set to hear of
+      // customer decisions: those go ONLY to Prateek Sir, the agent and the
+      // customer now (founder, 29 Sep; tellAccountDecision below).
+      const oldNotify = Object.keys(config.creation.accountDecisionNotify || {}).length ? [] : Object.keys(config.creation.notify);
+      for (const phone of oldNotify) {
         if (store.normPhone(phone) === store.normPhone(m.from)) continue;
         try {
           await this.transport.sendText(phone, `${req.answers.name} ka account ban gaya (${account.username}) — ${who} ne approve kiya.`);
@@ -2883,6 +2894,7 @@ Baaki ${payments.money(hold.due)} pay hone tak ${order.id} hold pe hai${custPhon
         store.log(this.key, `${decision.requestId}: home branch not checked: ${String((e && e.message) || e).slice(0, 80)}`);
       }
       approvalLog.record({ kind: 'account', id: decision.requestId, event: 'approved', by: who, username: account.username, odooPartner: odoo.partnerId || null, ...approvalLog.accountFacts(req.answers) });
+      await this.tellAccountDecision(m, `✅ New customer *${req.answers.name || req.answers.phone}* (${decision.requestId}) — approved by ${who}, account ${account.username} is open.${req.byName ? ' Opened by ' + req.byName + '.' : ''} The customer${req.byName ? ' and the agent have' : ' has'} been told.`);
       return reply(t(`Done — ${req.answers.name} is open (${account.username}).`, `Ho gaya — ${req.answers.name} ka account khul gaya (${account.username}).`) + branchNote + odooNote);
     } catch (e) {
       // The request STAYS parked: a failed create is worth another try, and
@@ -2890,6 +2902,21 @@ Baaki ${payments.money(hold.due)} pay hone tak ${order.id} hold pe hai${custPhon
       const why = String((e && e.message) || e).slice(0, 160);
       store.log(this.key, `${decision.requestId} create FAILED: ${why}`);
       return reply(t(`Could not create it: ${why}\nThe request is still here — try *OK ${decision.requestId}* again.`, `Nahi ban paya: ${why}\nRequest abhi bhi hai — dobara *OK ${decision.requestId}* bhejiye.`));
+    }
+  }
+
+  // A NEW CUSTOMER APPROVED OR REJECTED (founder, 29 Sep): Prateek Sir is told
+  // (config.creation.accountDecisionNotify), besides the agent and the
+  // customer - never the one who decided.
+  async tellAccountDecision(m, text) {
+    for (const phone of Object.keys(config.creation.accountDecisionNotify || {})) {
+      if (store.normPhone(phone) === store.normPhone(m.from)) continue;
+      try {
+        await escalation.ensureWindow(this.transport, phone, 'New customer decided — details follow').catch(() => {});
+        await this.transport.sendText(phone, text);
+      } catch (e) {
+        store.log(this.key, `could not tell ${phone} of the customer decision: ${String((e && e.message) || e).slice(0, 80)}`);
+      }
     }
   }
 
@@ -2916,7 +2943,7 @@ Baaki ${payments.money(hold.due)} pay hone tak ${order.id} hold pe hai${custPhon
           'Aapka account pehle se bana hua hai sir — naya banane ki zaroorat nahi. Part number aur quantity bhejiye, order laga deta hoon.',
         ),
       );
-      for (const phone of Object.keys(config.creation.approvers)) {
+      for (const phone of customerCreate.accountApprovers()) {
         if (store.normPhone(phone) === store.normPhone(m.from)) continue;
         try {
           await this.transport.sendText(phone, `${requestId} (${firm}) band — ${who}: account pehle se hai.`);
@@ -3302,6 +3329,16 @@ Baaki ${payments.money(hold.due)} pay hone tak ${order.id} hold pe hai${custPhon
   // Every request waiting on a Sales Head: accounts, discounts, orders.
   // Only the last three days: one left unanswered last week must not make
   // every bare "ok" ambiguous.
+  // "Customer approvals are with Arun Sir" - to an approver who is not one.
+  accountApproverOnly(t) {
+    const own = config.creation.accountApprovers || {};
+    const names = customerCreate
+      .accountApprovers()
+      .map((p) => own[p] || customerCreate.approverName(p))
+      .join(', ');
+    return t(`New-customer approvals are with ${names} now — nothing was changed.`, `Naye customer ka approval ab ${names} karte hain — kuch change nahi hua.`);
+  }
+
   openApprovals(now = Date.now()) {
     const fresh = (at) => {
       const ms = typeof at === 'number' ? at : Date.parse(at || '');
@@ -3604,6 +3641,7 @@ Baaki ${payments.money(hold.due)} pay hone tak ${order.id} hold pe hai${custPhon
       approvalLog.record({ kind: 'discount', id: req.id, event: 'requested', by: st.setBy || null, customer: st.customer, detail: `${type === 'change' ? 'change ' + (extra && extra.oldValue) + '% → ' : ''}${d.kind || ''} ${d.target || ''} ${d.value}%`.trim() });
       const sent = await this.discountToPortal(req, st.setBy || null);
       store.log(this.key, `${req.id}: discount ${type} for ${st.customer} (${d.target || ''} ${d.value}%) ${sent.ok ? 'on the portal for approval' : 'NOT written: ' + sent.why}`);
+      if (sent.ok) await this.tellDiscountSetup(req, sent, st.setBy || m.from).catch(() => {});
       return { req, sent };
     };
 
@@ -4055,6 +4093,41 @@ Baaki ${payments.money(hold.due)} pay hone tak ${order.id} hold pe hai${custPhon
     store.log(this.key, `${req.id}: ${made.name} written to the portal as rule ${made.ruleId} — ${made.live ? 'APPROVED' : 'waiting for the Super Admin'}`);
     approvalLog.record({ kind: 'discount', id: req.id, event: 'sent to portal', by: by || null, customer: req.customer, detail: `${made.name} (rule #${made.ruleId})` });
     return { ok: true, ruleId: made.ruleId, name: made.name, live: made.live };
+  }
+
+  // A DISCOUNT SET UP OR CHANGED BY AN AGENT (founder, 29 Sep): Prateek Sir is
+  // told what was set, for whom and by whom (config.creation.
+  // discountSetupNotify). A notice only - the rule is approved or rejected on
+  // the Dealer Portal by a Super Admin, not here, so it asks for no reply.
+  async tellDiscountSetup(req, sent, by) {
+    const to = Object.keys(config.creation.discountSetupNotify || {});
+    if (!to.length) return;
+    const r = req.rule || {};
+    const on = r.kind === 'brand' ? `Brand ${r.target}` : r.kind === 'part' ? `Part ${r.target}` : 'All parts';
+    const limits = [r.minQty > 1 ? `min qty ${r.minQty}` : null, r.maxQty ? `max qty ${r.maxQty}` : null, r.minAmount ? `min ₹${r.minAmount}` : null, r.maxAmount ? `max ₹${r.maxAmount}` : null, req.type === 'change' ? null : r.durationLabel ? `valid ${r.durationLabel}` : null].filter(Boolean);
+    const where = sent.waitsForAccount
+      ? `Goes to the Dealer Portal when the new account ${sent.waitsForAccount} is approved.`
+      : `On the Dealer Portal as rule #${sent.ruleId}${sent.live ? ' — already APPROVED there.' : ' — waiting for a Super Admin.'}`;
+    const text = [
+      `🏷️ *Discount ${req.type === 'change' ? 'change' : 'setup'}* by ${by || 'an agent'}`,
+      `Customer: ${req.customer}`,
+      `${on} — ${req.type === 'change' ? `${req.oldValue}% → *${r.value}%*` : `*${r.value}%*`}${limits.length ? ' (' + limits.join(', ') + ')' : ''}`,
+      r.mrp ? `MRP ₹${r.mrp} → ₹${discountSetup.priceAt(r.mrp, r.value)}` : null,
+      where,
+      '',
+      sent.live ? 'For your information.' : 'Please check it and approve or reject it on the Dealer Portal (Super Admin).',
+    ]
+      .filter((l) => l !== null)
+      .join('\n');
+    for (const phone of to) {
+      try {
+        await escalation.ensureWindow(this.transport, phone, 'Discount setup — details follow').catch(() => {});
+        await this.transport.sendText(phone, text);
+      } catch (e) {
+        store.log(this.key, `could not tell ${phone} of discount ${req.id}: ${String((e && e.message) || e).slice(0, 80)}`);
+      }
+    }
+    store.log(this.key, `${req.id}: discount ${req.type} notice sent to ${to.join(', ')}`);
   }
 
   // THE AGENT WHO OPENED AN ACCOUNT, told of the decision: the chat the form
