@@ -160,14 +160,23 @@ async function ordersFor(row, t) {
 
 async function ledgerFor(row, t) {
   const odoo = require('../integrations/odoo');
+  // Cheques given and not yet in Odoo count as paid (core/cheques): "owes"
+  // is what is left after them, and each cheque is listed under the head.
+  const pos = await require('./cheques')
+    .positionOf(row.id)
+    .catch(() => null);
+  const withCheques = pos && pos.cheques.length;
   const head = [
-    t('owes ₹', 'baaki ₹') + money(row.balance),
-    Number(row.pdc_amount) ? 'PDC ₹' + money(row.pdc_amount) : null,
+    withCheques
+      ? t('owes ₹', 'baaki ₹') + money(pos.afterCheques) + t(` (₹${money(row.balance)} less cheques ₹${money(pos.chequeAmount)})`, ` (₹${money(row.balance)} mein se cheque ₹${money(pos.chequeAmount)} ghata ke)`)
+      : t('owes ₹', 'baaki ₹') + money(row.balance),
+    !withCheques && Number(row.pdc_amount) ? 'PDC ₹' + money(row.pdc_amount) : null,
     Number(row.credit_limit)
       ? 'limit ₹' + money(row.credit_limit) + (row.credit_days ? ' / ' + row.credit_days + t(Number(row.credit_days) === 1 ? ' day' : ' days', ' din') : '')
       : null,
   ].filter(Boolean);
   const out = [row.name + ' - ' + head.join(' · ')];
+  if (withCheques) out.push(t('Cheques received, not in the ledger yet:', 'Cheque mil gaye, ledger mein abhi nahi:'), ...require('./cheques').chequeLines(pos, t));
 
   if (odoo.enabled() && row.odoo_partner_id) {
     try {
@@ -727,4 +736,4 @@ async function answer(row, intent, t) {
   return ordersFor(row, t);
 }
 
-module.exports = { parse, parseOwn, answer, answerOwn, ownRow, ordersFor, parseBill, sendBill, parseOrderDetail, orderDetail, parseDesk, classifyDesk, trackText, invoiceStatusText, shortageText, partStatusText, incomingText, orderListFacts, trackFacts, invoiceFacts, shortageFacts, _internals: { money, day, where, same, cleanName, stageOf } };
+module.exports = { parse, parseOwn, answer, answerOwn, ownRow, ordersFor, parseBill, sendBill, parseOrderDetail, orderDetail, parseDesk, classifyDesk, trackText, invoiceStatusText, shortageText, partStatusText, incomingText, orderListFacts, trackFacts, invoiceFacts, shortageFacts, _internals: { money, day, where, same, cleanName, stageOf }, _ledgerFor: ledgerFor };

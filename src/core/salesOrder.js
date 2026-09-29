@@ -420,6 +420,11 @@ async function customerCard(row, t) {
   // Two ids, named as what they are (integrations/portalContracts): this row's
   // id is the ACCOUNT; discount rules are made against the DEALER.
   const dl = await portal.dealerIdForAccount(full.id, full).catch(() => null);
+  // Cheques given and not yet in Odoo count as paid (core/cheques).
+  const pos = await require('./cheques')
+    .positionOf(full.id)
+    .catch(() => null);
+  const left = pos && pos.cheques.length ? pos.afterCheques : full.balance;
   const lines = [
     `*${full.name}*`,
     full.phone || full.mobile ? 'Phone: ' + (full.phone || full.mobile) : null,
@@ -429,10 +434,15 @@ async function customerCard(row, t) {
     agentOf(full) ? 'Agent: ' + agentOf(full) : null,
     full.credit_limit != null ? `Credit: ${money(full.credit_limit)}${full.credit_days != null ? ' · ' + full.credit_days + ' day(s)' : ''}` : null,
     // What they owe — Odoo's receivable, as the portal reads it live.
-    full.balance != null
-      ? Number(full.balance) >= 1
-        ? t('Due balance: ', 'Due balance: ') + money(full.balance) + t(' (to be settled before a new order)', ' (naye order se pehle settle karna hai)')
+    left != null
+      ? Number(left) >= 1
+        ? t('Due balance: ', 'Due balance: ') + money(left) + t(' (to be settled before a new order)', ' (naye order se pehle settle karna hai)')
         : t('Due balance: nil (settled)', 'Due balance: nil (settle hai)')
+      : null,
+    pos && pos.cheques.length
+      ? t(`Cheques received, not in Odoo yet: ${money(pos.chequeAmount)} (Odoo shows ${money(pos.owed)} due)`, `Cheque mile, Odoo mein abhi nahi: ${money(pos.chequeAmount)} (Odoo mein ${money(pos.owed)} due)`) +
+        '\n' +
+        require('./cheques').chequeLines(pos, t).join('\n')
       : null,
     full.home_branch_dealer_id || full.home_branch_dealer
       ? 'Home branch: ' + require('./dataEntryRequests').branchName(full.home_branch_dealer_id || full.home_branch_dealer)
@@ -831,7 +841,20 @@ async function sendLedgerPdf(bot, m, row, t) {
       creditDays: full.credit_days != null ? full.credit_days : null,
     });
     const safe = String(full.name || 'customer').replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
-    const due = st.closing >= 1 ? 'due ' + require('./pdf').rs(st.closing) : 'nothing due';
+    // A cheque they gave and Odoo has not posted is not in this ledger; the
+    // caption says so, and what is left after it (core/cheques).
+    const pos = await require('./cheques')
+      .positionOf(full.id)
+      .catch(() => null);
+    const rs = require('./pdf').rs;
+    const due =
+      (st.closing >= 1 ? 'due ' + rs(st.closing) : 'nothing due') +
+      (pos && pos.cheques.length
+        ? t(
+            `; cheque(s) ${rs(pos.chequeAmount)} received, not in this ledger yet — after them ${pos.afterCheques >= 1 ? rs(pos.afterCheques) + ' due' : 'nothing due'}`,
+            `; ${rs(pos.chequeAmount)} ke cheque mil gaye, is ledger mein abhi nahi — unke baad ${pos.afterCheques >= 1 ? rs(pos.afterCheques) + ' baaki' : 'kuch baaki nahi'}`,
+          )
+        : '');
     await bot.transport.sendDocument(
       m.chatId,
       buf,

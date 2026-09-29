@@ -133,6 +133,35 @@ async function main() {
     customer: '919899000888',
   });
 
+  // A CHEQUE GIVEN AND NOT YET IN ODOO COUNTS AS PAID ONCE RECEIVED (29 Sep).
+  {
+    const ch = require('../src/core/cheques');
+    portal.setMockCustomers([{ id: 9001, name: 'Cheque Motors', phone: '919811100009', balance: '10000.00', credit_limit: '50000', credit_days: 7 }]);
+    portal.setMockPdc({
+      balance: { 9001: { balance: '10000.00', customer_outstanding: '10000.00', pdc_amount: '6000.00', balance_is_live: true } },
+      cheques: [
+        { txn_id: 1, acc_id: 9001, pdc_number: '004512', pdc_amount: '6000.00', cheque_date: '2026-10-02', status: 'deposited', bank_name: 'HDFC' },
+        { txn_id: 2, acc_id: 9001, pdc_number: '004499', pdc_amount: '3000.00', cheque_date: '2026-09-01', status: 'rejected', bank_name: 'HDFC' },
+        { txn_id: 3, acc_id: 9001, pdc_number: '004400', pdc_amount: '5000.00', cheque_date: '2026-08-01', status: 'cleared', bank_name: 'HDFC' },
+      ],
+    });
+    const pos = await ch.positionOf(9001, { fresh: true });
+    check('cheques: a deposited cheque counts, a rejected or cleared one does not', pos.owed === 10000 && pos.chequeAmount === 6000 && pos.afterCheques === 4000 && pos.cheques.length === 1 && pos.failed.length === 1);
+    const due = await require('../src/core/payments').dueOf({ buyerId: 9001, name: 'Cheque Motors' });
+    check('...what they still owe is Odoo less the cheque', due && due.due === 4000 && due.owed === 10000 && due.chequeAmount === 6000);
+    const said = await require('../src/core/customerLookup')._ledgerFor({ id: 9001, name: 'Cheque Motors', balance: '10000.00' }, (en, hi) => hi);
+    check('...and the ledger answer says so, cheque by cheque', /baaki ₹4,000/.test(said) && /004512 · ₹6,000/.test(said) && !/004499/.test(said), said);
+    const told = [];
+    const fakeBot = { transport: { sendText: async (to, text) => told.push([to, text]) } };
+    const watch = require('../src/core/chequeWatch');
+    check('...a bounce already there when the watch starts is not announced', (await watch.checkOnce(fakeBot)).length === 0 && told.length === 0);
+    portal.setMockPdc({ balance: {}, cheques: [{ txn_id: 1, acc_id: 9001, dealer_name: 'Cheque Motors', pdc_number: '004512', pdc_amount: '6000.00', status: 'bounced' }, { txn_id: 2, acc_id: 9001, status: 'rejected', pdc_amount: '3000.00' }] });
+    const fresh = await watch.checkOnce(fakeBot);
+    check('...a new bounce is told to the staff, once', fresh.length === 1 && told.length >= 1 && /Cheque bounced/.test(told[0][1]) && /004512/.test(told[0][1]) && (await watch.checkOnce(fakeBot)).length === 0);
+    portal.setMockPdc({});
+    portal.setMockCustomers([]);
+  }
+
   // ONE CONVERSATION PER CUSTOMER IN A GROUP (29 Sep): their own key, sent
   // back to the group, addressed to them.
   {

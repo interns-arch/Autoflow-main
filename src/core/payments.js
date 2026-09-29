@@ -43,7 +43,20 @@ async function dueOf(customer) {
   }
   const row = rows.find((r) => Number(r.id) === Number(customer.buyerId));
   if (!row || row.balance === undefined || row.balance === null) return null;
-  return { due: round2(row.balance), live: row.balance_is_live !== false };
+  // A CHEQUE THEY GAVE COUNTS AS PAID ONCE RECEIVED (founder, 29 Sep): the
+  // balance is Odoo's and has not taken it off yet (core/cheques). Read fresh
+  // - an accountant's OK re-reads this to see whether it is settled.
+  const pos = await require('./cheques')
+    .positionOf(customer.buyerId, { fresh: true })
+    .catch(() => null);
+  const cheque = pos ? pos.chequeAmount : 0;
+  return {
+    due: round2(Math.max(0, Number(row.balance) - cheque)),
+    owed: round2(row.balance),
+    chequeAmount: cheque,
+    cheques: pos ? pos.cheques : [],
+    live: row.balance_is_live !== false,
+  };
 }
 
 const settled = (due) => !(Number(due) >= (config.payments.settledBelow || 1));

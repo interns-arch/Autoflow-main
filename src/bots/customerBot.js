@@ -359,6 +359,8 @@ class CustomerBot {
     // Orders punched and then cancelled on the portal: marked, and the
     // customer (and the salesman) told (core/cancelWatch).
     require('../core/cancelWatch').start(this);
+    // A cheque that bounces or is rejected: the staff are told (core/chequeWatch).
+    require('../core/chequeWatch').start(this);
     await this.transport.start();
   }
 

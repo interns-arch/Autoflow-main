@@ -1004,6 +1004,11 @@ function setMockStock(rows) {
 
 // Customers for the salesman flow in tests: the mock has no customer list.
 let mockCustomers = [];
+// Cheques for tests: { balance: { <accountId>: pdc-balance row }, cheques: [pdc-management items] }.
+let mockPdc = { balance: {}, cheques: [] };
+function setMockPdc(v) {
+  mockPdc = { balance: (v && v.balance) || {}, cheques: (v && v.cheques) || [] };
+}
 function setMockCustomers(rows) {
   mockCustomers = Array.isArray(rows) ? rows : [];
   return mockCustomers.length;
@@ -1082,6 +1087,7 @@ module.exports = {
   },
   setMockStock,
   setMockCustomers,
+  setMockPdc,
   // The portal's ETA record for a part (GET /eta-mapping): the rows of the
   // purchase orders it is coming in on, newest first. [] when none.
   async etaMapping(partNo) {
@@ -1631,6 +1637,48 @@ module.exports = {
     if (!id) return null;
     if (isMock()) return mockCredit;
     const data = await api('GET', '/accounts/' + id + '/credit-control');
+    return (data && data.data) || data || null;
+  },
+  // CHEQUES (founder, 29 Sep): a cheque the customer gave is on the portal
+  // (read as admin: the sales login gets 403 "Finance verification access is
+  // required")
+  // the day it is collected, and in Odoo only once it is posted there. These
+  // two read the portal's side (core/cheques decides what they mean).
+  //
+  // What the account owes, with the cheques received and not yet in Odoo
+  // (pdc_amount) beside it.
+  async pdcBalance(accountId) {
+    const id = String(accountId == null ? '' : accountId).replace(/[^0-9]/g, '');
+    if (!id) return null;
+    if (isMock()) return mockPdc.balance[id] || null;
+    const data = await api('GET', '/accounts/pdc-balance?account_id=' + id, undefined, true, 'admin');
+    return (data && data.data) || data || null;
+  },
+  // The account's cheques, newest first: number, amount, dates, status
+  // (collected / verified / deposited / cleared / bounced).
+  async pdcCheques(accountId, { limit = 50 } = {}) {
+    const id = String(accountId == null ? '' : accountId).replace(/[^0-9]/g, '');
+    if (!id) return [];
+    if (isMock()) return mockPdc.cheques.filter((c) => String(c.acc_id) === id);
+    const data = await api('GET', `/account-transactions/pdc-management?customer_id=${id}&limit=${limit}&sort_by=posted_date&sort_dir=desc`, undefined, true, 'admin');
+    const items = ((data && (data.data || data)) || {}).items || [];
+    // Only this account's, whatever the filter matched on.
+    return items.filter((c) => String(c.acc_id) === id);
+  },
+  // Every customer's cheques, newest first, filtered by the portal's own
+  // params (status, posted_from …) - for watching for a bounce.
+  async pdcChequeList(params = {}) {
+    if (isMock()) return mockPdc.cheques.filter((c) => !params.status || c.status === params.status);
+    const q = new URLSearchParams({ limit: '200', sort_by: 'posted_date', sort_dir: 'desc', ...params }).toString();
+    const data = await api('GET', '/account-transactions/pdc-management?' + q, undefined, true, 'admin');
+    return ((data && (data.data || data)) || {}).items || [];
+  },
+  // One cheque in full - its Odoo payment once it has been posted there.
+  async pdcCheque(txnId) {
+    const id = String(txnId == null ? '' : txnId).replace(/[^0-9]/g, '');
+    if (!id) return null;
+    if (isMock()) return mockPdc.cheques.find((c) => String(c.txn_id) === id) || null;
+    const data = await api('GET', '/account-transactions/pdc/' + id, undefined, true, 'admin');
     return (data && data.data) || data || null;
   },
   // A customer recent orders, for "Kalra ka order kab aayega". The portal
