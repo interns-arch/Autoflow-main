@@ -132,6 +132,28 @@ async function main() {
     customer: '919899000888',
   });
 
+  // ONE CONVERSATION PER CUSTOMER IN A GROUP (29 Sep): their own key, sent
+  // back to the group, addressed to them.
+  {
+    const gc = require('../src/core/groupChat');
+    const k = gc.memberKey('simgroup-delhi dealers', '919811100001');
+    check('group: a member key carries the group', gc.groupOf(k) === 'simgroup-delhi dealers' && gc.groupOf('sim-919811100001') === null && gc.groupOf('919811100001@cloud') === null);
+    const got = [];
+    const wrapped = gc.wrapTransport({ sendToChat: async (id, text) => got.push([id, text]), other: 1 });
+    gc.noteName(k, 'Kalra Motors');
+    await wrapped.sendToChat(k, 'BP-1001 stock mein hai');
+    await wrapped.sendToChat(k, 'Kalra Motors ji, order ho gaya');
+    await wrapped.sendToChat('sim-919811100001', 'a DM');
+    check('...a send to it goes to the group, addressed to the customer', got[0][0] === 'simgroup-delhi dealers' && got[0][1] === '*Kalra Motors* — BP-1001 stock mein hai');
+    check('...not twice when the reply already names them, and a DM is untouched', got[1][1] === 'Kalra Motors ji, order ho gaya' && got[2][0] === 'sim-919811100001' && got[2][1] === 'a DM' && wrapped.other === 1);
+    const route = require('../src/pipeline/route');
+    const g = { isGroup: true, chatId: 'some-other-group', from: '919811100001' };
+    check('...a group the bot did not create is not answered by default', !route.listensTo(g));
+    config.groupsAnswerAll = true;
+    check('...unless GROUPS_ANSWER_ALL', route.listensTo(g));
+    config.groupsAnswerAll = false;
+  }
+
   const customer = new CustomerBot();
   // THE FLOWS BELOW ARE STAFF TOOLING NOW.
   //

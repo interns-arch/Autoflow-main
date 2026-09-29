@@ -341,7 +341,10 @@ const GREETING =
 class CustomerBot {
   constructor() {
     this.key = 'customer';
-    this.transport = createTransport(this.key);
+    // A customer in a group has a conversation of their own, keyed
+    // "<group>~<phone>" (core/groupChat); whatever is sent to that key is
+    // posted in the group.
+    this.transport = require('../core/groupChat').wrapTransport(createTransport(this.key));
   }
 
   async start() {
@@ -430,6 +433,17 @@ class CustomerBot {
     // For the bot at all? A chat it listens to, not one of our own numbers,
     // not a Cartrends person talking in a group (pipeline/route).
     if (!route.forBot(m)) return false;
+
+    // A CUSTOMER IN A GROUP gets a conversation of their own (founder, 29
+    // Sep): their cart, their account form, the agent's memory of them — never
+    // the group's, shared with every other customer in it. The reply is still
+    // posted in the group (core/groupChat). Staff in a group keep the group's
+    // own chat, as before.
+    if (m.isGroup && !m.groupId && !this.isOperator(m)) {
+      m.groupId = m.chatId;
+      m.chatId = require('../core/groupChat').memberKey(m.chatId, store.normPhone(m.from));
+      require('../core/groupChat').noteName(m.chatId, m.profileName);
+    }
 
     // m._desk: the STAFF AGENT (agent/staff) driving the desk. The message is
     // its instruction, not the staff member's words: nothing about it is
@@ -3184,6 +3198,8 @@ class CustomerBot {
   //    null when it could not run.
   async askAgent(m, text, reply, t, attachment) {
     const who = await customers.resolve(m.from).catch(() => null);
+    // In a group, replies are addressed by the name their account carries.
+    if (m.groupId && who && who.found && who.name) require('../core/groupChat').noteName(m.chatId, who.name);
     const res = await agent.handle({
       bot: this,
       chatId: m.chatId,

@@ -1,4 +1,6 @@
 'use strict';
+// Group ids a message has come from, so a reply goes back as a group message.
+const HEARD_GROUPS = new Set();
 // Official WhatsApp Cloud API transport (Meta Graph API).
 // Same surface as the linked-device transports:
 //   start(), sendText(number, text), sendToChat(chatId, text),
@@ -239,7 +241,9 @@ class CloudTransport {
   async sendToChat(chatId, text) {
     const id = String(chatId || '');
     const groups = require('../core/groups');
-    if (/@g\.us/.test(id) || groups.findByGroupId(id)) {
+    // ...or one a group message came from (GROUPS_ANSWER_ALL answers groups
+    // it did not create, so they are not in the registry).
+    if (/@g\.us/.test(id) || groups.findByGroupId(id) || HEARD_GROUPS.has(id)) {
       return this.sendToGroup(id, text);
     }
     return this.sendText(id.split('@')[0], text);
@@ -400,6 +404,7 @@ class CloudTransport {
               (value.metadata && value.metadata.group_id) ||
               null;
             const isGroup = Boolean(groupId);
+            if (isGroup) HEARD_GROUPS.add(String(groupId));
             // The name on their WhatsApp profile. Meta sends it beside the
             // message; the helper asked about a part needs to know WHO is asking.
             const contact = (value.contacts || []).find((c) => c && c.wa_id === msg.from) || (value.contacts || [])[0];

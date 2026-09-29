@@ -16,7 +16,9 @@ function listensTo(m) {
   // GROUPS: the bot speaks ONLY in groups it created itself. Nothing to
   // configure and nothing to get wrong — being added to some unrelated
   // company group can never make it start answering there.
-  return Boolean(require('../core/groups').findByGroupId(m.chatId));
+  // ...unless GROUPS_ANSWER_ALL says any group it is in (config).
+  if (config.groupsAnswerAll) return true;
+  return Boolean(require('../core/groups').findByGroupId(m.groupId || m.chatId));
 }
 
 // A number that only ever asks — never orders. Availability yes, cart no.

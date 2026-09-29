@@ -313,7 +313,19 @@ function contextMiddleware({ createMiddleware, z }) {
       // "ok", "kab tak aayega?" after it are about the offer.
       const adv = require('../core/advanceOrders');
       const eta = chatId ? adv.pending(chatId) : null;
+      // IN A WHATSAPP GROUP (founder, 29 Sep): other customers and our staff
+      // read the reply too, so it says who it is for; a parts list is shown
+      // as in stock / out of stock and the order is punched only on this
+      // customer's own yes (core/groupChat keeps their cart their own).
+      const msg = configurable.message || null;
+      const inGroup = Boolean(msg && msg.groupId);
+      const who = registered || (msg && msg.profileName) || null;
       const extra = [
+        inGroup
+          ? 'IN A GROUP: this message was written in a WhatsApp group, and everyone in it reads your reply. Begin by addressing this customer' +
+            (who ? ' (' + who + ')' : '') +
+            ' so they know it is for them. When they ask for parts, check every one and reply with ONE list in two parts — in stock (part, qty, their price) and out of stock — then ask them whether to punch the order for what is in stock. Punch (confirm_order) only on THEIR clear yes. If their number has no account with us, the order cannot be placed: say so and offer to open their account (account_form "start").'
+          : '',
         cartNote(chatId),
         eta
           ? 'ETA OFFER OPEN: after their order ' +

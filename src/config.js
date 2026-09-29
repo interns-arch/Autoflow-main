@@ -77,6 +77,12 @@ const config = {
   // care, monitoring...). The customer's own number is added on top.
   groupDefaultMembers: list(process.env.GROUP_DEFAULT_MEMBERS).map(digits).filter(Boolean),
   groupSubjectPrefix: (process.env.GROUP_SUBJECT_PREFIX || 'Cartrends').trim(),
+  // GROUPS_ANSWER_ALL=true: answer customers in ANY group the bot's number is
+  // in - one it was added to, not only one it created. Off by default: an
+  // unrelated group would otherwise hear from it. (On the Cloud API the
+  // number is only ever in groups it created, so this matters for the linked
+  // WhatsApp transport.)
+  groupsAnswerAll: String(process.env.GROUPS_ANSWER_ALL || '').toLowerCase() === 'true',
   internalWarehouseName: process.env.INTERNAL_WAREHOUSE_NAME || 'Bijwasan',
 
   stockBroadcastTimes: times(process.env.STOCK_BROADCAST_TIMES, ['09:30', '16:00']),
