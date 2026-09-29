@@ -2759,6 +2759,28 @@ async function main() {
         ds20.cancel(agentChat20);
       }
 
+      // ---- "Costamber creat karni h" (29 Sep, live: Nirmal) ----
+      // Spelt past the word list: Gemini reads it, and the form opens.
+      {
+        const ai26 = require('../src/core/ai');
+        const cfg26 = require('../src/config');
+        const keyWas26 = cfg26.gemini.apiKey;
+        const teamWas26 = cr20.team;
+        cr20.team = { ...(teamWas26 || {}), 919800000401: 'Nirmal' };
+        cfg26.gemini.apiKey = 'test-key';
+        ai26._setModel(async (system) => (/^A member of the Cartrends sales team/.test(system) ? { newAccount: true, why: 'stub' } : { intent: 'other' }));
+        try {
+          const out26 = text20(await say20('919800000401', 'Costamber creat karni h'));
+          check('an agent asking for a customer account in any spelling gets the form', /Kiska account banana hai/.test(out26) && require('../src/core/customerCreate').pending('sim-919800000401'), out26);
+        } finally {
+          ai26._setModel(null);
+          cfg26.gemini.apiKey = keyWas26;
+          require('../src/core/customerCreate').cancel('sim-919800000401');
+          cr20.team = teamWas26;
+        }
+        check('...and "Hi" never asks Gemini', (await require('../src/core/replyReader').wantsNewAccount('Hi')) === false);
+      }
+
       // ---- the same flow with NOTHING TAPPED ----
       // The bot sends no buttons any more, so every step above has to work
       // typed. No buttonId anywhere below.

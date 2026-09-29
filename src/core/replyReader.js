@@ -196,4 +196,32 @@ async function readFormReply({ step, question, reply, phone, recent: given, flow
   }
 }
 
-module.exports = { readReply, readYesNo, readFormReply, _fallback: fallback, _squeeze: squeeze };
+// ASKING FOR A NEW CUSTOMER ACCOUNT, however it is spelt (29 Sep, live: a
+// sales agent's "Costamber creat karni h" and "Mujhe acount kreat karni h"
+// missed the word list, went to small talk and were told "send your GST, the
+// sales team will create it" - the sales team being them). Only a message
+// with something like "customer" or "account" in it is read; Gemini decides
+// from it and the chat so far. -> true | false | null (no model)
+const ACCOUNTISH = /\b(?:[ck][ou]{1,2}s?t[ao]?m\w*|[ck]u?st\w*|ac+[ou]*n?t\w*|akaunt\w*|kh?aa?ta\w*|grahak\w*|party|firm|dealer|id)\b/i;
+const NEW_ACCOUNT_SYSTEM = `A member of the Cartrends sales team (an auto-parts distributor in India) sent the bot one WhatsApp message. They type Hindi, English or Hinglish, often misspelt ("costamber", "acount", "kreat", "bnana"). Decide ONE thing: are they asking the bot to OPEN / CREATE / REGISTER a NEW customer account (usually for a customer of theirs)? Not their balance, not a ledger, not an order, not a discount, not a question about an existing customer. JSON only: {"newAccount": true|false, "why": "<few words>"}`;
+async function wantsNewAccount(text, { phone, recent: given } = {}) {
+  const said = String(text || '').trim();
+  if (!said || said.length > 160 || !ACCOUNTISH.test(said)) return false;
+  if (!ai.modelAvailable() && !ai._stubbed()) return null;
+  const recent = recentLines(phone, given);
+  const user = [recent ? `Recent messages (oldest first):\n${recent}` : null, `Their message:\n${said}`].filter(Boolean).join('\n\n');
+  try {
+    const out = await Promise.race([
+      ai._model(NEW_ACCOUNT_SYSTEM, user, { modelName: MODEL(), timeoutMs: TIMEOUT_MS }),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('timed out')), TIMEOUT_MS)),
+    ]);
+    const yes = Boolean(out && out.newAccount === true);
+    store.log('reply', `new account? "${said.slice(0, 50)}" -> ${yes}${out && out.why ? ' (' + String(out.why).slice(0, 60) + ')' : ''}`);
+    return yes;
+  } catch (e) {
+    store.log('reply', `new account? model could not read "${said.slice(0, 40)}": ${String((e && e.message) || e).slice(0, 80)}`);
+    return null;
+  }
+}
+
+module.exports = { readReply, readYesNo, readFormReply, wantsNewAccount, _accountish: ACCOUNTISH, _fallback: fallback, _squeeze: squeeze };

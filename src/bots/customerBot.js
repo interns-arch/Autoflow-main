@@ -687,7 +687,16 @@ class CustomerBot {
       return reply(t('No problem. Send me a part number whenever you need one.', 'Theek hai. Jab bhi koi part chahiye, bata dijiye.'));
     }
 
-    if (createAnswer === 'yes' || customerCreate.wantsToStart(text) || customerCreate.wantsSomeoneElse(text)) {
+    // Said another way than the word list knows: Gemini reads it (29 Sep, live:
+    // Nirmal's "Costamber creat karni h" got small talk instead of the form).
+    // Only for the sales team - a customer is answered by the agent - and only
+    // when the list did not already say yes.
+    const listSaysCreate = createAnswer === 'yes' || customerCreate.wantsToStart(text) || customerCreate.wantsSomeoneElse(text);
+    const geminiSaysCreate =
+      !listSaysCreate && !customerCreate.pending(m.chatId) && (customerCreate.agentName(m.from) || salesOrder.isSalesPerson(m.from)) && !ai.partNumberIn(text)
+        ? (await replyReader.wantsNewAccount(text, { phone: store.normPhone(m.from) }).catch(() => null)) === true
+        : false;
+    if (listSaysCreate || geminiSaysCreate) {
       createAsk.delete(m.chatId);
       // A SALES AGENT is never told they already have an account: opening
       // one for a customer standing at their counter is their job, and the
