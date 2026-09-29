@@ -143,6 +143,12 @@ async function flush(bot, ref) {
   const b = batches.get(ref);
   batches.delete(ref);
   if (!b || !b.failed.size) return;
+  // A NOTICE (the new-customer details) is not an approval: nobody is asked
+  // to act on its failure. It is kept and goes when they write.
+  if (String(ref).startsWith('notice:')) {
+    store.log('delivery', `${ref}: not delivered to ${[...b.failed].join(', ')} — kept, sent when they write`);
+    return;
+  }
   const lang = require('./lang');
   const sentTo = recipientsOf(ref);
   const reached = [...sentTo].filter((p) => !b.failed.has(p));

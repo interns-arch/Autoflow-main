@@ -99,6 +99,34 @@ const pendingCancel = require('../core/chatState').slot('cancelAsk');
 // question are read as the answer to it. Any other message means they have
 // moved on, and the question is dropped.
 const createAsk = require('../core/chatState').slot('createAsk');
+
+// A NOTICE KEPT UNTIL IT ARRIVES (the new-customer details to Tez Expert):
+// "notice:<request>|<phone>" -> { text, at } until delivered; then
+// { done: true } so it is never queued twice (customerBot.deliverQueuedNotices).
+const noticeTexts = require('../core/chatState').slot('notice.texts');
+
+// The new customer, in full, for Tez Expert (config.creation.accountCreatedTeam).
+// `a` is the form's answers - or the approval log's facts, which name them
+// differently (customer / gst / address) - both are read.
+function accountCreatedText(a, username, openedBy, approvedBy) {
+  const line = (k, v) => (v ? `${k}: ${v}` : null);
+  return [
+    `🆕 *New customer created* — ${a.name || a.customer || a.phone}`,
+    line('Request', a.requestId || a.id),
+    line('WhatsApp', a.phone ? '+' + store.normPhone(a.phone) : null),
+    line('GSTIN', a.gstNo || a.gst),
+    line('Business type', a.businessType),
+    line('Contact person', a.contactPerson),
+    line('Contact phone', a.contactPhone),
+    line('Email', a.email),
+    line('Address', a.city || a.state || a.pin ? [a.address, a.city, a.state, a.pin].filter(Boolean).join(', ') : a.address),
+    line('Portal login', username),
+    line('Opened by', openedBy),
+    line('Approved by', approvedBy),
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
 const CREATE_ASK_MS = 10 * 60 * 1000;
 
 // Every message of a chat by its WhatsApp id, for a while - the last 40 each
@@ -467,6 +495,7 @@ class CustomerBot {
     // An approver writing opens their window: whatever never reached them goes
     // now, before their message is read (their "OK WA-…" can then follow).
     if (!m.isGroup && !viaAgent) await this.resendUndelivered(m).catch(() => 0);
+    if (!m.isGroup && !viaAgent) await this.deliverQueuedNotices(m).catch(() => 0);
 
     // Whatever recording the last message left behind is finished with. A
     // voice note's clip is held only for as long as its own words are being
@@ -4222,28 +4251,16 @@ Baaki ${payments.money(hold.due)} pay hone tak ${order.id} hold pe hai${custPhon
   async tellAccountCreatedTeam(req, account, approvedBy) {
     const team = (config.creation && config.creation.accountCreatedTeam) || {};
     const a = req.answers || {};
-    const line = (k, v) => (v ? `${k}: ${v}` : null);
-    const text = [
-      `🆕 *New customer created* — ${a.name || a.phone}`,
-      line('Request', a.requestId),
-      line('WhatsApp', a.phone ? '+' + store.normPhone(a.phone) : null),
-      line('GSTIN', a.gstNo),
-      line('Business type', a.businessType),
-      line('Contact person', a.contactPerson),
-      line('Contact phone', a.contactPhone),
-      line('Email', a.email),
-      line('Address', [a.address, a.city, a.state, a.pin].filter(Boolean).join(', ')),
-      line('Portal login', account && account.username),
-      line('Opened by', req.byName || a.createdByName || (req.forSomeoneElse ? 'sales team' : 'the customer')),
-      line('Approved by', approvedBy),
-    ]
-      .filter(Boolean)
-      .join('\n');
+    const text = accountCreatedText(a, account && account.username, req.byName || a.createdByName || (req.forSomeoneElse ? 'sales team' : 'the customer'), approvedBy);
     let told = 0;
     for (const [phone, name] of Object.entries(team)) {
       try {
         await escalation.ensureWindow(this.transport, phone, 'New customer created — details follow', a.name || 'New customer').catch(() => {});
-        await this.transport.sendText(phone, text);
+        const id = await this.transport.sendText(phone, text);
+        // Refused by WhatsApp (no 24-hour window, no billing for templates):
+        // kept, and sent the moment they write (deliverQueuedNotices).
+        noticeTexts.set('notice:' + a.requestId + '|' + store.normPhone(phone), { text, at: Date.now() });
+        deliveryWatch.track(id, { ref: 'notice:' + a.requestId, to: phone });
         told++;
       } catch (e) {
         store.log(this.key, `new-customer details not sent to ${name || phone}: ` + String((e && e.message) || e).slice(0, 80));
@@ -4251,6 +4268,36 @@ Baaki ${payments.money(hold.due)} pay hone tak ${order.id} hold pe hai${custPhon
     }
     store.log(this.key, `${a.requestId}: new-customer details sent to ${told} of ${Object.keys(team).length} (${Object.values(team).join(', ')})`);
     return told;
+  }
+
+  // NOTICES THAT NEVER ARRIVED (the new-customer details to Tez Expert), sent
+  // the moment that person writes. 29 Sep, live: Alam ji's REGAL99 notice was
+  // refused - 131042 no billing for the template, 131047 no 24-hour window -
+  // while Shubham Kumar, who had written recently, got it.
+  async deliverQueuedNotices(m) {
+    const p = store.normPhone(m.from);
+    if (!p) return 0;
+    let sent = 0;
+    for (const u of deliveryWatch.allUndelivered()) {
+      if (!String(u.ref).startsWith('notice:') || !Object.keys(u.to || {}).includes(p)) continue;
+      const kept = noticeTexts.get(u.ref + '|' + p);
+      if (!kept || kept.done || !kept.text) {
+        deliveryWatch.delivered(u.ref, p);
+        continue;
+      }
+      try {
+        const text = lang.for(m.chatId)('(Sent earlier, but WhatsApp could not deliver it then)\n\n', '(Pehle bheja tha, par tab pahunch nahi paya)\n\n') + kept.text;
+        const id = await this.transport.sendText(p, text);
+        deliveryWatch.track(id, { ref: u.ref, to: p });
+        deliveryWatch.delivered(u.ref, p);
+        noticeTexts.set(u.ref + '|' + p, { done: true, at: Date.now() });
+        sent++;
+        store.log(this.key, `${u.ref}: sent to ${p} now that they wrote — it had not reached them`);
+      } catch (e) {
+        store.log(this.key, `${u.ref}: could not send to ${p} again: ` + String((e && e.message) || e).slice(0, 80));
+      }
+    }
+    return sent;
   }
 
   // AN APPROVER WHO WRITES TO THE BOT, with requests that never reached them
@@ -4315,6 +4362,26 @@ Baaki ${payments.money(hold.due)} pay hone tak ${order.id} hold pe hai${custPhon
     for (const ap of approvers) {
       const latest = lastIn(ap).pop();
       if (latest && Date.now() - latest < 22 * 60 * 60 * 1000) resent += await this.resendUndelivered({ from: ap, chatId: ap + '@cloud' }).catch(() => 0);
+    }
+    // NEW-CUSTOMER NOTICES from the last three days that went to a Tez Expert
+    // member whose window was shut (29 Sep: Alam ji and REGAL99): queued, and
+    // sent when they write.
+    const team = Object.keys((config.creation && config.creation.accountCreatedTeam) || {}).map((p) => store.normPhone(p));
+    const since = new Date(Date.now() - 3 * DAY).toISOString();
+    for (const e of approvalLog.between(since, '2100-01-01').filter((x) => x.kind === 'account' && x.event === 'approved')) {
+      const at = Date.parse(e.at) || 0;
+      const req = approvalLog.between('2000-01-01', '2100-01-01').find((x) => x.kind === 'account' && x.id === e.id && x.event === 'requested') || {};
+      for (const ph of team) {
+        const key = 'notice:' + e.id + '|' + ph;
+        if (noticeTexts.get(key)) continue; // already kept, sent or done
+        const before = lastIn(ph).filter((x) => x <= at).pop();
+        if (before && at - before < DAY) continue; // their window was open: it went
+        noticeTexts.set(key, { text: accountCreatedText({ ...e, requestId: e.id }, e.username, req.by || e.openedBy || null, e.by), at: Date.now() });
+        deliveryWatch.markUndelivered('notice:' + e.id, ph, 'their 24-hour window was shut when it was sent');
+        marked++;
+        const latest = lastIn(ph).pop();
+        if (latest && Date.now() - latest < 22 * 60 * 60 * 1000) resent += await this.deliverQueuedNotices({ from: ph, chatId: ph + '@cloud' }).catch(() => 0);
+      }
     }
     if (marked || resent) store.log(this.key, `account requests that never reached the approver: ${marked} marked, ${resent} sent again now`);
     return { marked, resent };

@@ -611,6 +611,15 @@ async function main() {
       const toShubham = customer.transport.outbox.filter((o) => String(o.to).includes('919122781913')).map((o) => o.text || '').join('\n');
       check('a created customer\'s details go to Alam ji and Shubham Kumar', told === 2 && /New customer created/.test(toAlam) && /New customer created/.test(toShubham), JSON.stringify(customer.transport.outbox.map((o) => o.to)));
       check('...with the details: name, GSTIN, address, portal login, who opened and who approved', /UNDELIVERED MOTORS/.test(toAlam) && /08AAPCR8256F1ZU/.test(toAlam) && /Jaipur/.test(toAlam) && /undelivered_motors/.test(toAlam) && /Nirmal/.test(toAlam) && /Arun Sir/.test(toAlam), toAlam);
+      // 29 Sep, live: WhatsApp refused Alam ji's copy (no window, no billing).
+      const alamMsg = customer.transport.outbox.find((o) => String(o.to).includes('919217030408') && /New customer created/.test(o.text || ''));
+      await dw.onFailed(customer, { id: alamMsg && (alamMsg.id || alamMsg.wamid), to: '919217030408', code: 131047, why: 'Re-engagement message' });
+      check('a notice WhatsApp refused is kept for that person', dw.undeliveredFor('notice:WA-UNDEL1').includes('919217030408'), JSON.stringify(dw.allUndelivered()));
+      customer.transport.outbox.length = 0;
+      await customer.transport.injectIncoming({ id: 'wamid.alam-hi', from: '919217030408', chatId: 'sim-919217030408', isGroup: false, body: 'Hi', mediaType: 'chat' });
+      const again = customer.transport.outbox.filter((o) => String(o.to).includes('919217030408')).map((o) => o.text || '').join('\n');
+      check('...and sent to them the moment they write', /New customer created/.test(again) && /UNDELIVERED MOTORS/.test(again) && /(pahunch nahi paya|could not deliver)/i.test(again), again.slice(0, 200));
+      check('...only once', !dw.undeliveredFor('notice:WA-UNDEL1').includes('919217030408'));
     } finally {
       cc.unpark('WA-UNDEL1');
       dw.delivered('WA-UNDEL1', ARUN);
