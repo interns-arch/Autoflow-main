@@ -54,7 +54,9 @@ const ok = (name, cond, detail) => {
   const chat = 'sim-' + SALES;
   const say = async (body) => {
     bot.transport.outbox.length = 0;
-    await bot.transport.injectIncoming({ id: 'wamid.staff-' + Math.random(), from: SALES, chatId: chat, isGroup: false, body, hasMedia: false, mediaType: 'chat' });
+    // "text", as the Cloud API sends a typed message (29 Sep, live: the agent
+    // only took "chat", so it never saw a real message).
+    await bot.transport.injectIncoming({ id: 'wamid.staff-' + Math.random(), from: SALES, chatId: chat, isGroup: false, body, hasMedia: false, mediaType: 'text' });
     const out = bot.transport.outbox.filter((o) => String(o.to || '').indexOf(SALES) >= 0).map((o) => o.text || (o.fileName ? '[file ' + o.fileName + ']' : '')).join('\n---\n');
     console.log('\n  > ' + body + '\n  < ' + out.replace(/\n/g, '\n    '));
     return out;
@@ -75,6 +77,13 @@ const ok = (name, cond, detail) => {
   const r5 = await say('Customer Testing ke liye naya account banana hai, number 9812345670');
   ok('a new account for a number: the form starts for it, not asking the number again', /9812345670/.test(r5) && !/WhatsApp number bhejiye/i.test(r5), r5);
   ok('the replies are written by the model, not the desk templates', !/^Theek hai, Kalra Motors\. Parts bataiye\.$/m.test(r2));
+  // 29 Sep, live (Nirmal): a new customer, misspelt, then the number.
+  require('../src/core/customerCreate').cancel(chat);
+  const n1 = await say('Costamber creat karni h');
+  ok('"Costamber creat karni h" from a salesman starts the account form — not "send your firm details, the team will do it"', !/team account (bana|create kar) degi/i.test(n1) && /(number|whatsapp|mobile|GST)/i.test(n1), n1);
+  const n2 = await say('6378766940');
+  ok('...and the number goes into that form, not "no customer found, write customer bana do"', !/customer bana do/i.test(n2) && !/koi customer nahi mila/i.test(n2), n2);
+  require('../src/core/customerCreate').cancel(chat);
 
   console.log('\n' + pass + ' passed, ' + fail + ' failed\n');
   process.exit(fail ? 1 : 0);

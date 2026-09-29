@@ -143,7 +143,11 @@ function build() {
 const APPROVAL_WORDS = /^\s*(ok+|okay|okk+|haan|ha+n?|yes|yess|y|no|nahi|nhi|approve[d]?|reject(ed)?|done|theek|thik)\b[\s\S]{0,40}$/i;
 function takes(bot, m) {
   if (!enabled() || m._desk) return false;
-  if (m.buttonId || m.hasMedia || (m.mediaType && m.mediaType !== 'chat')) return false;
+  // A typed message is "text" from the Cloud API and "chat" from the linked
+  // transport and the simulator. 29 Sep, live: only "chat" was let through,
+  // so no real WhatsApp message ever reached this agent - Nirmal's "Costamber
+  // creat karni h" went to the desk's small talk ("…Mahesh ji…").
+  if (m.buttonId || m.hasMedia || (m.mediaType && !['chat', 'text'].includes(String(m.mediaType)))) return false;
   const body = String(m.body || '').trim();
   if (!body) return false;
   const p = store.normPhone(m.from);
