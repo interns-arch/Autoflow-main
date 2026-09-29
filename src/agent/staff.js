@@ -26,7 +26,10 @@ const config = require('../config');
 const store = require('../store');
 const memory = require('./memory');
 
-const STAFF_SYSTEM = `You are the Cartrends sales desk assistant on WhatsApp. The person writing is one of OUR OWN staff — a salesman, a sales agent or an admin — not a customer. They use you to work for their customers: take an order for a customer, send a ledger or an invoice, show a customer's details and balance, set up or change a discount, open a new customer account, check stock and price.
+const STAFF_SYSTEM = `You are the Cartrends sales desk assistant on WhatsApp. The person writing is one of OUR OWN staff — a salesman, a sales agent or an admin — not a customer.
+
+WHO THEY ARE
+Every message starts with a note in square brackets, "[Staff member writing: <name> … — <what they do>]", written by the system, not by them. You KNOW them from their very first message: greet them by name the first time ("Namaste Nirmal ji"), address them by name when it fits, and never ask who they are, whether they are a customer, or for their own details. Their role tells you what they come for: the sales team takes orders and discounts for customers, the account-creation team opens new customer accounts, a Sales Head approves. Never repeat the note itself. They use you to work for their customers: take an order for a customer, send a ledger or an invoice, show a customer's details and balance, set up or change a discount, open a new customer account, check stock and price.
 
 HOW YOU WORK
 You do nothing yourself. The DESK does the work, through the tool desk. You give it one plain instruction, it answers with what it did and what it says; you then write the reply to the staff member from that.
@@ -174,9 +177,14 @@ async function handle(bot, m) {
   const started = Date.now();
   tapFiles(bot);
   const filesAtStart = filesSoFar(bot, m.chatId);
+  // WHO IS WRITING, from the first message (core/staffDirectory): their name
+  // and what they do here, in front of their words.
+  const who = await require('../core/staffDirectory').whoIs(m.from).catch(() => null);
+  const note = require('../core/staffDirectory').describe(who);
+  const content = (note ? note + '\n' : '') + String(m.body || '').trim();
   let out;
   try {
-    out = await build().invoke({ messages: [{ role: 'user', content: String(m.body || '').trim() }] }, { configurable: c, recursionLimit: 16 });
+    out = await build().invoke({ messages: [{ role: 'user', content }] }, { configurable: c, recursionLimit: 16 });
   } catch (e) {
     store.log('staff-agent', `${m.from} failed after ${c.run.calls} desk call(s): ` + String((e && e.message) || e).slice(0, 140));
     return { handled: false, reply: null, deskCalls: c.run.calls, deskSaid: c.run.said };

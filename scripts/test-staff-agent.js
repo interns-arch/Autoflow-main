@@ -63,6 +63,11 @@ const ok = (name, cond, detail) => {
   };
 
   console.log('\nA SALESMAN, UNDERSTOOD BY THE STAFF AGENT\n');
+  // 29 Sep, founder: "each and every sales agent / creation team - the bot
+  // knows him from the first message".
+  config.creation.team = { ...(config.creation.team || {}), [SALES]: 'Nirmal Singla' };
+  const r0 = await say('Hi');
+  ok('from the very first message the salesman is greeted by name', /Nirmal/i.test(r0) && !/(aap kaun|who are you|customer ho|your (firm|shop) details)/i.test(r0), r0);
   const r1 = await say('order karna hai 9811122233');
   ok('"order karna hai <number>" is understood: it does not ask for the number', !/number bhejiye|send the (customer'?s )?number/i.test(r1) && /Kalra/i.test(r1), r1);
   let r2 = r1;
