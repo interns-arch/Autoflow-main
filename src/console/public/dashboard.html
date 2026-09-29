@@ -304,8 +304,8 @@
       `<div class="bar">${tabs}<input type="search" id="q" placeholder="Search name, phone, GSTIN, order, agent…" value="${esc(search)}" /></div>
        ${dates}${perDay}
        <div class="bar">${chips}<span style="flex:1"></span>
-         <button class="dl" id="dl1" title="Every field of the rows shown below">⬇ Download CSV (${list.length})</button>
-         <button class="dl" id="dlAll" title="One CSV per tab, with the search applied">⬇ Download all</button></div>
+         <button class="dl" id="dl1" title="Every field of the rows shown below, as an Excel file">⬇ Download Excel (${list.length})</button>
+         <button class="dl" id="dlAll" title="One Excel file, a sheet per tab - each tab's own dates, with the search applied">⬇ Download all (Excel)</button></div>
        <div class="panel">${list.length ? `<table><thead><tr>${T.cols.map((c) => `<th>${esc(c)}</th>`).join('')}</tr></thead><tbody>${rows}</tbody></table>` : '<div class="empty">Nothing here.</div>'}</div>
        <p class="muted" style="font-size:12px">Click a row for every detail.</p>`;
     app.querySelectorAll('[data-tab]').forEach((b) => (b.onclick = () => { tab = b.dataset.tab; filter = 'all'; render(); }));
@@ -325,17 +325,15 @@
     if (byF) byF.onchange = () => { byField = byF.value; saveRange(); render(); };
     const qi = document.getElementById('q');
     qi.oninput = () => { search = qi.value.trim().toLowerCase(); const pos = qi.selectionStart; render(); const n = document.getElementById('q'); n.focus(); n.setSelectionRange(pos, pos); };
-    document.getElementById('dl1').onclick = () => download(tab, list, filter);
-    document.getElementById('dlAll').onclick = () => {
-      Object.keys(TABS).forEach((k, i) =>
-        setTimeout(() => download(k, rowsOf(k).filter((x) => !search || JSON.stringify(x).toLowerCase().includes(search)), 'all', k), i * 400),
-      );
-    };
+    document.getElementById('dl1').onclick = () => download(tab, list, filter).catch((e) => alert('Could not make the Excel file: ' + e.message));
+    document.getElementById('dlAll').onclick = () => downloadAll().catch((e) => alert('Could not make the Excel file: ' + e.message));
   }
 
-  // CSV DOWNLOAD — exactly the rows shown (tab, status filter, search), with
-  // every field, not only the columns on screen. A byte-order mark so Excel
-  // reads names and ₹ correctly.
+  // EXCEL DOWNLOAD (founder, 29 Sep: "dashboard data download in xlsx") —
+  // exactly the rows shown (tab, status filter, search, the tab's dates),
+  // with every field, not only the columns on screen. Dates are Excel dates
+  // and money is a number, so the sheet sorts and sums; the headings carry a
+  // filter. The writer is loaded from our own server on the first download.
   const HEAD = {
     id: 'Request / order', requestedAt: 'Requested', decidedAt: 'Decided', at: 'Date', status: 'Status', customer: 'Customer',
     customerId: 'Customer portal id', phone: 'WhatsApp', gst: 'GSTIN', businessType: 'Business type', contactPerson: 'Contact person',
@@ -346,10 +344,13 @@
     checkedBy: 'Checked by', received: 'Received',
   };
   const DATES = new Set(['requestedAt', 'decidedAt', 'at']);
-  function csvCell(v) {
-    const s = v === null || v === undefined ? '' : String(v);
-    return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
-  }
+  const MONEY = new Set(['amount', 'due', 'received']);
+  const EMPTY = {
+    customers: ['id', 'requestedAt', 'decidedAt', 'status', 'customer', 'phone', 'gst', 'openedBy', 'approvedBy', 'rejectedBy', 'homeBranch'],
+    orders: ['id', 'at', 'status', 'customer', 'placedBy', 'approvedBy', 'rejectedBy', 'portalOrder', 'lines', 'amount'],
+    discounts: ['id', 'requestedAt', 'decidedAt', 'status', 'customer', 'asked', 'result', 'createdBy', 'approvedBy', 'rejectedBy'],
+    payments: ['id', 'at', 'customer', 'due', 'detail', 'status', 'checkedBy', 'received'],
+  };
   // The portal's facts sit in a nested object: in the file each gets its own
   // column ("Portal: status", "Portal: invoiceNo" …).
   const flat = (r) => {
@@ -360,36 +361,78 @@
     }
     return o;
   };
-  function download(which, rowsIn, flt) {
+  // One cell: a real date, a real number for money, text for the rest.
+  function cell(k, v) {
+    if (v === null || v === undefined || v === '') return '';
+    if (DATES.has(k)) { const d = new Date(v); return isNaN(d) ? String(v) : d; }
+    if (MONEY.has(k) || /(^|\.)(amount|total|value|due)$/i.test(k)) {
+      const n = Number(String(v).replace(/[₹,\s]|Rs\.?/gi, ''));
+      if (Number.isFinite(n)) return n;
+    }
+    if (Array.isArray(v)) return v.map((x) => (x && typeof x === 'object' ? Object.values(x).join(' ') : x)).join('; ');
+    if (typeof v === 'object') return JSON.stringify(v);
+    if (typeof v === 'number' || typeof v === 'boolean') return v;
+    return String(v);
+  }
+  let xlsxLoading = null;
+  function xlsxLib() {
+    if (window.XLSX) return Promise.resolve(window.XLSX);
+    if (!xlsxLoading) {
+      xlsxLoading = new Promise((ok, fail) => {
+        const s = document.createElement('script');
+        s.src = '/dashboard/xlsx.js';
+        s.onload = () => (window.XLSX ? ok(window.XLSX) : fail(new Error('the Excel writer did not load')));
+        s.onerror = () => { xlsxLoading = null; fail(new Error('the Excel writer could not be loaded')); };
+        document.head.appendChild(s);
+      });
+    }
+    return xlsxLoading;
+  }
+  function sheetOf(XLSX, which, rowsIn) {
     const rows = rowsIn.map(flat);
     const keys = [];
     for (const r of rows) for (const k of Object.keys(r)) if (!keys.includes(k)) keys.push(k);
-    // Nothing to export still gives the headings, so the file is recognisable.
-    if (!keys.length) {
-      const EMPTY = {
-        customers: ['id', 'requestedAt', 'decidedAt', 'status', 'customer', 'phone', 'gst', 'openedBy', 'approvedBy', 'rejectedBy', 'homeBranch'],
-        orders: ['id', 'at', 'status', 'customer', 'placedBy', 'approvedBy', 'rejectedBy', 'portalOrder', 'lines', 'amount'],
-        discounts: ['id', 'requestedAt', 'decidedAt', 'status', 'customer', 'asked', 'result', 'createdBy', 'approvedBy', 'rejectedBy'],
-        payments: ['id', 'at', 'customer', 'due', 'detail', 'status', 'checkedBy', 'received'],
-      };
-      keys.push(...(EMPTY[which] || ['id']));
-    }
-    const fmt = (k, v) => (DATES.has(k) && v ? new Date(v).toLocaleString('en-IN', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : v);
-    const lines = [keys.map((k) => csvCell(HEAD[k] || (k.startsWith('portal.') ? 'Portal: ' + k.slice(7) : k))).join(',')];
-    for (const r of rows) lines.push(keys.map((k) => csvCell(fmt(k, r[k]))).join(','));
-    const blob = new Blob(['﻿' + lines.join('\r\n') + '\r\n'], { type: 'text/csv;charset=utf-8' });
-    const day = new Date().toISOString().slice(0, 10);
-    // The date range in the file name, so a download says which days it holds.
-    useTab(which); // this file's own tab range, for its name
+    // Nothing to export still gives the headings, so the sheet is recognisable.
+    if (!keys.length) keys.push(...(EMPTY[which] || ['id']));
+    const head = keys.map((k) => HEAD[k] || (k.startsWith('portal.') ? 'Portal: ' + k.slice(7) : k));
+    const body = rows.map((r) => keys.map((k) => cell(k, r[k])));
+    const ws = XLSX.utils.aoa_to_sheet([head, ...body], { cellDates: true, dateNF: 'dd-mmm-yyyy hh:mm' });
+    // Wide enough to read, never wider than a screen.
+    ws['!cols'] = keys.map((k, c) => {
+      let w = String(head[c]).length;
+      for (const row of body) { const v = row[c]; w = Math.max(w, v instanceof Date ? 17 : String(v).length); }
+      return { wch: Math.min(60, Math.max(8, w + 2)) };
+    });
+    if (ws['!ref']) ws['!autofilter'] = { ref: ws['!ref'] };
+    return ws;
+  }
+  const sheetName = (which) => String((TABS[which] && TABS[which].label) || which).replace(/[\\/?*[\]:]/g, ' ').slice(0, 31);
+  // The date range in the file name, so a download says which days it holds.
+  function spanOf(which) {
+    useTab(which);
+    const day = ymd(new Date());
     const [bf, bt] = bounds();
-    const span = range === 'all' ? null : (bf ? ymd(bf) : 'start') + '-to-' + (bt ? ymd(new Date(+bt - 1)) : day);
-    const name = ['cartrends', which, flt && flt !== 'all' ? flt.replace(/\s+/g, '-') : null, span, search ? 'search-' + search.replace(/[^a-z0-9]+/gi, '-').slice(0, 20) : null, day].filter(Boolean).join('_') + '.csv';
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = name;
-    document.body.appendChild(a);
-    a.click();
-    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+    return range === 'all' ? null : (bf ? ymd(bf) : 'start') + '-to-' + (bt ? ymd(new Date(+bt - 1)) : day);
+  }
+  const searchPart = () => (search ? 'search-' + search.replace(/[^a-z0-9]+/gi, '-').slice(0, 20) : null);
+  async function download(which, rowsIn, flt) {
+    const XLSX = await xlsxLib();
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, sheetOf(XLSX, which, rowsIn), sheetName(which));
+    const name = ['cartrends', which, flt && flt !== 'all' ? flt.replace(/\s+/g, '-') : null, spanOf(which), searchPart(), ymd(new Date())].filter(Boolean).join('_') + '.xlsx';
+    useTab(tab); // back to the tab on screen
+    XLSX.writeFile(wb, name, { compression: true });
+  }
+  // Every tab in one workbook: a sheet each, each over its own tab's dates.
+  async function downloadAll() {
+    const XLSX = await xlsxLib();
+    const wb = XLSX.utils.book_new();
+    for (const k of Object.keys(TABS)) {
+      const rows = rowsOf(k).filter((x) => !search || JSON.stringify(x).toLowerCase().includes(search));
+      XLSX.utils.book_append_sheet(wb, sheetOf(XLSX, k, rows), sheetName(k));
+    }
+    useTab(tab);
+    XLSX.writeFile(wb, ['cartrends', 'dashboard', searchPart(), ymd(new Date())].filter(Boolean).join('_') + '.xlsx', { compression: true });
   }
 
   load();

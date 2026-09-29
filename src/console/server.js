@@ -67,7 +67,7 @@ function missed(req) {
   misses.set(ip, { n: fresh ? m.n + 1 : 1, at: fresh ? m.at : Date.now() });
   store.log('console', `wrong dashboard key from ${ip}`);
 }
-const OPEN_PATHS = new Set(['/webhook/wa', '/login', '/logout', '/dashboard', '/api/dashboard', '/favicon.ico']);
+const OPEN_PATHS = new Set(['/webhook/wa', '/login', '/logout', '/dashboard', '/dashboard/xlsx.js', '/api/dashboard', '/favicon.ico']);
 
 function loginPage(msg, next) {
   const esc = (s) => String(s || '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -126,6 +126,14 @@ function mountGate(app) {
 function mountDashboard(app) {
   app.get('/', (req, res) => res.redirect('/dashboard'));
   app.get('/dashboard', (req, res) => res.sendFile(path.join(__dirname, 'public', 'dashboard.html')));
+  // The Excel writer the page builds its downloads with (founder, 29 Sep:
+  // "dashboard data download in xlsx") - the xlsx package the server already
+  // has, served from here rather than a CDN. A library, no data: open like
+  // the page itself.
+  app.get('/dashboard/xlsx.js', (req, res) => {
+    res.set('Cache-Control', 'public, max-age=86400');
+    res.sendFile(require.resolve('xlsx/dist/xlsx.full.min.js'));
+  });
   app.get('/api/dashboard', async (req, res) => {
     const key = String(req.query.key || req.get('x-dashboard-key') || '');
     if (!config.dashboardKey) return res.status(503).json({ error: 'DASHBOARD_KEY is not set on the server' });
