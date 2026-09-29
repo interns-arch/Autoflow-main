@@ -443,6 +443,33 @@ function start(chatId, phone, t, opts) {
   return t(lead + '\n\n' + first.ask[1], lead + '\n\n' + first.ask[1]);
 }
 
+// WHAT EACH FIELD WANTS, for Gemini to read a typed reply against.
+const WANTS = {
+  phoneFor: "The WhatsApp number of the customer whose account is being opened (not the sender's own). value: 10 digits.",
+  gstNo: 'The firm\'s GST number (GSTIN, 15 characters, e.g. 06CIYPK2053H1ZZ). value: the GSTIN alone, no spaces. Only if they say the firm has NO GST registration at all is it a skip (that sends the account to a person); not having the number to hand right now is unclear.',
+  name: 'The firm or shop name. value: the name alone.',
+  businessType: 'The kind of business. value: one of "retailer", "wholesaler", "garage", "fleet".',
+  contactPerson: "The contact person's name. value: the name alone.",
+  contactPhone: 'The contact person\'s phone number. value: 10 digits — or "same" if it is the number they are writing from.',
+  panNo: 'PAN number (10 characters, e.g. AABCU9603R), optional. value: the PAN alone.',
+  email: 'Email address (invoices go to it). value: the email address alone.',
+  address: 'The full shop address. value: the address as written.',
+  city: 'The city. value: the city name.',
+  state: 'The state. value: the state name.',
+  pin: 'The 6-digit PIN code. value: the 6 digits.',
+  shopPhoto: 'A PHOTO of the shop front is wanted here, so typed words are not the answer: saying they have no photo is a skip; anything else about the photo is unclear.',
+  location: 'The shop LOCATION shared from WhatsApp (attach → Location) is wanted here, so typed words are not the answer: saying they cannot share it is a skip; anything else about it is unclear.',
+  creditLimit: 'The credit limit in rupees for this customer. value: the number only ("1 lakh" -> 100000, "50k" -> 50000).',
+  collectionDays: 'How many days the customer has to pay each bill (1 to 30). value: the number only.',
+  dob: "The owner's date of birth, optional. value: DD/MM/YYYY.",
+  bankDetails: 'Bank account number, IFSC and bank name, optional. value: as written.',
+  remarks: 'Anything else they want to add, optional ("nahi", "kuch nahi" is a skip). value: as written.',
+};
+function fieldWants(field, form) {
+  const w = WANTS[field.key] || `The ${field.key}. value: as written.`;
+  return `${w}${field.req ? '' : ' (Optional.)'}${form.forSomeoneElse ? ' The sender is opening this account for someone else.' : ''}`;
+}
+
 // One answer. `m` is the whole message, so a photo or a dropped pin can be
 // the answer as easily as text.
 //
@@ -453,10 +480,37 @@ async function answer(chatId, m, text, t) {
   const field = fieldAt(form.idx);
   if (!field) return null;
 
-  const said = String(text || '').trim();
+  let said = String(text || '').trim();
   form.at = Date.now();
 
-  if (QUIT.test(said) || (said.length <= 90 && QUIT_IN.test(said))) {
+  // GEMINI READS THE TYPED REPLY (founder, 29 Sep) against what this field
+  // wants and the chat so far: an answer (its value pulled out of the
+  // sentence), a skip, a way out, a message of its own, or unclear. The value
+  // then goes through the field's own checks below, as if typed that way.
+  // A photo, a pin or a document is read by vision as before. No model: the
+  // patterns below read it, as they always did.
+  const hasMedia = Boolean(m && (m.mediaBase64 || m.location)) || !['', 'chat', 'text', 'interactive', 'button'].includes(String((m && m.mediaType) || '').toLowerCase());
+  let read = null;
+  if (said && !hasMedia) {
+    read = await require('./replyReader').readFormReply({
+      flow: form.byName ? `opening a new customer account, filled in by sales agent ${form.byName}` : 'a customer opening their own account',
+      step: fieldWants(field, form),
+      question: field.ask[1],
+      reply: said,
+      phone: store.normPhone((m && m.from) || form.phone),
+    });
+  }
+  if (read) {
+    if (read.intent === 'new') {
+      store.log('create', `${chatId}: "${said.slice(0, 50)}" is not an answer to ${field.key} (Gemini) - passed on, form waits`);
+      return null;
+    }
+    if (read.intent === 'unclear') return { reply: read.say || field.ask[1], done: false, form };
+    if (read.intent === 'skip') said = 'skip';
+    if (read.intent === 'answer') said = read.value;
+  }
+
+  if (read ? read.intent === 'quit' : QUIT.test(said) || (said.length <= 90 && QUIT_IN.test(said))) {
     open.delete(chatId);
     store.log('create', `${chatId}: customer form cancelled by the customer`);
     return {
@@ -494,7 +548,7 @@ async function answer(chatId, m, text, t) {
     };
   }
 
-  if (notAnAnswer(field, m, said)) {
+  if ((!read || hasMedia) && notAnAnswer(field, m, said)) {
     store.log('create', `${chatId}: "${said.slice(0, 50) || '(' + ((m && m.mediaType) || 'media') + ')'}" is not an answer to ${field.key} - passed on, form waits`);
     return null;
   }

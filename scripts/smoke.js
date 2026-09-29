@@ -2627,7 +2627,7 @@ async function main() {
       check('...and is told only once', (await require('../src/core/discountWatch').checkOnce(customer)).length === 0);
       cr20.team = teamWas22;
 
-      // ---- a yes typed any way at all (29 Sep, live: Shubham Maurya) ----
+      // ---- a yes typed any way at all (29 Sep, live: a sales agent) ----
       // "Hnnn", "Hn", "Ofcourse", "Haaaaan" were each answered with the same
       // question again. The model reads the reply against the question; with
       // no model, the fallback still reads a stretched word as its short self.

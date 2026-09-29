@@ -112,6 +112,39 @@ const quotable = require('../core/chatState').slot('quotable');
 const rateOptions = require('../core/chatState').slot('rateOptions');
 const discountSetup = require('../core/discountSetup');
 const replyReader = require('../core/replyReader');
+
+// WHAT EACH STEP OF THE DISCOUNT SETUP WANTS, for Gemini to read the reply
+// against (core/replyReader.readFormReply). The value it pulls out is then
+// read by the step exactly as if it had been typed that way.
+const YESNO = (what) => `A yes or a no: ${what}. value: "yes" or "no".`;
+const DISCOUNT_STEP = {
+  customer: (st) =>
+    st.candidates
+      ? 'Which customer: the list number of one shown (1-6), or a 10-digit mobile number, a GSTIN or a shop name. value: that number, GSTIN or name alone (a mobile as digits only).'
+      : 'Which customer the discount is for: a 10-digit mobile number, a GSTIN or a shop name. value: that alone (a mobile as digits only).',
+  confirmCustomer: (st) =>
+    YESNO(`is ${(st.row && st.row.name) || 'the customer shown'} the right customer, and go on setting up their discount`) +
+    ' If instead they send a different mobile or GST number, it is an answer with that number (digits / GSTIN only) as the value.',
+  pickRule: (st) => `Which existing discount rule to change: its list number (1 to ${(st.rules || []).length}), or a new rule. value: the number, or "new".`,
+  changePrice: () => 'The lowest price in rupees the part may be sold at. value: the number only.',
+  changeValue: () => 'The new discount, in percent. value: the number only, e.g. 12.5.',
+  confirmChange: () => YESNO('send this discount change for approval'),
+  type: () => 'Whether the new rule is for a whole brand or one part number. value: "brand" or "part".',
+  target: (st) =>
+    st.draft && st.draft.kind === 'brand'
+      ? 'The brand the discount is on (a car or parts maker, e.g. Maruti, Bosch, Cartrends). value: the brand name alone.'
+      : 'The part number the discount is on. value: the part number alone, as written.',
+  price: () => 'The lowest price in rupees the part may be sold at. value: the number only.',
+  value: () => 'How much discount, in percent. value: the number only, e.g. 10.',
+  minQty: () => 'The minimum quantity for the discount to apply; nothing given means 1 (that is a skip). value: a whole number.',
+  maxQty: () => 'The maximum quantity the discount applies to, if any (none is a skip). value: a whole number.',
+  minAmount: () => 'The minimum order amount in rupees, if any (none is a skip). value: the number only.',
+  maxAmount: () => 'The maximum order amount in rupees, if any (none is a skip). value: the number only.',
+  duration: () =>
+    'How long the rule lasts from approval. value: like "30 days", "3 months", "1 year" (a bare number is days), or "always" for no end date.',
+  confirm: () => YESNO('send this discount rule to the Dealer Portal for approval (a no starts the rule again)'),
+  more: () => YESNO('set up another discount rule for this customer (a no means finished)'),
+};
 const approvalLog = require('../core/approvalLog');
 const payments = require('../core/payments');
 const advanceOrders = require('../core/advanceOrders');
@@ -3205,6 +3238,12 @@ class CustomerBot {
   // here, so the step logic, and a tap on an old button still sitting in
   // someone's chat, keep working.
   async askDiscount(m, text) {
+    // What was last asked, for Gemini to read the next reply against.
+    const st = discountSetup.get(m.chatId);
+    if (st) {
+      st.lastAsked = String(text || '').slice(0, 600);
+      discountSetup.save(m.chatId, st);
+    }
     if (m._capture) {
       m._capture(text);
       return true;
@@ -3444,6 +3483,12 @@ class CustomerBot {
   async readDiscountYesNo(m, said, question, options) {
     if (m.buttonId === 'DSC_YES' || m.buttonId === 'DSC_MORE_YES') return { answer: 'yes' };
     if (m.buttonId === 'DSC_NO' || m.buttonId === 'DSC_MORE_NO') return { answer: 'no' };
+    // Already read at the top of answerDiscount: only an answer gets here,
+    // and its value is the yes or the no.
+    if (m._read) {
+      const v = String(m._read.value || '').toLowerCase();
+      return { answer: v === 'yes' || v === 'no' ? v : 'unclear' };
+    }
     return replyReader.readReply({ question, reply: said, options, phone: store.normPhone(m.from) });
   }
 
@@ -3458,7 +3503,35 @@ class CustomerBot {
     };
     const skipHint = t(' ("skip" if none)', ' (nahi hai to "skip")');
 
-    if (discountSetup.LATER.test(said) || m.buttonId === 'DSC_LATER') {
+    // GEMINI READS THE REPLY (founder, 29 Sep): against what this step wants
+    // and the chat so far. What it makes of it replaces the patterns below;
+    // the value it pulls out goes through each step's own checks, as typed.
+    // A tapped button needs no reading; no model, and the patterns read it.
+    let quit = discountSetup.LATER.test(said) || m.buttonId === 'DSC_LATER';
+    let read = null;
+    if (!m.buttonId && said && DISCOUNT_STEP[st.step]) {
+      read = await replyReader.readFormReply({
+        flow: 'discount rule setup for a customer',
+        step: DISCOUNT_STEP[st.step](st),
+        question: st.lastAsked,
+        reply: said,
+        phone: store.normPhone(m.from),
+      });
+    }
+    if (read) {
+      quit = read.intent === 'quit';
+      if (read.intent === 'new') {
+        // At "another rule?" the setup is over either way (see 'more').
+        if (st.step === 'more') discountSetup.cancel(m.chatId);
+        return null;
+      }
+      if (read.intent === 'unclear') return next(st.step, read.say || st.lastAsked || t('Sorry, once more?', 'Samajh nahi aaya — ek baar phir bhejiye?'));
+      if (read.intent === 'skip') said = 'skip';
+      if (read.intent === 'answer') said = read.value;
+      m._read = read;
+    }
+
+    if (quit) {
       discountSetup.cancel(m.chatId);
       store.log(this.key, `discount setup left (${st.count} rule(s) sent for approval)`);
       return reply(
@@ -3468,7 +3541,8 @@ class CustomerBot {
       );
     }
     // A price question or a part order in the middle is not an answer here.
-    if (!m.buttonId && /\b(kitne|kitna|rate|stock|hai kya)\b|\?\s*$/i.test(said) && !['confirm', 'confirmChange'].includes(st.step)) return null;
+    // (Only when Gemini did not read it: it tells a question from an answer.)
+    if (!read && !m.buttonId && /\b(kitne|kitna|rate|stock|hai kya)\b|\?\s*$/i.test(said) && !['confirm', 'confirmChange'].includes(st.step)) return null;
 
     // The request, filed and written straight to the Dealer Portal for the
     // Super Admin (founder, 28 Sep: not to the Sales Head any more).
@@ -4520,7 +4594,28 @@ class CustomerBot {
     if (!o) return false;
     if (!this.isOperator(m) && agent.enabled()) return false;
     const said = String(m.body || '').trim();
-    const answer = advanceOrders.readReply(said, m.buttonId);
+    // Gemini reads a typed reply against the offer (founder, 29 Sep); the
+    // patterns only when there is no model. Anything else goes on to be
+    // answered, and the offer stands.
+    let answer = null;
+    // (Not for a long message: this runs on every message while an offer is
+    // open, and a paragraph is not a reply to it.)
+    const read = m.buttonId || !said || said.split(/\s+/).length > 12
+      ? null
+      : await replyReader.readFormReply({
+          flow: 'an offer to book out-of-stock parts in advance',
+          step: YESNO('book these parts in advance (a no, or not wanting them, is a no)'),
+          question: advanceOrders.offerText(o, t),
+          reply: said,
+          phone: store.normPhone(m.from),
+        });
+    if (read) {
+      if (read.intent === 'unclear' && read.say) return reply(read.say);
+      if (read.intent === 'quit') answer = 'no';
+      else if (read.intent === 'answer' && ['yes', 'no'].includes(String(read.value).toLowerCase())) answer = String(read.value).toLowerCase();
+    } else {
+      answer = advanceOrders.readReply(said, m.buttonId);
+    }
     if (!answer) return false;
     const r = await this.etaOfferAnswered(m.chatId, answer === 'yes');
     if (r.none) return false;
