@@ -1825,6 +1825,24 @@ class CustomerBot {
             customerPhone: custPhone.length === 10 ? '91' + custPhone : null,
             agent: customerCreate.agentName(m.from) || null,
           }).catch(() => null);
+          if (hold && hold.chequeAmount > 0) {
+            // A cheque is in but does not cover it all: the total, the
+            // cheque, and what is still to pay (founder, 29 Sep).
+            return reply(
+              t(
+                `${heldFor.name} — the cheque is counted, but the due is not cleared yet:
+
+${payments.breakdown(hold.detail, t)}
+
+${order.id} is on hold until the remaining ${payments.money(hold.due)} is paid${custPhone.length === 10 ? '; the breakdown and the payment QR went to the customer' : ''}. Once our accountant confirms the payment it goes for approval, and you get the order number here.`,
+                `${heldFor.name} — cheque gin liya hai, par baaki abhi pura nahi hua:
+
+${payments.breakdown(hold.detail, t)}
+
+Baaki ${payments.money(hold.due)} pay hone tak ${order.id} hold pe hai${custPhone.length === 10 ? '; ye detail aur payment QR customer ko bhej diya' : ''}. Accountant ke confirm karte hi approval ke liye jayega aur order number yahin milega.`,
+              ),
+            );
+          }
           if (hold) {
             return reply(
               t(
@@ -1861,10 +1879,11 @@ class CustomerBot {
               const sent = await this.requestOrderApproval(order, { by: customerCreate.agentName(m.from) || m.from });
               if (sent) {
                 return reply(
-                  t(
-                    `${forCustomer.name}'s order (${order.id}) has gone to the Sales Head for approval. Once approved it is placed on the portal and you get the order number here.`,
-                    `${forCustomer.name} ka order (${order.id}) Sales Head ko approval ke liye bhej diya. Approve hote hi portal pe place hoga aur order number yahin milega.`,
-                  ),
+                  this.chequeCoveredNote(order, t) +
+                    t(
+                      `${forCustomer.name}'s order (${order.id}) has gone to the Sales Head for approval. Once approved it is placed on the portal and you get the order number here.`,
+                      `${forCustomer.name} ka order (${order.id}) Sales Head ko approval ke liye bhej diya. Approve hote hi portal pe place hoga aur order number yahin milega.`,
+                    ),
                 );
               }
             }
@@ -4096,16 +4115,54 @@ class CustomerBot {
   // billing is one invoice — no new order until the balance is paid, whoever
   // places it). The payment request, the QR and "your balance is settled" go
   // to the CUSTOMER's WhatsApp; the agent hears when the order goes on.
+  // "Total due ₹X, cheque ₹X received - covered" in front of the news that the
+  // order went ahead, when a cheque is why it was not held.
+  chequeCoveredNote(order, t) {
+    const c = order && order.chequeCovered;
+    if (!c) return '';
+    return (
+      t('The due is covered by the cheque, so the order goes ahead:', 'Cheque se baaki pura ho gaya, isliye order aage badh gaya:') +
+      '\n' +
+      payments.breakdown({ owed: c.owed, chequeAmount: c.chequeAmount, cheques: c.cheques, due: 0 }, t) +
+      '\n\n'
+    );
+  }
+
   async holdForPayment(order, customer, opts = {}) {
     const due = await payments.dueOf(customer).catch(() => null);
-    if (!due || payments.settled(due.due)) return null;
+    if (!due || payments.settled(due.due)) {
+      // CLEARED BY A CHEQUE (founder, 29 Sep): Odoo still shows a due, but the
+      // cheques they gave cover it - the order goes ahead, and whoever is told
+      // it went is told why (order.chequeCovered).
+      if (due && due.chequeAmount > 0 && due.owed >= 1) {
+        order.chequeCovered = { owed: due.owed, chequeAmount: due.chequeAmount, cheques: due.cheques };
+        store.log(this.key, `${order.id}: ${customer.name} owes ${payments.money(due.owed)} in Odoo, covered by cheque(s) of ${payments.money(due.chequeAmount)} - not held`);
+      }
+      return null;
+    }
     const custChat = opts.customerPhone ? store.normPhone(opts.customerPhone) + '@cloud' : null;
     if (custChat) {
       const ct = lang.for(custChat);
-      const text = ct(
-        `Hello ${customer.name}. Your previous balance of ${payments.money(due.due)} is unpaid, so the new order${opts.agent ? ' placed by ' + opts.agent : ''} is on hold. Please pay it with the QR below and reply "payment done" — the order goes ahead as soon as it is confirmed.`,
-        `Namaste ${customer.name}. Aapka pichla ${payments.money(due.due)} baaki hai, isliye naya order${opts.agent ? ' (' + opts.agent + ' ne lagaya)' : ''} ruka hua hai. Neeche QR se pay karke "payment kar diya" likhiye — confirm hote hi order aage badh jayega.`,
-      );
+      // With a cheque in, the total, the cheque and what is left - so they
+      // see the cheque was counted and pay only the rest.
+      const withCheque = due.chequeAmount > 0;
+      const text = withCheque
+        ? ct(
+            `Hello ${customer.name}. Thank you for your cheque — it has been counted.
+
+${payments.breakdown(due, ct)}
+
+The new order${opts.agent ? ' placed by ' + opts.agent : ''} is on hold until the remaining ${payments.money(due.due)} is paid. Please pay it with the QR below and reply "payment done" — the order goes ahead as soon as it is confirmed.`,
+            `Namaste ${customer.name}. Aapka cheque mil gaya hai, shukriya — wo gin liya gaya hai.
+
+${payments.breakdown(due, ct)}
+
+Baaki ${payments.money(due.due)} pay hone tak naya order${opts.agent ? ' (' + opts.agent + ' ne lagaya)' : ''} ruka hua hai. Neeche QR se pay karke "payment kar diya" likhiye — confirm hote hi order aage badh jayega.`,
+          )
+        : ct(
+            `Hello ${customer.name}. Your previous balance of ${payments.money(due.due)} is unpaid, so the new order${opts.agent ? ' placed by ' + opts.agent : ''} is on hold. Please pay it with the QR below and reply "payment done" — the order goes ahead as soon as it is confirmed.`,
+            `Namaste ${customer.name}. Aapka pichla ${payments.money(due.due)} baaki hai, isliye naya order${opts.agent ? ' (' + opts.agent + ' ne lagaya)' : ''} ruka hua hai. Neeche QR se pay karke "payment kar diya" likhiye — confirm hote hi order aage badh jayega.`,
+          );
       try {
         await escalation.ensureWindow(this.transport, store.normPhone(opts.customerPhone), 'Payment due — details follow', customer.name);
         const id = await this.transport.sendToChat(custChat, text);
@@ -4128,7 +4185,7 @@ class CustomerBot {
     store.log(this.key, `${order.id} held: ${customer.name} owes ${payments.money(due.due)} (${req.id})`);
     approvalLog.record({ kind: 'payment', id: req.id, event: 'requested', by: 'bot (order ' + order.id + ')', customer: customer.name, phone: req.phone, detail: 'due ' + payments.money(due.due) + ' before ' + order.id, amount: due.due });
     const qrSent = await this.sendPaymentQr(req, due.due);
-    return { req, due: due.due, qrSent };
+    return { req, due: due.due, owed: due.owed, chequeAmount: due.chequeAmount || 0, cheques: due.cheques || [], detail: due, qrSent };
   }
 
   // The QR for the amount, into the customer's chat. -> true when one went.

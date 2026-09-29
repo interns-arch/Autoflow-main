@@ -151,6 +151,27 @@ async function main() {
     check('...what they still owe is Odoo less the cheque', due && due.due === 4000 && due.owed === 10000 && due.chequeAmount === 6000);
     const said = await require('../src/core/customerLookup')._ledgerFor({ id: 9001, name: 'Cheque Motors', balance: '10000.00' }, (en, hi) => hi);
     check('...and the ledger answer says so, cheque by cheque', /baaki ₹4,000/.test(said) && /004512 · ₹6,000/.test(said) && !/004499/.test(said), said);
+    // THE HOLD SPELLS IT OUT (29 Sep): total due, the cheque, what is left.
+    const pay = require('../src/core/payments');
+    const bd = pay.breakdown(due, (en, hi) => en);
+    check('...the breakdown says total, cheque and what is still to pay', /Total due: Rs\.10,000/.test(bd) && /Cheque received: Rs\.6,000 \(no\. 004512/.test(bd) && /Still to pay: Rs\.4,000/.test(bd), bd);
+    const cb = new CustomerBot();
+    const heldOrder = { id: 'ORD-CHQ1', chatId: 'sim-919800000301', lines: [] };
+    const hold = await cb.holdForPayment(heldOrder, { buyerId: 9001, name: 'Cheque Motors' }, { customerPhone: '919811100009', agent: 'Krishna Kumar' });
+    const toCust = cb.transport.outbox.map((o) => o.text || '').join('\n');
+    check('...short of the due: the order is held for the rest only', hold && hold.due === 4000 && hold.owed === 10000 && hold.chequeAmount === 6000 && heldOrder.status === 'awaitingPayment');
+    check('...and the customer is shown the cheque was counted and what is left', /cheque mil gaya/i.test(toCust) && /Total baaki: Rs\.10,000/.test(toCust) && /Abhi dena hai: Rs\.4,000/.test(toCust), toCust);
+    portal.setMockPdc({
+      balance: { 9001: { balance: '10000.00', customer_outstanding: '10000.00', balance_is_live: true } },
+      cheques: [{ txn_id: 1, acc_id: 9001, pdc_number: '004512', pdc_amount: '10000.00', cheque_date: '2026-10-02', status: 'verified' }],
+    });
+    const freeOrder = { id: 'ORD-CHQ2', chatId: 'sim-919800000301', lines: [] };
+    const none = await cb.holdForPayment(freeOrder, { buyerId: 9001, name: 'Cheque Motors' });
+    check('...covered by the cheque: not held, and the order carries why', none === null && freeOrder.chequeCovered && freeOrder.chequeCovered.chequeAmount === 10000);
+    check('...which the news of the order says', /covered by the cheque/.test(cb.chequeCoveredNote(freeOrder, (en) => en)) && /Still to pay: nil/.test(cb.chequeCoveredNote(freeOrder, (en) => en)));
+
+    // The watch first sees the rejected cheque that was already there.
+    portal.setMockPdc({ balance: {}, cheques: [{ txn_id: 2, acc_id: 9001, status: 'rejected', pdc_amount: '3000.00' }] });
     const told = [];
     const fakeBot = { transport: { sendText: async (to, text) => told.push([to, text]) } };
     const watch = require('../src/core/chequeWatch');

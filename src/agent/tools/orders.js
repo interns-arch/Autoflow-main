@@ -164,6 +164,24 @@ const confirmOrder = tool(
         store.log('agent', 'due check failed: ' + String((e && e.message) || e).slice(0, 90));
         return null;
       });
+      // A cheque is in but does not cover it all (founder, 29 Sep): the
+      // total, the cheque and what is still to pay, all three said.
+      if (hold && hold.chequeAmount > 0) {
+        return JSON.stringify({
+          placed: false,
+          paymentDue: true,
+          totalDue: 'Rs.' + hold.owed,
+          chequeReceived: 'Rs.' + hold.chequeAmount,
+          cheques: hold.cheques.map((c) => ({ number: c.number, amount: 'Rs.' + c.amount, date: c.date, status: c.status })),
+          stillToPay: 'Rs.' + hold.due,
+          paymentRequest: hold.req.id,
+          qrSent: hold.qrSent,
+          why:
+            'Their cheque has been received and counted, but it does not cover everything they owe. Tell them, in their language, all three: the total due (' + ('Rs.' + hold.owed) + '), the cheque received (' + ('Rs.' + hold.chequeAmount) + ', with its number and date), and the amount still to pay (' + ('Rs.' + hold.due) + '). The new order is kept and goes ahead once that remaining amount is paid and confirmed' +
+            (hold.qrSent ? '; a payment QR for the remaining amount has been sent to them just now' : '; our team will share how to pay') +
+            '. When they say they have paid, call payment_done. It is NOT placed and NOT sent for approval yet.',
+        });
+      }
       if (hold) {
         return JSON.stringify({
           placed: false,
@@ -204,6 +222,7 @@ const confirmOrder = tool(
         placed: false,
         sentForApproval: true,
         requestId: order.id,
+        ...chequeFacts(order),
         why: 'orders are placed once the Sales Head approves them. It has gone to him; the customer will get the portal order number when he does. Say exactly that — it is NOT placed yet.',
       });
     }
@@ -223,7 +242,7 @@ const confirmOrder = tool(
         cart: JSON.parse(cartState(order)),
       });
     }
-    return JSON.stringify({ placed: true, orderNumber: res && res.soNumber, backordered: (res && res.backordered) || null });
+    return JSON.stringify({ placed: true, orderNumber: res && res.soNumber, backordered: (res && res.backordered) || null, ...chequeFacts(order) });
   },
   {
     name: 'confirm_order',
@@ -233,6 +252,17 @@ const confirmOrder = tool(
     schema: z.object({}),
   },
 );
+
+// A due that Odoo still shows but their cheque covers (customerBot
+// holdForPayment sets it): said with the news, so they know it was counted.
+function chequeFacts(order) {
+  const c = order && order.chequeCovered;
+  if (!c) return {};
+  return {
+    dueCoveredByCheque: { totalDue: 'Rs.' + c.owed, chequeReceived: 'Rs.' + c.chequeAmount, stillToPay: 'Rs.0' },
+    chequeNote: 'Their cheque covers what they owed, so the order went ahead: mention it in a line (total due, cheque received, nothing left to pay).',
+  };
+}
 
 const cancelOrder = tool(
   async (_input, config) => {
