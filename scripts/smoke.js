@@ -443,6 +443,42 @@ async function main() {
   customer.transport.sendText = hadText7;
   portal.confirm = realConfirm7;
 
+  // 29 Sep, founder: "whatever agent do for customer and it get approved or
+  // decline send msg to both that agent and customer".
+  console.log('\n[5b-vii-b] an agent\'s order or account declined: agent AND customer told');
+  {
+    const AG = '919000000281';
+    const CU = '919000000282';
+    const o9 = orders.getOrCreateDraft('sim-' + AG, 'Decline Test');
+    o9.lines = [{ item: '16510M65L10', partNo: '16510M65L10', qty: 1, source: 'available', available: 5 }];
+    o9.status = 'approval';
+    o9.requestedBy = AG;
+    o9.portalCustomer = { buyerId: 1, name: 'Decline Test Motors', phone: CU };
+    require('../src/store').save();
+    const chatOfWas9 = customer.customerChatOf;
+    customer.customerChatOf = () => 'sim-' + CU;
+    customer.transport.outbox.length = 0;
+    try {
+      await customer.decideOrder({ from: '919999492550', chatId: 'sim-919999492550' }, { yes: false, requestId: String(o9.id).toUpperCase() }, async () => true, (en, hi) => hi);
+      const toAg = customer.transport.outbox.filter((o) => String(o.to).includes(AG)).map((o) => o.text).join('\n');
+      const toCu = customer.transport.outbox.filter((o) => String(o.to).includes(CU)).map((o) => o.text).join('\n');
+      check('an agent\'s order declined: the agent is told', /approve nahi kiya|not approved/i.test(toAg), toAg);
+      check('...and the customer too, kindly', /approve nahi ho paya|could not be approved/i.test(toCu) && /(maaf|sorry)/i.test(toCu), toCu);
+    } finally {
+      customer.customerChatOf = chatOfWas9;
+    }
+    // An account an agent opened, declined.
+    const cc9 = require('../src/core/customerCreate');
+    const form9 = { chatId: 'sim-' + AG, byName: 'Shubham', answers: { requestId: 'WA-DECL9', phone: CU, name: 'DECLINE TEST MOTORS', businessType: 'retailer' } };
+    cc9.park(form9);
+    customer.transport.outbox.length = 0;
+    await customer.decideNewCustomer({ from: '919999492550', chatId: 'sim-919999492550' }, { yes: false, requestId: 'WA-DECL9' }, async () => true, (en, hi) => hi);
+    const toAg9 = customer.transport.outbox.filter((o) => String(o.to).includes(AG)).map((o) => o.text).join('\n');
+    const toCu9 = customer.transport.outbox.filter((o) => String(o.to).includes(CU)).map((o) => o.text || '').join('\n');
+    check('an agent\'s account request declined: the agent is told', /approve nahi kiya|not approved/i.test(toAg9) && /WA-DECL9/.test(toAg9), toAg9);
+    check('...and the customer too', /jaankari chahiye|more information/i.test(toCu9), toCu9);
+  }
+
   // 28 Sep, founder: an order punched and then CANCELLED on the portal (by the
   // Super Admin) - the customer and the salesman are told, and the dashboard
   // shows it.
@@ -2584,6 +2620,10 @@ async function main() {
       customer.transport.outbox.length = 0;
       const told22 = await require('../src/core/discountWatch').checkOnce(customer);
       check('once approved on the portal, the agent is told orders get it from now', told22.some((x) => String(x.ruleId) === '501' && x.status === 'APPROVED') && customer.transport.outbox.some((o) => String(o.to).indexOf(AGENT20) >= 0 && /approve ho gaya — ab se order pe discount lagega/.test(o.text || '')), text20(customer.transport.outbox));
+      // 29 Sep, founder: "the approved msg goes to agent but not to customer".
+      const toCust22 = customer.transport.outbox.filter((o) => String(o.to).indexOf(CUST22) >= 0).map((o) => o.text || '').join('\n');
+      check('...and the CUSTOMER is told too, on their own number, with the discount', /discount set ho gaya|discount is now set/i.test(toCust22) && /15%/.test(toCust22), toCust22 || JSON.stringify(customer.transport.outbox.map((o) => o.to)));
+      check('...and the agent hears that the customer was told', customer.transport.outbox.some((o) => String(o.to).indexOf(AGENT20) >= 0 && /Customer ko bhi bata diya/.test(o.text || '')));
       check('...and is told only once', (await require('../src/core/discountWatch').checkOnce(customer)).length === 0);
       cr20.team = teamWas22;
 
@@ -2599,9 +2639,9 @@ async function main() {
       const asked25 = [];
       require('../src/config').gemini.apiKey = 'test-key';
       ai25._setModel(async (system, user) => {
-        if (!/^You read one WhatsApp reply to a yes\/no question/.test(system)) return { intent: 'other' };
+        if (!/^You are reading one WhatsApp reply from a member of the Cartrends sales team/.test(system)) return { intent: 'other' };
         asked25.push(user);
-        return { answer: /jhakaas/.test(user) ? 'yes' : 'other', why: 'stub' };
+        return { answer: /jhakaas/.test(user) ? 'yes' : 'unclear', why: 'stub', say: 'Matlab bhej doon, sir?' };
       });
       try {
         portal.setMockCustomers([{ id: 1, name: 'Mock Customer', phone: '919000000304', gst_no: '07AAAAA0000A1Z5', address: 'Karol Bagh, Delhi', credit_limit: '50000.00', credit_days: 7, balance: '1200' }]);

@@ -1283,6 +1283,20 @@ module.exports = {
       return { approved: false, superAdminNeeded: Boolean(e && e.superAdminNeeded), why: String((e && e.message) || e).slice(0, 300) };
     }
   },
+  // An ACCOUNT's own mobile, for telling the customer about something done on
+  // their account (a discount approved). null when the portal has none.
+  async accountPhone(accountId) {
+    const id = Number(accountId);
+    if (!id) return null;
+    if (isMock()) {
+      const r = mockCustomers.find((x) => Number(x.id) === id);
+      return (r && (r.phone || r.mobile)) || null;
+    }
+    const a = await api('GET', '/accounts/' + id, null, true, 'admin');
+    const raw = (a && (a.phone || a.mobile)) || null;
+    const ten = String(raw || '').replace(/\D/g, '').slice(-10);
+    return ten.length === 10 ? '91' + ten : null;
+  },
   // The customer's discounts that apply today (core/discountSetup.activeRules),
   // from the same five-minute copy of the rules the prices use.
   // Takes the customer's ACCOUNT id (every caller has one); rules are

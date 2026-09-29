@@ -18,9 +18,12 @@ const waiting = chatState.slot('discount.awaitingPortal'); // ruleId -> { chatId
 const EVERY_MS = 5 * 60 * 1000;
 const GIVE_UP_MS = 14 * 24 * 60 * 60 * 1000;
 
-function watch(ruleId, { chatId, name, what }) {
+// customerPhone: the CUSTOMER the rule is for (founder, 29 Sep: "the approved
+// msg goes to agent but not to customer ... send msg to both that agent and
+// customer"). Told too, on their own number, when the portal decides.
+function watch(ruleId, { chatId, name, what, customerPhone, customerName }) {
   if (!ruleId || !chatId) return;
-  waiting.set(String(ruleId), { chatId, name: name || null, what: what || null, at: Date.now() });
+  waiting.set(String(ruleId), { chatId, name: name || null, what: what || null, customerPhone: customerPhone || null, customerName: customerName || null, at: Date.now() });
   store.log('discount', `rule ${ruleId} is waiting for the Super Admin on the portal (${name || what || ''})`);
 }
 
@@ -64,16 +67,53 @@ async function checkOnce(bot) {
     }
     if (!text) continue;
     waiting.delete(String(w.ruleId));
-    done.push({ ruleId: w.ruleId, status });
-    store.log('discount', `rule ${w.ruleId} is ${status} on the portal — ${w.chatId} told`);
+    // THE CUSTOMER TOO, on an approval or a rejection (not on a rule that
+    // simply vanished - nobody decided anything they need to hear about).
+    const custChat = w.customerPhone && (status === 'APPROVED' || status === 'REJECTED') ? store.normPhone(w.customerPhone) + '@cloud' : null;
+    const toCustomer = custChat && custChat.split('@')[0] !== String(w.chatId).split('@')[0] ? customerText(status, r, w, lang.for(custChat)) : null;
+    if (toCustomer) text += t('\n\nThe customer has been told as well.', '\n\nCustomer ko bhi bata diya hai.');
+    const told = [];
     try {
       const id = await bot.transport.sendToChat(w.chatId, text);
       if (bot.recordOutgoing) bot.recordOutgoing(w.chatId, id, text);
+      told.push('agent');
     } catch (e) {
       store.log('discount', `could not tell ${w.chatId} about rule ${w.ruleId}: ` + String((e && e.message) || e).slice(0, 80));
     }
+    if (toCustomer) {
+      try {
+        const phone = custChat.split('@')[0];
+        await require('./escalation').ensureWindow(bot.transport, phone, 'Your discount — details follow', w.customerName || 'Discount').catch(() => {});
+        const id = await bot.transport.sendToChat(custChat, toCustomer);
+        if (bot.recordOutgoing) bot.recordOutgoing(custChat, id, toCustomer);
+        told.push('customer ' + phone);
+      } catch (e) {
+        store.log('discount', `could not tell the customer ${w.customerPhone} about rule ${w.ruleId}: ` + String((e && e.message) || e).slice(0, 80));
+      }
+    }
+    done.push({ ruleId: w.ruleId, status, told });
+    store.log('discount', `rule ${w.ruleId} is ${status} on the portal — told: ${told.join(', ') || 'nobody'}`);
   }
   return done;
+}
+
+// What the CUSTOMER reads: their discount in plain words, as the portal has
+// it now (the value the Super Admin approved, which may differ from the ask).
+function customerText(status, r, w, t) {
+  const who = w.customerName ? w.customerName + ' ji' : 'ji';
+  const on = r ? (String(r.rule_type).toUpperCase() === 'ITEM' ? 'part ' + r.part_no : r.brand ? r.brand + ' parts' : 'all parts') : null;
+  const pct = r && r.discount_value != null ? r.discount_value + '%' : null;
+  const till = r && r.valid_to ? new Date(r.valid_to).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) : null;
+  if (status === 'APPROVED') {
+    return t(
+      `Good news, ${who} — a ${pct ? pct + ' ' : ''}discount${on ? ' on ' + on : ''} is now set on your account${till ? ', valid till ' + till : ''}. It applies on your orders from now. Thank you for your business!`,
+      `Khushkhabri ${who} — aapke account pe${on ? ' ' + on + ' par' : ''} ${pct ? pct + ' ka ' : ''}discount set ho gaya hai${till ? ', ' + till + ' tak' : ''}. Ab se aapke orders pe lagega. Dhanyavaad!`,
+    );
+  }
+  return t(
+    `Dear ${who}, the discount requested for your account${on ? ' on ' + on : ''} could not be approved this time. Your sales representative will be happy to talk it over with you.`,
+    `${who}, aapke account ke liye${on ? ' ' + on + ' par' : ''} jo discount maanga gaya tha, woh is baar approve nahi ho paya. Aapke sales representative aapse is baare mein baat kar lenge.`,
+  );
 }
 
 let timer = null;

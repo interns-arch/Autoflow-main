@@ -2697,6 +2697,7 @@ class CustomerBot {
       for (const r of discountSetup.forAccount(decision.requestId)) discountSetup.drop(r.id);
       store.log(this.key, `${decision.requestId} rejected by ${who}`);
       approvalLog.record({ kind: 'account', id: decision.requestId, event: 'rejected', by: who, ...approvalLog.accountFacts(req.answers) });
+      await escalation.ensureWindow(this.transport, req.answers.phone, 'Your account — details follow', req.answers.name || 'Account').catch(() => {});
       await this.transport.sendText(
         req.answers.phone,
         t(
@@ -2704,6 +2705,7 @@ class CustomerBot {
           'Account ke liye thodi aur jaankari chahiye — team aapko call karegi.',
         ),
       );
+      await this.tellAccountAgent(req, (tt) => tt(`❌ The account request for ${req.answers.name || req.answers.phone} (${decision.requestId}) was not approved by ${who}. The customer has been told.`, `❌ ${req.answers.name || req.answers.phone} ka account request (${decision.requestId}) ${who} ne approve nahi kiya. Customer ko bata diya hai.`));
       return reply(t(`Rejected. ${req.answers.name} was told.`, `Reject kar diya. ${req.answers.name} ko bata diya.`));
     }
 
@@ -2718,6 +2720,7 @@ class CustomerBot {
       customers.forget(req.answers.phone); // so the next order resolves the NEW account
       store.log(this.key, `${decision.requestId} approved by ${who} — created ${account.username}`);
 
+      await escalation.ensureWindow(this.transport, req.answers.phone, 'Your account — details follow', req.answers.name || 'Account').catch(() => {});
       await this.transport.sendText(
         req.answers.phone,
         t(
@@ -2729,6 +2732,11 @@ class CustomerBot {
       // them on: those already approved are created; the rest are created
       // when their own OK comes.
       const waiting = discountSetup.forAccount(decision.requestId);
+      // The agent who opened it hears it too - with the rules below when
+      // there are some, on its own otherwise.
+      if (!waiting.length) {
+        await this.tellAccountAgent(req, (tt) => tt(`✅ ${req.answers.name || req.answers.phone}'s account is open (${account.username}) — approved by ${who}. The customer has been told.`, `✅ ${req.answers.name || req.answers.phone} ka account khul gaya (${account.username}) — ${who} ne approve kiya. Customer ko bata diya hai.`));
+      }
       if (waiting.length) {
         const lines = [];
         for (const r of waiting) {
@@ -3430,11 +3438,13 @@ class CustomerBot {
 
   // A yes/no step of the discount setup, answered in the agent's own words:
   // the model reads the reply against the question (core/replyReader). A
-  // tapped button needs no reading. -> 'yes' | 'no' | 'other'
+  // tapped button needs no reading.
+  // -> { answer: 'yes'|'no'|'unclear'|'new', say? } — `say` is Gemini's own
+  // line back when it cannot tell, used instead of the same question again.
   async readDiscountYesNo(m, said, question, options) {
-    if (m.buttonId === 'DSC_YES' || m.buttonId === 'DSC_MORE_YES') return 'yes';
-    if (m.buttonId === 'DSC_NO' || m.buttonId === 'DSC_MORE_NO') return 'no';
-    return replyReader.readYesNo({ question, reply: said, options, phone: store.normPhone(m.from) });
+    if (m.buttonId === 'DSC_YES' || m.buttonId === 'DSC_MORE_YES') return { answer: 'yes' };
+    if (m.buttonId === 'DSC_NO' || m.buttonId === 'DSC_MORE_NO') return { answer: 'no' };
+    return replyReader.readReply({ question, reply: said, options, phone: store.normPhone(m.from) });
   }
 
   async answerDiscount(m, said, reply, t) {
@@ -3474,7 +3484,8 @@ class CustomerBot {
         dealerId: st.dealerId || null,
         odooPartnerId: st.odooPartnerId || null,
         accountRequestId: st.accountRequestId || null,
-        phone: st.phone || null,
+        // The customer's own number: told when the portal decides (discountWatch).
+        phone: st.phone || (st.row && (st.row.phone || st.row.mobile)) || null,
         by: st.setBy,
         chatId: m.chatId,
         ...extra,
@@ -3527,7 +3538,7 @@ class CustomerBot {
           discountSetup.save(m.chatId, st);
           return this.answerDiscount(m, said, reply, t);
         }
-        const ans = await this.readDiscountYesNo(m, said, t(`Set up the discount for ${st.row.name}?`, `${st.row.name} ka discount setup karein?`), {
+        const { answer: ans, say } = await this.readDiscountYesNo(m, said, t(`Set up the discount for ${st.row.name}?`, `${st.row.name} ka discount setup karein?`), {
           yes: `this is the right customer, go on with the discount setup for ${st.row.name}`,
           no: 'wrong customer, or do not set it up',
         });
@@ -3540,8 +3551,10 @@ class CustomerBot {
               : t("Then send the right customer's phone number or GST number.", 'Theek hai — sahi customer ka phone number ya GST number bhejiye.'),
           );
         }
+        // A message of its own is answered elsewhere; the customer waits.
+        if (ans === 'new') return null;
         if (ans !== 'yes') {
-          return next('confirmCustomer', t(`Set up the discount for ${st.row.name}? yes or no`, `${st.row.name} ka discount setup karein? haan ya nahi`));
+          return next('confirmCustomer', say || t(`Set up the discount for ${st.row.name}? yes or no`, `${st.row.name} ka discount setup karein? haan ya nahi`));
         }
         // The row is an ACCOUNT (its id is the account id). A rule is made
         // against the customer's DEALER record: found through the Odoo
@@ -3619,11 +3632,12 @@ class CustomerBot {
       // — is not an answer, goes on to be answered, and the change waits.
       // (25 Sep, live: that message was read as a no and the change died.)
       case 'confirmChange': {
-        const ans = await this.readDiscountYesNo(m, said, t('Send this change for approval?', 'Ye change approval ke liye bhejun?'), { yes: 'send the discount change', no: 'do not send it' });
+        const { answer: ans, say } = await this.readDiscountYesNo(m, said, t('Send this change for approval?', 'Ye change approval ke liye bhejun?'), { yes: 'send the discount change', no: 'do not send it' });
         if (ans === 'no') {
           discountSetup.cancel(m.chatId);
           return reply(t('Not sent. Nothing was changed.', 'Theek hai, nahi bheja. Kuch change nahi hua.'));
         }
+        if (ans === 'unclear') return next('confirmChange', say || t('Send this change for approval? Yes or no.', 'Ye change approval ke liye bhejun? Haan ya Nahi.'));
         if (ans !== 'yes') return null;
         return this.sendDiscountChange(m, st, submit, reply, t);
       }
@@ -3728,7 +3742,7 @@ class CustomerBot {
         ]);
       }
       case 'confirm': {
-        const ans = await this.readDiscountYesNo(m, said, discountSetup.describe(d, t) + '\n' + t('Send this rule to the Dealer Portal for approval?', 'Ye rule Dealer Portal pe approval ke liye bhejun?'), {
+        const { answer: ans, say } = await this.readDiscountYesNo(m, said, discountSetup.describe(d, t) + '\n' + t('Send this rule to the Dealer Portal for approval?', 'Ye rule Dealer Portal pe approval ke liye bhejun?'), {
           yes: 'send this rule for approval',
           no: 'do not send it, start the rule again',
         });
@@ -3737,11 +3751,11 @@ class CustomerBot {
           return next('type', t('Again, then — brand-wise or part-wise?', 'Theek hai, dobara — Brand wise ya Part wise?'), this.discountTypeButtons(t));
         }
         // A message of its own ("Maruti ka headlight kitne ka hai?") is not
-        // an answer: it goes on, and the rule waits for its yes. A word or two
-        // that is neither is asked again.
-        if (ans !== 'yes' && said.split(/\s+/).length > 2) return null;
+        // an answer: it goes on, and the rule waits for its yes. A reply the
+        // model cannot place gets its own line back, not the same question.
+        if (ans === 'new') return null;
         if (ans !== 'yes') {
-          return next('confirm', t('Send this rule for approval? Yes or no.', 'Ye rule approval ke liye bhejun? Haan ya Nahi.'), [
+          return next('confirm', say || t('Send this rule for approval? Yes or no.', 'Ye rule approval ke liye bhejun? Haan ya Nahi.'), [
             { id: 'DSC_YES', title: t('Yes', 'Haan') },
             { id: 'DSC_NO', title: t('No, start again', 'Nahi, dobara') },
           ]);
@@ -3764,9 +3778,9 @@ class CustomerBot {
         // "done", "bas", "itna hi" mean STOP here, even though "done" is a yes
         // at the confirm step. With a button it never mattered which word was
         // typed; answered in words, "done" would have started another rule.
-        const ans =
+        const { answer: ans, say } =
           m.buttonId === 'DSC_MORE_NO' || /^(done|bas|bas itna|itna hi|that'?s all|no more|enough)\b/i.test(said)
-            ? 'no'
+            ? { answer: 'no' }
             : await this.readDiscountYesNo(m, said, t('Another rule for this customer?', 'Is customer ke liye aur rule?'), {
                 yes: 'add another discount rule for this customer',
                 no: 'finished, no more rules',
@@ -3774,6 +3788,7 @@ class CustomerBot {
         if (ans === 'yes') {
           return next('type', t('Brand-wise or part-wise?', 'Brand wise ya Part wise?'), this.discountTypeButtons(t));
         }
+        if (ans === 'unclear') return next('more', say || t('Another rule for this customer? Yes or no.', 'Is customer ke liye aur rule? Haan ya Nahi.'));
         discountSetup.cancel(m.chatId);
         // "Maruti ka right headlight chahiye" is not an answer to "another
         // rule?" (25 Sep, live: it was swallowed and answered "Ho gaya — 1
@@ -3827,7 +3842,7 @@ class CustomerBot {
       const made = await portal.createDiscountRule(body);
       const id = made && (made.rule_id || made.id);
       const live = String((made && made.approval_status) || '').toUpperCase() === 'APPROVED';
-      if (id && !live && req.chatId) require('../core/discountWatch').watch(id, { chatId: req.chatId, name: body.rule_name });
+      if (id && !live && req.chatId) require('../core/discountWatch').watch(id, { chatId: req.chatId, name: body.rule_name, customerPhone: await this.discountCustomerPhone(req, accountId), customerName: name });
       return { ok: true, name: body.rule_name, ruleId: id, live };
     } catch (e) {
       return { ok: false, name: body.rule_name, why: String((e && e.message) || e).slice(0, 100) };
@@ -3906,7 +3921,7 @@ class CustomerBot {
       }
       discountSetup.drop(req.id);
       const live = String((updated && updated.approval_status) || 'PENDING').toUpperCase() === 'APPROVED';
-      if (!live && req.chatId) require('../core/discountWatch').watch(req.ruleId, { chatId: req.chatId, name: body.rule_name, what });
+      if (!live && req.chatId) require('../core/discountWatch').watch(req.ruleId, { chatId: req.chatId, name: body.rule_name, what, customerPhone: await this.discountCustomerPhone(req, req.accountId), customerName: req.customer });
       store.log(this.key, `${req.id}: rule ${req.ruleId} changed to ${req.rule.value}% on the portal — ${live ? 'APPROVED' : 'waiting for the Super Admin'}`);
       approvalLog.record({ kind: 'discount', id: req.id, event: 'sent to portal', by: by || null, customer: req.customer, detail: `${what} (rule #${req.ruleId})` });
       return { ok: true, ruleId: req.ruleId, name: body.rule_name, live };
@@ -3929,6 +3944,39 @@ class CustomerBot {
     store.log(this.key, `${req.id}: ${made.name} written to the portal as rule ${made.ruleId} — ${made.live ? 'APPROVED' : 'waiting for the Super Admin'}`);
     approvalLog.record({ kind: 'discount', id: req.id, event: 'sent to portal', by: by || null, customer: req.customer, detail: `${made.name} (rule #${made.ruleId})` });
     return { ok: true, ruleId: made.ruleId, name: made.name, live: made.live };
+  }
+
+  // THE AGENT WHO OPENED AN ACCOUNT, told of the decision: the chat the form
+  // was filled in, when that is not the customer's own.
+  async tellAccountAgent(req, textFor) {
+    const chat = req && req.chatId;
+    if (!chat) return false;
+    const ten = (p) => String(p || '').replace(/\D/g, '').slice(-10);
+    if (ten(String(chat).split('@')[0]) === ten(req.answers && req.answers.phone)) return false;
+    try {
+      const text = textFor(lang.for(chat));
+      const id = await this.transport.sendToChat(chat, text);
+      this.recordOutgoing(chat, id, text);
+      return true;
+    } catch (e) {
+      store.log(this.key, `could not tell the agent about ${req.answers && req.answers.requestId}: ` + String((e && e.message) || e).slice(0, 80));
+      return false;
+    }
+  }
+
+  // THE CUSTOMER a discount request is for, as a number to tell when the
+  // portal decides it (founder, 29 Sep: "the approved msg goes to agent but
+  // not to customer"). The request's own number, else the account's on the
+  // portal. Never the agent's own number.
+  async discountCustomerPhone(req, accountId) {
+    const norm = (p) => {
+      const ten = String(p || '').replace(/\D/g, '').slice(-10);
+      return ten.length === 10 ? '91' + ten : null;
+    };
+    let p = norm(req.phone) || norm(req.customerPhone);
+    if (!p && accountId) p = await portal.accountPhone(accountId).catch(() => null);
+    const agentPhone = norm(String(req.chatId || '').split('@')[0]);
+    return p && p !== agentPhone ? p : null;
   }
 
   // What the agent is told once a request is on the portal.
@@ -4265,7 +4313,30 @@ class CustomerBot {
       store.save();
       store.log(this.key, `${order.id} rejected by ${who}`);
       approvalLog.record({ kind: 'order', id: order.id, event: 'rejected', by: who, customer: (order.portalCustomer && order.portalCustomer.name) || null });
-      await tell(ct(`Your order ${order.id} was not approved. Please call us if you want to talk about it.`, `Aapka order ${order.id} approve nahi hua. Baat karni ho to humein call kijiye.`));
+      const pcR = order.portalCustomer || {};
+      // AN AGENT'S ORDER (founder, 29 Sep: "whatever agent do for customer and
+      // it get approved or decline send msg to both"): the agent's chat, AND
+      // the customer on their own number.
+      if (order.requestedBy) {
+        await tell(ct(`${pcR.name ? pcR.name + "'s o" : 'O'}rder ${order.id} was not approved by the Sales Head. The customer has been told.`, `${pcR.name ? pcR.name + ' ka o' : 'O'}rder ${order.id} Sales Head ne approve nahi kiya. Customer ko bata diya hai.`));
+        const custChatR = this.customerChatOf(order);
+        if (custChatR) {
+          const cr = lang.for(custChatR);
+          const text = cr(
+            `Dear ${pcR.name ? pcR.name + ' ji' : 'customer'}, we are sorry — your order ${order.id} could not be approved this time. Please call us or your sales representative, and we will gladly help.`,
+            `${pcR.name ? pcR.name + ' ji' : 'Ji'}, maaf kijiye — aapka order ${order.id} is baar approve nahi ho paya. Humein ya apne sales representative ko call kijiye, hum zaroor madad karenge.`,
+          );
+          try {
+            await escalation.ensureWindow(this.transport, custChatR.split('@')[0], `Order ${order.id} — details follow`, order.id);
+            const id = await this.transport.sendToChat(custChatR, text);
+            this.recordOutgoing(custChatR, id, text);
+          } catch (e) {
+            store.log(this.key, `${order.id}: could not tell the customer it was rejected: ${String((e && e.message) || e).slice(0, 80)}`);
+          }
+        }
+      } else {
+        await tell(ct(`Your order ${order.id} was not approved. Please call us if you want to talk about it.`, `Aapka order ${order.id} approve nahi hua. Baat karni ho to humein call kijiye.`));
+      }
       return reply(t(`Rejected ${order.id}. The customer was told.`, `${order.id} reject kar diya. Customer ko bata diya.`));
     }
 
