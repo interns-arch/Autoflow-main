@@ -3865,6 +3865,8 @@ Baaki ${payments.money(hold.due)} pay hone tak ${order.id} hold pe hai${custPhon
     // Sir is asked to approve it there as Super Admin (decideDiscount).
     // -> { req, sent }
     const submit = async (type, extra) => {
+      // Kept fresh while they work on this customer (the memory lasts 30 min).
+      if (st.lookedUpRow) salesOrder.rememberLookedUp(m.chatId, st.lookedUpRow);
       const req = discountSetup.file({
         type,
         rule: { ...d },
@@ -3968,6 +3970,11 @@ Baaki ${payments.money(hold.due)} pay hone tak ${order.id} hold pe hai${custPhon
         st.dealerId = dl.dealerId;
         st.odooPartnerId = dl.odooPartnerId;
         st.customer = st.row.name;
+        // THE CUSTOMER IN HAND (founder, 30 Sep): a discount set up for them,
+        // then "order karna hai" is their order - not "which customer?". Only
+        // a "hi" starts over (freshStaffStart).
+        salesOrder.rememberLookedUp(m.chatId, st.row);
+        st.lookedUpRow = { ...st.row };
         delete st.row;
         store.log(this.key, `${m.from} confirmed ${st.customer} (account ${st.accountId} -> dealer ${st.dealerId}) for a discount setup`);
         return this.showDiscountRules(m, st, reply, t);

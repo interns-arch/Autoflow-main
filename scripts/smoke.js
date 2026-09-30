@@ -2811,6 +2811,20 @@ async function main() {
       check('...and the CUSTOMER is told too, on their own number, with the discount', /discount set ho gaya|discount is now set/i.test(toCust22) && /15%/.test(toCust22), toCust22 || JSON.stringify(customer.transport.outbox.map((o) => o.to)));
       check('...and the agent hears that the customer was told', customer.transport.outbox.some((o) => String(o.to).indexOf(AGENT20) >= 0 && /Customer ko bhi bata diya/.test(o.text || '')));
       check('...and is told only once', (await require('../src/core/discountWatch').checkOnce(customer)).length === 0);
+      // 30 Sep, founder: a discount set up for a customer, then "order karna
+      // hai" is that customer's order - "bot didn't ask for which customer";
+      // after a "hi" it asks.
+      // Every agent is on the sales team as well (30 Sep: "all the sales agent
+      // can create customer, discount, order").
+      config.salesTeamNumbers.push(AGENT20);
+      const ord22 = text20(await say20(AGENT20, 'order karna hai'));
+      check('after a discount for Mock Customer, "order karna hai" is their order - not "which customer?"', /Mock Customer/.test(ord22) && !/Kis customer|Which customer/i.test(ord22), ord22);
+      await say20(AGENT20, 'hi');
+      const ord22b = text20(await say20(AGENT20, 'I want to order'));
+      check('...and after "hi" the same ask is "which customer?"', /Kis customer|Which customer/i.test(ord22b) && !/Mock Customer/.test(ord22b), ord22b);
+      config.salesTeamNumbers.splice(config.salesTeamNumbers.indexOf(AGENT20), 1);
+      require('../src/core/salesOrder').clear(agentChat20);
+      if (orders.findDraft(agentChat20)) orders.cancel(orders.findDraft(agentChat20));
       // ARUN SIR REJECTS: nothing on the portal; Prateek Sir, the agent and
       // the customer are told.
       await say20(AGENT20, 'discount change karna hai');
