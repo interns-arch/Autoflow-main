@@ -195,29 +195,63 @@ async function toolChecks() {
   ok('...and a number the portal does not know comes back with its close match', o3 && o3.status === 'close_match_only' && o3.closeMatch.partNo === 'GONEX5PK' && o3.closeMatch.packOf === 5, JSON.stringify(o3));
   ok('...as facts: no sentence, no stock count', !/found and added|did not match|\bavailable\b/i.test(JSON.stringify(ol)));
 
-  // The account form, driven by the agent: a registered customer is asked
-  // whether it is for someone else; then the form's questions come back as
-  // facts for the agent to ask in its own words.
+  // A CUSTOMER OPENS ONLY THEIR OWN ACCOUNT (founder, 28 Sep). One number
+  // cannot open an account for another: that is the sales team's.
   const cust = require('../src/core/customers');
   const cc = require('../src/core/customerCreate');
   const resolveCustWas = cust.resolve;
-  cust.resolve = async () => ({ found: true, name: 'Miya Ji Motors' });
   const formCfg = { configurable: { chatId: 'form-test@c.us', phone: '919000000990', bot: { finishNewCustomer: async () => true, reviewNewCustomer: async () => true } } };
   cc.cancel('form-test@c.us');
+  let f0;
   let f1;
   let f2;
   let f3;
   try {
-    f1 = JSON.parse(await workflows.accountForm.invoke({ action: 'start' }, formCfg));
+    cust.resolve = async () => ({ found: true, name: 'Miya Ji Motors' });
+    f0 = JSON.parse(await workflows.accountForm.invoke({ action: 'start' }, formCfg));
+    cust.resolve = async () => ({ found: false });
     f2 = JSON.parse(await workflows.accountForm.invoke({ action: 'start', forSomeoneElse: true }, formCfg));
-    f3 = JSON.parse(await workflows.accountForm.invoke({ action: 'answer', answer: '9812345678' }, formCfg));
+    f1 = JSON.parse(await workflows.accountForm.invoke({ action: 'start' }, formCfg));
+    f3 = JSON.parse(await workflows.accountForm.invoke({ action: 'answer', answer: 'MY SHOP' }, formCfg));
   } finally {
     cust.resolve = resolveCustWas;
     cc.cancel('form-test@c.us');
   }
-  ok('a registered customer asking for an account is found to have one already', f1 && f1.alreadyRegistered === true && f1.name === 'Miya Ji Motors', JSON.stringify(f1));
-  ok('...and "for someone else" opens the form, with its first question as a fact', f2 && f2.started === true && /number|WhatsApp/i.test(f2.nextQuestion), JSON.stringify(f2));
-  ok('...and an answer moves the form on', f3 && f3.inProgress === true && typeof f3.formSays === 'string', JSON.stringify(f3));
+  ok('a registered number asking for an account is told it has one', f0 && f0.alreadyRegistered === true && f0.name === 'Miya Ji Motors', JSON.stringify(f0));
+  ok('an account for someone else is not opened here — the sales team does it', f2 && f2.started === false && f2.refused === 'account_for_someone_else', JSON.stringify(f2));
+  ok('an unregistered number opens its OWN account, first question as a fact', f1 && f1.started === true && typeof f1.nextQuestion === 'string', JSON.stringify(f1));
+  ok('...and an answer moves the form on', f3 && typeof f3.inProgress === 'boolean', JSON.stringify(f3));
+
+  // "hi" starts a fresh conversation (founder, 28 Sep) - but never while a
+  // question is with the specialist, whose answer resumes that thread.
+  {
+    const ag = require('../src/agent');
+    const C = 'fresh-test@c.us';
+    ag._sessions.delete(C);
+    ok('a chat starts on its own id, so existing threads are unchanged', ag._threadOf(C) === C);
+    ok('"hii" on its own starts a fresh conversation', ag._freshOnGreeting(C, 'hii') === true && ag._threadOf(C) === C + '#1');
+    ok('"hi, 16510M65L10 ka rate?" is not a bare greeting', ag._freshOnGreeting(C, 'hi, 16510M65L10 ka rate?') === false && ag._threadOf(C) === C + '#1');
+    ag._markPaused(C, true);
+    ok('while a question is with the specialist, "hi" keeps the conversation', ag._freshOnGreeting(C, 'hi') === false && ag._threadOf(C) === C + '#1');
+    ag._markPaused(C, false);
+    ag._sessions.delete(C);
+  }
+  // No account, no cart (founder, 28 Sep).
+  {
+    const ordersTool = require('../src/agent/tools/orders');
+    const r = JSON.parse(await ordersTool.addToOrder.invoke({ items: [{ partNumber: '16510M65L10', qty: 2 }] }, { configurable: { chatId: 'noacct-test@c.us', phone: '919000000999', customer: null } }));
+    ok('an unregistered number: nothing goes into the cart, and they are told the account comes first', r.added === false && r.noAccount === true && /account has to be created first/.test(r.tellCustomer), JSON.stringify(r));
+    ok('...and no draft is made for them', !require('../src/core/orders').findDraft('noacct-test@c.us'));
+  }
+
+  // ...nor set a discount: not passed to a person either.
+  const esc = require('../src/agent/tools/escalation');
+  const noBot = { configurable: { chatId: 'esc-test@c.us', phone: '919000000991', bot: { key: 'test' } } };
+  const d1 = JSON.parse(await esc.askAPerson.invoke({ item: 'customer wants discount set on Maruti parts', qty: 1, reason: 'business_question', whatYouTried: 'answer_business_question' }, noBot));
+  const d2 = JSON.parse(await esc.askAPerson.invoke({ item: 'Mujhe discount create karne hai kar sakta hu', qty: 1, reason: 'business_question', whatYouTried: '-' }, noBot));
+  const d3 = JSON.parse(await esc.askAPerson.invoke({ item: 'naya account khulwana hai', qty: 1, reason: 'business_question', whatYouTried: '-' }, noBot));
+  ok('a customer\'s discount request is not passed to a person', d1.asked === false && d1.refused === 'discount_by_sales_team' && d2.refused === 'discount_by_sales_team', JSON.stringify([d1, d2]));
+  ok('...nor an account request', d3.asked === false && d3.refused === 'account_by_sales_team', JSON.stringify(d3));
 
   // A number plate, looked up.
   const vahan = require('../src/integrations/vahan');
@@ -512,10 +546,16 @@ const CASES = [
     why: 'did not check the list with resolve_order_list, or wrote the old template',
   },
   {
-    name: 'opening an account goes through account_form',
-    say: 'mujhe naya account khulwana hai',
+    name: 'a customer opening their own account goes through account_form',
+    say: 'mujhe apna naya account khulwana hai',
     check: (_reply, tools) => tools.includes('account_form'),
     why: 'did not use account_form',
+  },
+  {
+    name: 'a customer asking to set a discount is told the sales team does it',
+    say: 'Mujhe discount create karna hai',
+    check: (reply, tools) => /sales team|sales/i.test(reply) && !tools.includes('ask_a_person'),
+    why: 'passed it to a person, or did not say the sales team sets discounts',
   },
   {
     name: 'a number plate is looked up, not guessed at',
@@ -593,8 +633,81 @@ async function agentChecks() {
   }
 }
 
+// ------------------------------------------------ the ETA offer, as a tool
+// 26 Sep: the parts of a placed order that were not in stock are offered to
+// the customer with an ETA; their answer is the AGENT's to act on, through
+// eta_offer - and the agent is told every tool it has.
+async function etaChecks() {
+  console.log('\nTHE ETA OFFER AND THE TOOL LIST (offline)\n');
+  const agentMod = require('../src/agent');
+  const { etaOffer } = require('../src/agent/tools/advance');
+  const adv = require('../src/core/advanceOrders');
+  const portal = require('../src/integrations/dealerPortal');
+  const CustomerBot = require('../src/bots/customerBot');
+
+  const index = agentMod._toolIndex(agentMod.TOOLS);
+  ok('the prompt lists every tool the agent can call', agentMod.TOOLS.every((t) => index.includes('- ' + t.name + ':')), index);
+  ok('...eta_offer among them', /- eta_offer:/.test(index));
+
+  // A bot that only sends: the real etaOfferAnswered on a fake transport.
+  const sent = [];
+  const bot = {
+    key: 'customer',
+    transport: {
+      sendToChat: async (to, text) => {
+        sent.push({ to, text });
+        return 'wamid.' + sent.length;
+      },
+      sendText: async (to, text) => {
+        sent.push({ to, text });
+        return 'wamid.' + sent.length;
+      },
+    },
+    recordOutgoing() {},
+    toApprovers: async (text) => {
+      sent.push({ to: 'approvers', text });
+      return 1;
+    },
+  };
+  bot.etaOfferAnswered = CustomerBot.prototype.etaOfferAnswered.bind(bot);
+  const CHAT = '919000000891@cloud';
+  const order = { id: 'ORD-ETA1', portalCustomer: { buyerId: 345, name: 'Eta Motors' }, lines: [] };
+  await adv.offer(bot, { order, res: { skipped: [{ partNo: 'Q1', item: 'Q1', qty: 3 }], short: [] }, soNumber: 'SO-1', to: CHAT, customerName: 'Eta Motors', agentChat: 'agentchat@cloud', agentName: 'Shubham' });
+  const cfg = { configurable: { chatId: CHAT, bot } };
+
+  const shown = JSON.parse(await etaOffer.invoke({ action: 'show' }, cfg));
+  ok('"show" gives the parts, the ETA date and what ETA means', shown.open && shown.parts[0].partNo === 'Q1' && shown.parts[0].qty === 3 && /estimated time of arrival/.test(shown.whatEtaMeans), JSON.stringify(shown));
+
+  // The context the model is sent names the open offer.
+  const { createMiddleware } = require('langchain');
+  const { SystemMessage } = require('@langchain/core/messages');
+  const { z } = require('zod');
+  const mw = require('../src/agent/memory').contextMiddleware({ createMiddleware, z });
+  let sys = '';
+  await mw.wrapModelCall({ messages: [], state: {}, systemMessage: new SystemMessage('X'), runtime: { configurable: { chatId: CHAT } } }, async (req) => {
+    sys = String(req.systemMessage.content);
+    return null;
+  });
+  ok('the model is told an ETA offer is open, and which tool answers it', /ETA OFFER OPEN[\s\S]*Q1 x3[\s\S]*eta_offer/.test(sys), sys.slice(-400));
+
+  const before = (portal._mockAdvance() || []).length;
+  const booked = JSON.parse(await etaOffer.invoke({ action: 'accept' }, cfg));
+  ok('"accept" books the advance order and returns its number', booked.booked && /^ADV-/.test(booked.advanceOrderNo) && portal._mockAdvance().length === before + 1, JSON.stringify(booked));
+  ok('...the salesman who punched it is told', sent.some((s) => s.to === 'agentchat@cloud' && /advance order/i.test(s.text)));
+  ok('...and the Sales Heads', sent.some((s) => s.to === 'approvers' && /Advance order/.test(s.text)));
+  const again = JSON.parse(await etaOffer.invoke({ action: 'accept' }, cfg));
+  ok('a second "accept" books nothing more', again.open === false && portal._mockAdvance().length === before + 1, JSON.stringify(again));
+
+  await adv.offer(bot, { order: { ...order, id: 'ORD-ETA2' }, res: { skipped: [{ partNo: 'Q2', item: 'Q2', qty: 1 }], short: [] }, soNumber: 'SO-2', to: CHAT, customerName: 'Eta Motors' });
+  const no = JSON.parse(await etaOffer.invoke({ action: 'decline' }, cfg));
+  ok('"decline" books nothing', no.declined && portal._mockAdvance().length === before + 1, JSON.stringify(no));
+  const none = JSON.parse(await etaOffer.invoke({ action: 'show' }, { configurable: { chatId: 'nobody@cloud', bot } }));
+  ok('with no offer open, the tool says so', none.open === false);
+}
+
 (async () => {
   await toolChecks();
+  await etaChecks();
   await agentChecks();
   console.log('\n' + pass + ' passed, ' + fail + ' failed' + (skip ? ', ' + skip + ' skipped' : '') + '\n');
   process.exit(fail ? 1 : 0);

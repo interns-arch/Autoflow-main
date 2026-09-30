@@ -60,7 +60,10 @@ function waitForSpecialist(key, escalationId, what, tellCustomer) {
     // their language, when it called this tool. The model is not running
     // once paused, so the line travels here and the caller sends it. Empty
     // only if the model left it out; the caller has a plain line for that.
-    tellCustomer: String(tellCustomer || '').trim().slice(0, 300) || null,
+    // Long enough to carry the answer for every other part in the message
+    // (29 Sep: four photos, one unknown part, and the other answers were lost
+    // behind a bare "senior se confirm karke batata hoon").
+    tellCustomer: String(tellCustomer || '').trim().slice(0, 1500) || null,
   });
 
   inFlight.delete(key);
@@ -88,6 +91,22 @@ function waitForSpecialist(key, escalationId, what, tellCustomer) {
   });
 }
 
+// A customer asking to have a discount SET or CHANGED, or a new customer
+// account OPENED. Asking what discount they get is not this: my_discounts
+// answers that.
+const WANTS_DISCOUNT = /\b(discount|disc|chhoot|chhut|chut|chuut|scheme)\b[^.?\n]{0,40}\b(set|create|chahiye|chaiye|de\s?do|dedo|do|kar\s?do|kardo|karo|badha\w*|increase|more|zyada|jyada|change|laga\w*|add|bana\w*|lagwa\w*|milega|mil sakta|kar sakta|karne)\b|\b(set|create|badha\w*|increase|change|laga\w*|add|bana\w*)\b[^.?\n]{0,25}\b(discount|chhoot|chhut|scheme)\b/i;
+const WANTS_ACCOUNT = /\b(new|naya|nayi|naye)\s+(customer|account|khata|party|dealer)\b|\b(account|khata|registration|register|customer)\b[^.?\n]{0,30}\b(open|create|khol\w*|bana\w*|kar\s?do|karo|register|add)\b|\b(open|create|register)\b[^.?\n]{0,20}\b(account|customer)\b/i;
+function customerOnlyRefusal(text) {
+  const s = String(text || '');
+  if (WANTS_DISCOUNT.test(s)) {
+    return { kind: 'discount_by_sales_team', say: 'Discounts are set by our sales team, not on this chat. Tell them that in a line, in their language, and offer to help with parts or an order. Do not say anyone will call or confirm.' };
+  }
+  if (WANTS_ACCOUNT.test(s)) {
+    return { kind: 'account_by_sales_team', say: 'Not a question for a person. Their OWN account: open it with account_form "start". An account for someone else: our sales team opens it (or that person messages from their own number) — say so in a line.' };
+  }
+  return null;
+}
+
 const askAPerson = tool(
   async ({ item, qty, reason, whatYouTried, webCandidates, tellCustomer }, config) => {
     const ctx = contextFrom(config);
@@ -96,6 +115,14 @@ const askAPerson = tool(
 
     const what = String(item || '').trim();
     if (!what) return JSON.stringify({ asked: false, why: 'nothing to ask about' });
+
+    // NOT FOR CUSTOMERS (founder, 28 Sep): setting a discount and opening a
+    // new customer account are done by our sales team. A customer asking for
+    // either is told so - not passed to a person, who would only have to say
+    // the same. (Every caller of this tool is a customer: staff never reach
+    // the agent, bots/customerBot.isOperator.)
+    const salesOnly = customerOnlyRefusal(what);
+    if (salesOnly) return JSON.stringify({ asked: false, refused: salesOnly.kind, tellCustomer: salesOnly.say });
 
     const key = flightKey(ctx.chatId, what);
     // A re-run of this node. The specialist has already been asked; all that
@@ -212,7 +239,8 @@ const askAPerson = tool(
       'Hand this question to the specialist at the shop and WAIT for his answer. The customer is told a specialist is reviewing it, and this conversation pauses — possibly for hours — until he replies. ' +
       'This is the LAST resort. Use it only after lookup_known_part, search_catalogue_index, search_portal_catalogue AND search_the_web have all come back with nothing, or when check_stock_and_price returned status "unidentified", or when answer_business_question found nothing approved. ' +
       'Tell it what you already tried, so he is confirming rather than starting from scratch. ' +
-      'Write the customer\'s holding line yourself in tellCustomer — it is sent the moment this pauses, because you are not running while it waits. Say nothing else alongside it, and never guess at the answer.',
+      'Write the customer\'s message yourself in tellCustomer — it is sent the moment this pauses, because you are not running while it waits, so it is ALL they get until he answers. ' +
+      'When the same message asked for other parts too, check those FIRST (check_stock_and_price) and put their answer in tellCustomer: every part, in stock or not, then the one you are asking about, named — never only a holding line. Never guess at the part you are asking about.',
     schema: z.object({
       item: z.string().describe('what the customer asked for, in their own words — this is what the specialist will read'),
       qty: z.number().int().optional().describe('how many they want, if they said'),
@@ -233,7 +261,9 @@ const askAPerson = tool(
       tellCustomer: z
         .string()
         .optional()
-        .describe('ALWAYS give this: the one short line the customer gets NOW, while he checks — in THEIR language and your own voice, e.g. "Ek minute, senior se confirm karke batata hoon." No promise of a time, no guess at the answer, no price.'),
+        .describe(
+          'ALWAYS give this: what the customer gets NOW, in THEIR language and your own voice. If they asked for other parts in the same message, it is your full answer for those (each part: in stock / not in stock and when, with the price the tools gave) followed by the part you are checking, BY NAME and number — e.g. "…aur 29938434 (TVS rear brake shoe) hamare portal pe nahi mila — senior se confirm karke batata hoon." For a single part, one short line naming it. No promise of a time, no guess at that part, no price for it.',
+        ),
     }),
   },
 );

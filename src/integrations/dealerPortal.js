@@ -119,7 +119,21 @@ const sessions = {
     // error, which is far clearer than silently doing nothing.
     creds: () => ({ user: dp.adminUsername || dp.username, pass: dp.adminPassword || dp.password, fixed: dp.adminToken }),
   },
+  // Approves the discount rules the admin login wrote: the portal will not
+  // let one user approve its own rule (config.dealerPortal.approverUsername).
+  approver: {
+    token: null,
+    refresh: null,
+    expiresAt: 0,
+    refreshTimer: null,
+    renewing: null,
+    creds: () =>
+      dp.approverUsername || dp.approverToken
+        ? { user: dp.approverUsername, pass: dp.approverPassword, fixed: dp.approverToken }
+        : sessions.admin.creds(),
+  },
 };
+const hasApprover = () => Boolean(dp.approverUsername || dp.approverToken);
 
 // Login and refresh answer in the same shape, and the portal sends it both at
 // the top level and nested under `data`. `expires_at` is authoritative when
@@ -677,7 +691,15 @@ async function withDiscountRules(rows, accountId, lines) {
     if (!(mrp > 0) || Number(row.discount_percent) > 0) continue; // the portal already priced it
     const line = (lines || []).find((l) => norm(l.partNo || l.item) === norm(row.part_no));
     const rule = ruleFor(rules, { dealerId, partNo: row.part_no, brand: row.brand, qty: Number(row.requested_qty) || (line && Number(line.qty)) || 1 });
-    if (!rule) continue;
+    if (!rule) {
+      // A customer WITH rules whose line still prices at 0%: say why it
+      // missed, so "the discount did not come" can be read off the log.
+      const theirs = rules.filter((r) => Number(r.dealer_id) === Number(dealerId));
+      if (theirs.length) {
+        store.log('portal', `dealer ${dealerId}: no discount on ${row.part_no} (brand "${row.brand || '-'}") — their rules: ${theirs.map((r) => `#${r.rule_id || r.id} ${r.rule_type} ${r.brand || r.part_no || 'all'} ${r.discount_value}% ${r.approval_status || '?'} ${String(r.valid_from || '').slice(0, 10)}..${String(r.valid_to || '').slice(0, 10)}`).join('; ').slice(0, 300)}`);
+      }
+      continue;
+    }
     const pct = Number(rule.discount_value);
     const price = round2(mrp * (1 - pct / 100));
     row.discount_percent = pct;
@@ -707,6 +729,91 @@ async function withDiscountRules(rows, accountId, lines) {
 //   allocation the portal itself worked out, so we echo analyze's own row
 //   back rather than inventing one. `_raw` is the untouched analyze row,
 //   stashed on the line by readAnalyzeResponse.
+// THE DISCOUNT, IN THE WORDS AN ORDER LINE USES. withDiscountRules writes it
+// the commercial-analyze way (discount_percent, price); a portal order line
+// keeps it as item_discount_per / discounted_unit_price / discount_rule_id
+// (Kalra's order 486, core/rates). Sent only the first way, orders punched at
+// 0% (28 Sep, founder: "discount not set when customer punch any order"), so
+// every line and allocation carries both. Nothing is added to a line with no
+// discount.
+function withOrderDiscount(line, l) {
+  const pct = Number(line.discount_percent) || Number(l && l.discountPercent) || 0;
+  if (!(pct > 0)) return line;
+  const mrp = Number(line.mrp) || Number(l && l.mrp) || 0;
+  const round2 = (v) => Math.round(v * 100) / 100;
+  const unit = Number(line.price) > 0 && mrp && Number(line.price) < mrp ? Number(line.price) : mrp ? round2(mrp * (1 - pct / 100)) : null;
+  const ruleId = (line.discount_rule && line.discount_rule.id) || line.discount_rule_id || null;
+  const out = { ...line, discount_percent: pct, item_discount_per: pct };
+  if (unit) {
+    out.price = unit;
+    out.discounted_unit_price = unit;
+  }
+  if (ruleId) out.discount_rule_id = ruleId;
+  out.dealers = (line.dealers || []).map((a) => {
+    const am = Number(a.mrp) || mrp;
+    const ap = am ? round2(am * (1 - pct / 100)) : a.price;
+    return { ...a, discount_percent: pct, item_discount_per: pct, price: ap, discounted_unit_price: ap, ...(ruleId ? { discount_rule_id: ruleId } : {}) };
+  });
+  return out;
+}
+
+// The order about to be punched, each line priced by the customer's discount
+// rule as the admin panel has it NOW. Returns a copy; the order is untouched.
+// A line with no rule keeps what it had. Any failure reading the rules leaves
+// the order as it was - an order is never held back for a discount lookup.
+async function discountForPunch(order) {
+  const ctx = order.portalCustomer || null;
+  const accountId = ctx && (ctx.buyerId || ctx.accountId);
+  if (!accountId || !Array.isArray(order.lines) || !order.lines.length) return order;
+  let rules;
+  let dealerId;
+  try {
+    forgetDiscountRules();
+    rules = await discountRules(); // GET /discount-rules/ as admin
+    dealerId = (await dealerIdForAccount(accountId)).dealerId;
+  } catch (e) {
+    store.log('portal', `${order.id}: discount rules not read at punch — lines go as quoted: ` + String((e && e.message) || e).slice(0, 100));
+    return order;
+  }
+  if (!dealerId) {
+    store.log('portal', `${order.id}: account ${accountId} has no single dealer — no discount at punch`);
+    return order;
+  }
+  const { ruleFor } = require('../core/discountSetup');
+  const round2 = (v) => Math.round(v * 100) / 100;
+  const lines = order.lines.map((l) => {
+    const raw = l._raw && typeof l._raw === 'object' ? { ...l._raw } : {};
+    const partNo = raw.part_no || l.partNo || l.item;
+    const rule = ruleFor(rules, { dealerId, partNo, brand: raw.brand || l.brand, qty: Number(l.qty) || 1 });
+    if (!rule) {
+      const theirs = rules.filter((r) => Number(r.dealer_id) === Number(dealerId));
+      if (theirs.length) store.log('portal', `${order.id}: no discount at punch on ${partNo} (brand "${raw.brand || l.brand || '-'}") — dealer ${dealerId} has ${theirs.length} rule(s)`);
+      return l;
+    }
+    const pct = Number(rule.discount_value);
+    const mrp = Number(raw.mrp) || Number(l.mrp) || 0;
+    raw.part_no = partNo;
+    raw.discount_percent = pct;
+    raw.discount_rule = { id: rule.rule_id || rule.id || null, name: rule.rule_name || null };
+    if (mrp) {
+      raw.mrp = mrp;
+      raw.price = round2(mrp * (1 - pct / 100));
+      raw.discount_amount = round2(mrp - raw.price);
+    }
+    const allocs = Array.isArray(raw.dealers) ? 'dealers' : Array.isArray(raw.allocations) ? 'allocations' : null;
+    if (allocs) {
+      raw[allocs] = raw[allocs].map((a) => {
+        const am = Number(a.mrp) || mrp;
+        return am ? { ...a, discount_percent: pct, price: round2(am * (1 - pct / 100)), discount_amount: round2(am * pct / 100) } : { ...a, discount_percent: pct };
+      });
+    }
+    return { ...l, _raw: raw, discountPercent: pct, rate: raw.price || l.rate };
+  });
+  const got = lines.filter((l) => l.discountPercent > 0).length;
+  store.log('portal', `${order.id}: discount at punch from the admin rules (dealer ${dealerId}) on ${got}/${lines.length} line(s)`);
+  return { ...order, lines };
+}
+
 function buildConfirmRequest(order) {
   const sellable = order.lines.filter((l) => l.source !== 'unidentified' && l.source !== 'unknown');
   const ctx = order.portalCustomer || null;
@@ -726,7 +833,7 @@ function buildConfirmRequest(order) {
     lines: sellable.map((l) => {
       const raw = l._raw && typeof l._raw === 'object' ? l._raw : {};
       const allocations = Array.isArray(raw.dealers) ? raw.dealers : Array.isArray(raw.allocations) ? raw.allocations : null;
-      return {
+      const line = {
         ...raw,
         part_no: raw.part_no || l.partNo || l.item,
         requested_qty: l.qty,
@@ -741,6 +848,7 @@ function buildConfirmRequest(order) {
               mrp: v.mrp,
             })),
       };
+      return withOrderDiscount(line, l);
     }),
   };
   const branch = (ctx && ctx.branchId) || dp.sourceBranchDealerId;
@@ -789,7 +897,14 @@ function readConfirmResponse(data) {
     portalLines = [];
     for (const [i, ls] of took.entries()) {
       for (const l of ls || []) {
-        portalLines.push({ partNo: String(l.part_no || ''), qty: Number(l.final_quantity) || Number(l.quantity) || Number(l.requested_qty) || 0, onOrder: i === 1 });
+        const disc = l.item_discount_per != null ? l.item_discount_per : l.discount_percent;
+        portalLines.push({
+          partNo: String(l.part_no || ''),
+          qty: Number(l.final_quantity) || Number(l.quantity) || Number(l.requested_qty) || 0,
+          onOrder: i === 1,
+          // What the portal KEPT, so a discount it dropped is seen (confirm()).
+          discountPercent: disc != null && disc !== '' ? Number(disc) : null,
+        });
       }
     }
   }
@@ -889,6 +1004,11 @@ function setMockStock(rows) {
 
 // Customers for the salesman flow in tests: the mock has no customer list.
 let mockCustomers = [];
+// Cheques for tests: { balance: { <accountId>: pdc-balance row }, cheques: [pdc-management items] }.
+let mockPdc = { balance: {}, cheques: [] };
+function setMockPdc(v) {
+  mockPdc = { balance: (v && v.balance) || {}, cheques: (v && v.cheques) || [] };
+}
 function setMockCustomers(rows) {
   mockCustomers = Array.isArray(rows) ? rows : [];
   return mockCustomers.length;
@@ -918,7 +1038,9 @@ function mockCommercial(lines) {
         : [],
       price: rate || null,
       mrp: mrp || null,
-      raw: null,
+      // A mock row with a `cost` carries it the way the portal does: as the
+      // allocation's base_price (core/lossBilling).
+      raw: row && row.cost && allocated ? { part_no: row.part_no, mrp, price: rate, allocations: [{ dealer_id: 23, dealer_name: row.vendor || 'Dealer 23', qty: allocated, price: rate, mrp, base_price: Number(row.cost) }] } : null,
     });
     out.rate = rate || null;
     out.mrp = mrp || null;
@@ -967,6 +1089,7 @@ module.exports = {
   },
   setMockStock,
   setMockCustomers,
+  setMockPdc,
   // The portal's ETA record for a part (GET /eta-mapping): the rows of the
   // purchase orders it is coming in on, newest first. [] when none.
   async etaMapping(partNo) {
@@ -992,6 +1115,7 @@ module.exports = {
   _partBody: partBody,
   // exported so the punch body can be checked without punching anything
   _confirmBody: buildConfirmRequest,
+  _discountForPunch: (order) => discountForPunch(order),
   // exported so the punch body can be asserted without punching anything
 
   // Create a customer account from an approved Data Entry request.
@@ -1129,19 +1253,57 @@ module.exports = {
       if (r) r.approval_status = decision === 'approve' ? 'APPROVED' : 'REJECTED';
       return r;
     }
+    // "Only Super Admins can review requests." (403, 28 Sep, live, rule 2873)
+    // - the bot's admin login never can. The approver login is a Super Admin
+    // (config.dealerPortal.approverUsername), used for this call and nothing
+    // else, so the Sales Head's "OK DSC-…" puts the rule live at once.
+    const as = hasApprover() ? 'approver' : 'admin';
     const tries = decision === 'approve' ? ['approve', 'APPROVE', 'APPROVED'] : ['reject', 'REJECT', 'REJECTED'];
     let last;
     for (const action of tries) {
       try {
-        const data = await api('POST', `/discount-rules/${encodeURIComponent(ruleId)}/review?action=${action}`, null, true, 'admin');
-        store.log('portal', `discount rule ${ruleId} reviewed: ${action}`);
+        const data = await api('POST', `/discount-rules/${encodeURIComponent(ruleId)}/review?action=${action}`, null, true, as);
+        forgetDiscountRules();
+        store.log('portal', `discount rule ${ruleId} reviewed: ${action} (as ${as})`);
         return data;
       } catch (e) {
         last = e;
         if (e && e.status && e.status !== 400 && e.status !== 422) break;
       }
     }
+    if (last && last.status === 403) {
+      last.superAdminNeeded = true;
+      if (!hasApprover()) last.message += ' — set DEALER_PORTAL_APPROVER_USERNAME / _PASSWORD to a Super Admin login on the portal';
+    }
     throw last;
+  },
+  // A rule just written, put through to APPROVED - which is what makes it
+  // apply at order punch. -> { approved: true } | { approved: false, why, superAdminNeeded }
+  async approveDiscountRule(rule) {
+    const id = rule && (rule.rule_id || rule.id);
+    const status = String((rule && rule.approval_status) || '').toUpperCase();
+    if (!id || status === 'APPROVED') return { approved: true };
+    try {
+      const done = await module.exports.reviewDiscountRule(id, 'approve');
+      const now = String((done && done.approval_status) || 'APPROVED').toUpperCase();
+      return now === 'APPROVED' ? { approved: true } : { approved: false, why: 'the portal still has it ' + now };
+    } catch (e) {
+      return { approved: false, superAdminNeeded: Boolean(e && e.superAdminNeeded), why: String((e && e.message) || e).slice(0, 300) };
+    }
+  },
+  // An ACCOUNT's own mobile, for telling the customer about something done on
+  // their account (a discount approved). null when the portal has none.
+  async accountPhone(accountId) {
+    const id = Number(accountId);
+    if (!id) return null;
+    if (isMock()) {
+      const r = mockCustomers.find((x) => Number(x.id) === id);
+      return (r && (r.phone || r.mobile)) || null;
+    }
+    const a = await api('GET', '/accounts/' + id, null, true, 'admin');
+    const raw = (a && (a.phone || a.mobile)) || null;
+    const ten = String(raw || '').replace(/\D/g, '').slice(-10);
+    return ten.length === 10 ? '91' + ten : null;
   },
   // The customer's discounts that apply today (core/discountSetup.activeRules),
   // from the same five-minute copy of the rules the prices use.
@@ -1477,6 +1639,48 @@ module.exports = {
     if (!id) return null;
     if (isMock()) return mockCredit;
     const data = await api('GET', '/accounts/' + id + '/credit-control');
+    return (data && data.data) || data || null;
+  },
+  // CHEQUES (founder, 29 Sep): a cheque the customer gave is on the portal
+  // (read as admin: the sales login gets 403 "Finance verification access is
+  // required")
+  // the day it is collected, and in Odoo only once it is posted there. These
+  // two read the portal's side (core/cheques decides what they mean).
+  //
+  // What the account owes, with the cheques received and not yet in Odoo
+  // (pdc_amount) beside it.
+  async pdcBalance(accountId) {
+    const id = String(accountId == null ? '' : accountId).replace(/[^0-9]/g, '');
+    if (!id) return null;
+    if (isMock()) return mockPdc.balance[id] || null;
+    const data = await api('GET', '/accounts/pdc-balance?account_id=' + id, undefined, true, 'admin');
+    return (data && data.data) || data || null;
+  },
+  // The account's cheques, newest first: number, amount, dates, status
+  // (collected / verified / deposited / cleared / bounced).
+  async pdcCheques(accountId, { limit = 50 } = {}) {
+    const id = String(accountId == null ? '' : accountId).replace(/[^0-9]/g, '');
+    if (!id) return [];
+    if (isMock()) return mockPdc.cheques.filter((c) => String(c.acc_id) === id);
+    const data = await api('GET', `/account-transactions/pdc-management?customer_id=${id}&limit=${limit}&sort_by=posted_date&sort_dir=desc`, undefined, true, 'admin');
+    const items = ((data && (data.data || data)) || {}).items || [];
+    // Only this account's, whatever the filter matched on.
+    return items.filter((c) => String(c.acc_id) === id);
+  },
+  // Every customer's cheques, newest first, filtered by the portal's own
+  // params (status, posted_from …) - for watching for a bounce.
+  async pdcChequeList(params = {}) {
+    if (isMock()) return mockPdc.cheques.filter((c) => !params.status || c.status === params.status);
+    const q = new URLSearchParams({ limit: '200', sort_by: 'posted_date', sort_dir: 'desc', ...params }).toString();
+    const data = await api('GET', '/account-transactions/pdc-management?' + q, undefined, true, 'admin');
+    return ((data && (data.data || data)) || {}).items || [];
+  },
+  // One cheque in full - its Odoo payment once it has been posted there.
+  async pdcCheque(txnId) {
+    const id = String(txnId == null ? '' : txnId).replace(/[^0-9]/g, '');
+    if (!id) return null;
+    if (isMock()) return mockPdc.cheques.find((c) => String(c.txn_id) === id) || null;
+    const data = await api('GET', '/account-transactions/pdc/' + id, undefined, true, 'admin');
     return (data && data.data) || data || null;
   },
   // A customer recent orders, for "Kalra ka order kab aayega". The portal
@@ -1988,9 +2192,28 @@ module.exports = {
       store.log('portal', `MOCK sales order punched: ${soNumber} (${order.lines.length} lines)`);
       return { soNumber };
     }
-    const data = await api('POST', dp.confirmPath, buildConfirmRequest(order));
+    // THE DISCOUNT FROM THE ADMIN PANEL, THE ORDER FROM THE SALES ACCOUNT
+    // (founder, 28 Sep). The rules are read fresh with the admin login at the
+    // moment of punching, not taken from whatever the quote carried: a line
+    // priced by the plain analyze, or quoted before the rule was approved,
+    // used to go out at 0%.
+    const priced = await discountForPunch(order);
+    const body = buildConfirmRequest(priced);
+    const data = await api('POST', dp.confirmPath, body, true, 'sales');
     const result = readConfirmResponse(data);
     store.log('portal', `sales order punched: ${result.soNumber}`);
+    // A discount sent and not kept: said once, per part, so it is not found
+    // weeks later on a bill.
+    const dropped = [];
+    for (const sent of body.lines) {
+      if (!(Number(sent.item_discount_per) > 0)) continue;
+      const got = (result.portalLines || []).find((p) => norm(p.partNo) === norm(sent.part_no));
+      if (got && got.discountPercent !== null && !(got.discountPercent > 0)) dropped.push(`${sent.part_no} sent ${sent.item_discount_per}%, kept ${got.discountPercent}%`);
+    }
+    if (dropped.length) {
+      result.discountDropped = dropped;
+      store.log('portal', `⚠️ ${result.soNumber}: the portal did not keep the discount — ${dropped.join('; ')}`);
+    }
     return result;
   },
 

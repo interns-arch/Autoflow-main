@@ -21,7 +21,10 @@ const config = require('../config');
 const store = require('../store');
 const chatState = require('./chatState');
 
-const requests = chatState.slot('payments.requests');
+// Kept 30 days, not the day every chat slot gets: an order held on a payment
+// waits until the customer pays (30 Sep: after 24 h "OK PAY-…" was "not found"
+// and the held order was never released).
+const requests = chatState.slot('payments.requests', { maxAgeMs: 30 * 24 * 60 * 60 * 1000 });
 
 const isAccountant = (phone) => Boolean((config.payments.accountants || {})[store.normPhone(phone)]);
 const accountantName = (phone) => (config.payments.accountants || {})[store.normPhone(phone)] || store.normPhone(phone);
@@ -43,10 +46,42 @@ async function dueOf(customer) {
   }
   const row = rows.find((r) => Number(r.id) === Number(customer.buyerId));
   if (!row || row.balance === undefined || row.balance === null) return null;
-  return { due: round2(row.balance), live: row.balance_is_live !== false };
+  // A CHEQUE THEY GAVE COUNTS AS PAID ONCE RECEIVED (founder, 29 Sep): the
+  // balance is Odoo's and has not taken it off yet (core/cheques). Read fresh
+  // - an accountant's OK re-reads this to see whether it is settled.
+  const pos = await require('./cheques')
+    .positionOf(customer.buyerId, { fresh: true })
+    .catch(() => null);
+  const cheque = pos ? pos.chequeAmount : 0;
+  return {
+    due: round2(Math.max(0, Number(row.balance) - cheque)),
+    owed: round2(row.balance),
+    chequeAmount: cheque,
+    cheques: pos ? pos.cheques : [],
+    live: row.balance_is_live !== false,
+  };
 }
 
 const settled = (due) => !(Number(due) >= (config.payments.settledBelow || 1));
+
+// THE DUE, SPELT OUT (founder, 29 Sep): the total, each cheque they gave that
+// is not in Odoo yet, and what is still to pay - for the agent and the
+// customer alike, whenever an order waits on it. `d` is dueOf()'s answer.
+function breakdown(d, t) {
+  if (!d) return '';
+  const cheques = d.cheques || [];
+  if (!cheques.length || !d.chequeAmount) return t(`Due: ${money(d.due)}`, `Baaki: ${money(d.due)}`);
+  const one = (c) =>
+    [c.number ? 'no. ' + c.number : null, money(c.amount), c.date ? new Date(c.date).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' }) : null, c.status]
+      .filter(Boolean)
+      .join(' · ');
+  return [
+    t(`Total due: ${money(d.owed)}`, `Total baaki: ${money(d.owed)}`),
+    t(`Cheque received: ${money(d.chequeAmount)}`, `Cheque mila: ${money(d.chequeAmount)}`) + (cheques.length === 1 ? ` (${one(cheques[0])})` : ''),
+    ...(cheques.length > 1 ? cheques.map((c) => '  • ' + one(c)) : []),
+    settled(d.due) ? t('Still to pay: nil — the cheque covers it', 'Abhi dena hai: kuch nahi — cheque se pura ho gaya') : t(`Still to pay: ${money(d.due)}`, `Abhi dena hai: ${money(d.due)}`),
+  ].join('\n');
+}
 
 function newId() {
   let id;
@@ -133,4 +168,4 @@ function readDecision(text) {
   };
 }
 
-module.exports = { dueOf, settled, open, forChat, find, save, qr, accountantText, readDecision, isAccountant, accountantName, money, requests };
+module.exports = { dueOf, settled, breakdown, open, forChat, find, save, qr, accountantText, readDecision, isAccountant, accountantName, money, requests };

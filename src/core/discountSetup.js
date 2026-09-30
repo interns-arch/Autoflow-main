@@ -74,6 +74,19 @@ function describe(r, t) {
   return lines.filter(Boolean).join('\n');
 }
 
+// THE START A RULE IS WRITTEN WITH: midnight the day before (see toPortal),
+// or the rule's own start when that is earlier still. null stays null - the
+// portal's own rules often have no start at all.
+function opensFrom(existing, now = new Date()) {
+  const iso = (d) => new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 19);
+  const opens = new Date(now);
+  opens.setDate(opens.getDate() - 1);
+  opens.setHours(0, 0, 0, 0);
+  if (existing === null) return null;
+  if (existing && new Date(existing).getTime() <= opens.getTime()) return existing;
+  return iso(opens);
+}
+
 // What the portal is sent, once the account exists. `target` is what
 // dealerPortal.dealerIdForAccount found: { dealerId, accountId, odooPartnerId }.
 // The rule carries the account and Odoo partner it was resolved from, and
@@ -90,6 +103,16 @@ function toPortal(r, target, customerName, from = new Date()) {
     end.setHours(23, 59, 59, 0);
   }
   const iso = (d) => new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 19);
+  // THE RULE STARTS AT MIDNIGHT YESTERDAY, not "now". valid_from is written
+  // in IST with no zone, and the portal's rule check at order punch compares
+  // it with the time in UTC - so a rule made at 11:44 IST only began to count
+  // at 17:14 IST. 28 Sep, live: rule 2873 (Customer Testing, MARUTI 10%,
+  // APPROVED) was not even a candidate on SO 1458, punched at 12:42 IST
+  // (discount_rule_eval: {winner: null, candidates: []}). A day's head start
+  // covers any zone; the end date is still counted from today.
+  const opens = new Date(start);
+  opens.setDate(opens.getDate() - 1);
+  opens.setHours(0, 0, 0, 0);
   return {
     rule_type: r.kind === 'brand' ? 'BRAND' : 'ITEM',
     brand: r.kind === 'brand' ? r.target : null,
@@ -104,7 +127,7 @@ function toPortal(r, target, customerName, from = new Date()) {
     is_active: true,
     // Only ever sent after a Sales Head said "OK DSC-…" on WhatsApp.
     approval_status: 'APPROVED',
-    valid_from: iso(start),
+    valid_from: iso(opens),
     valid_to: end ? iso(end) : null,
     priority: 100,
     // The name carries the customer as the PORTAL has them, which may differ
@@ -127,10 +150,11 @@ function toPortal(r, target, customerName, from = new Date()) {
 // 10% rule and a MARUTI headlight came back at ₹21,310, and dealer 1002's
 // APPROVED MARUTI 12% was not applied either. So the rule is applied here.
 //
-// A rule counts when it is APPROVED on the portal, or when WE made it
-// (rule_metadata.source 'whatsapp-bot'): the bot only ever creates a rule
-// after a Sales Head said "OK DSC-…", and the portal keeps those PENDING
-// because only a Super Admin may review there.
+// A rule counts only when it is APPROVED on the portal - the same test the
+// portal applies at order punch, so a quote never shows a discount the SO
+// will not carry. (Until 28 Sep the bot's own PENDING rules counted too, and
+// quotes said 10% off while SO 1458 was punched at 0%.) The Super Admin
+// approves on the portal; from that moment quotes and orders both have it.
 //
 // Most specific wins: a rule for this part, then for its brand, then one for
 // every part; between two of the same kind, the bigger discount.
@@ -141,8 +165,23 @@ const counts = (r) =>
   // Rejected on the portal never counts, the bot's own included (26 Sep:
   // rule 2869, written to the wrong dealer and rejected in Super Admin,
   // still priced that dealer's parts at 15% off).
-  String(r.approval_status || '').toUpperCase() !== 'REJECTED' &&
-  (String(r.approval_status || '').toUpperCase() === 'APPROVED' || (r.rule_metadata && r.rule_metadata.source === 'whatsapp-bot'));
+  String(r.approval_status || '').toUpperCase() === 'APPROVED';
+
+// ONE MAKER, SEVERAL SPELLINGS. The portal's brand list offers "MARUTI
+// SUZUKI" while a rule read back says "MARUTI" and a part row can say either
+// (28 Sep, live: MIYA JI MOTORS' approved MARUTI rule #2872 punched at 0%).
+// Two brands are the same when they are spelt alike, or when both are
+// spellings of one maker listed below — only listed ones: "TATA" and "TATA
+// AUTOCOMP" are two companies, and a wrong match is a discount nobody gave.
+const SAME_MAKER = [['MARUTI', 'SUZUKI', 'MARUTISUZUKI', 'MSIL', 'MARUTISUZUKIGENUINE', 'MGP']];
+const brandKey = (s) => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+function sameBrand(a, b) {
+  const x = brandKey(a);
+  const y = brandKey(b);
+  if (!x || !y) return false;
+  if (x === y) return true;
+  return SAME_MAKER.some((g) => g.includes(x) && g.includes(y));
+}
 
 function ruleFor(rules, { dealerId, partNo, brand, qty = 1, now = new Date() } = {}) {
   const norm = (s) => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
@@ -152,7 +191,7 @@ function ruleFor(rules, { dealerId, partNo, brand, qty = 1, now = new Date() } =
   const kind = (r) => {
     const type = String(r.rule_type || '').toUpperCase();
     if (type === 'ITEM') return r.part_no && norm(r.part_no) === norm(partNo) ? 3 : 0;
-    if (type === 'BRAND') return r.brand && brand && norm(r.brand) === norm(brand) ? 2 : 0;
+    if (type === 'BRAND') return r.brand && brand && sameBrand(r.brand, brand) ? 2 : 0;
     return !r.part_no && !r.brand ? 1 : 0; // every part for this customer
   };
   let best = null;
@@ -326,5 +365,5 @@ const CHANGE_RE = WANTS_RE;
 
 module.exports = {
   open, get, pending, save, cancel, STEPS, SKIP, LATER, YES, NO, readNumber, readDuration, ruleName, describe, toPortal,
-  requests, file, find, drop, forAccount, approvalText, pctFromPrice, priceAt, money, CHANGE_RE, wantsSetup, ruleFor, activeRules,
+  requests, file, find, drop, forAccount, approvalText, pctFromPrice, priceAt, money, CHANGE_RE, wantsSetup, ruleFor, activeRules, opensFrom,
 };

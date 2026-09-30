@@ -160,14 +160,25 @@ async function ordersFor(row, t) {
 
 async function ledgerFor(row, t) {
   const odoo = require('../integrations/odoo');
+  // Cheques given and not yet in Odoo count as paid (core/cheques): "owes"
+  // is what is left after them, and each cheque is listed under the head.
+  const pos = await require('./cheques')
+    .positionOf(row.id)
+    .catch(() => null);
+  const withCheques = pos && pos.cheques.length;
+  // Collection days, not the portal's credit_days (always 1 - one invoice).
+  const collection = Number(row.credit_limit) ? await require('./salesOrder').collectionDaysOf(row.id, row).catch(() => null) : null;
   const head = [
-    t('owes ₹', 'baaki ₹') + money(row.balance),
-    Number(row.pdc_amount) ? 'PDC ₹' + money(row.pdc_amount) : null,
+    withCheques
+      ? t('owes ₹', 'baaki ₹') + money(pos.afterCheques) + t(` (₹${money(row.balance)} less cheques ₹${money(pos.chequeAmount)})`, ` (₹${money(row.balance)} mein se cheque ₹${money(pos.chequeAmount)} ghata ke)`)
+      : t('owes ₹', 'baaki ₹') + money(row.balance),
+    !withCheques && Number(row.pdc_amount) ? 'PDC ₹' + money(row.pdc_amount) : null,
     Number(row.credit_limit)
-      ? 'limit ₹' + money(row.credit_limit) + (row.credit_days ? ' / ' + row.credit_days + t(Number(row.credit_days) === 1 ? ' day' : ' days', ' din') : '')
+      ? 'limit ₹' + money(row.credit_limit) + (collection ? t(' / collection ' + collection + ' days', ' / collection ' + collection + ' din') : '')
       : null,
   ].filter(Boolean);
   const out = [row.name + ' - ' + head.join(' · ')];
+  if (withCheques) out.push(t('Cheques received, not in the ledger yet:', 'Cheque mil gaye, ledger mein abhi nahi:'), ...require('./cheques').chequeLines(pos, t));
 
   if (odoo.enabled() && row.odoo_partner_id) {
     try {
@@ -247,7 +258,7 @@ const OWN = [
   // more often — so it is matched first.
   { re: /\bcredit\s*limit\b/i, intent: 'ledger' },
   { re: /\b(credits?|credit\s*notes?|cn)\b/i, intent: 'credit' },
-  { re: /\b(ledger|statement|khata|hisaab|hisab)\b/i, intent: 'ledger' },
+  { re: /\b(ledger|ledgar|ladger|ladgar|leger|legar|lejer|lezer|legder|ledgr|statement|khata|khaata|hisaab|hisab)\b/i, intent: 'ledger' },
   { re: /\b(balance|baki|baaki|bakaya|baqaya|outstanding|kitna dena|kitne paise|due)\b/i, intent: 'ledger' },
   { re: /\b(billed|bill\s*(hua|ho\s*gaya|kiya|kar\s*diya|banaya)|invoice\s*(hua|ho\s*gaya))\b/i, intent: 'billed' },
   { re: /\b(mera|hamara|humara|meri|hamari)\b[^\n]{0,20}\b(order|maal|saman|samaan)\b/i, intent: 'status' },
@@ -727,4 +738,4 @@ async function answer(row, intent, t) {
   return ordersFor(row, t);
 }
 
-module.exports = { parse, parseOwn, answer, answerOwn, ownRow, ordersFor, parseBill, sendBill, parseOrderDetail, orderDetail, parseDesk, classifyDesk, trackText, invoiceStatusText, shortageText, partStatusText, incomingText, orderListFacts, trackFacts, invoiceFacts, shortageFacts, _internals: { money, day, where, same, cleanName, stageOf } };
+module.exports = { parse, parseOwn, answer, answerOwn, ownRow, ordersFor, parseBill, sendBill, parseOrderDetail, orderDetail, parseDesk, classifyDesk, trackText, invoiceStatusText, shortageText, partStatusText, incomingText, orderListFacts, trackFacts, invoiceFacts, shortageFacts, _internals: { money, day, where, same, cleanName, stageOf }, _ledgerFor: ledgerFor };

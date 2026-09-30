@@ -77,6 +77,17 @@ const config = {
   // care, monitoring...). The customer's own number is added on top.
   groupDefaultMembers: list(process.env.GROUP_DEFAULT_MEMBERS).map(digits).filter(Boolean),
   groupSubjectPrefix: (process.env.GROUP_SUBJECT_PREFIX || 'Cartrends').trim(),
+  // GROUPS_ANSWER_ALL=true: answer customers in ANY group the bot's number is
+  // in - one it was added to, not only one it created. Off by default: an
+  // unrelated group would otherwise hear from it. (On the Cloud API the
+  // number is only ever in groups it created, so this matters for the linked
+  // WhatsApp transport.)
+  groupsAnswerAll: String(process.env.GROUPS_ANSWER_ALL || '').toLowerCase() === 'true',
+  // ETA_OFFERS=true: after an order is punched with parts not in stock, offer
+  // those parts to the customer as an advance order with their ETA
+  // (core/advanceOrders), and tell whoever placed it. OFF for now (founder,
+  // 29 Sep).
+  etaOffers: String(process.env.ETA_OFFERS || '').toLowerCase() === 'true',
   internalWarehouseName: process.env.INTERNAL_WAREHOUSE_NAME || 'Bijwasan',
 
   stockBroadcastTimes: times(process.env.STOCK_BROADCAST_TIMES, ['09:30', '16:00']),
@@ -138,6 +149,15 @@ const config = {
     adminUsername: (process.env.DEALER_PORTAL_ADMIN_USERNAME || '').trim(),
     adminPassword: (process.env.DEALER_PORTAL_ADMIN_PASSWORD || '').trim(),
     adminToken: (process.env.DEALER_PORTAL_ADMIN_TOKEN || '').trim(),
+
+    // THE LOGIN THAT APPROVES DISCOUNT RULES on the portal. The admin login
+    // writes the rule, and the portal answers 403 when that same login then
+    // approves it (28 Sep, live: rules 2872 created and updated, both left
+    // PENDING, so order punch gave 0%). A second user holding the portal's
+    // discount-approval permission goes here. Blank = the admin login.
+    approverUsername: (process.env.DEALER_PORTAL_APPROVER_USERNAME || '').trim(),
+    approverPassword: (process.env.DEALER_PORTAL_APPROVER_PASSWORD || '').trim(),
+    approverToken: (process.env.DEALER_PORTAL_APPROVER_TOKEN || '').trim(),
 
     // Token lifecycle: the portal's access_token expires; these control
     // proactive refresh so no customer request ever hits an expired token.
@@ -203,6 +223,9 @@ const config = {
   reminderTime: (process.env.REMINDER_TIME || '10:00').trim(),
   // The dashboard (/dashboard): its data is shown only with this key. Unset = off.
   dashboardKey: (process.env.DASHBOARD_KEY || '').trim(),
+  // A second port that serves ONLY the dashboard (console/server.startDashboard),
+  // for opening to the team. 0 / unset = off.
+  dashboardPort: parseInt(process.env.DASHBOARD_PORT || '0', 10) || 0,
 
   // human-confirm escalation: confusion par is number ko DM, itni der jawab
   // ka intezar, phir customer ko fallback reply. Helper ka jawab PERMANENTLY
@@ -298,6 +321,20 @@ const config = {
     qrImage: (process.env.PAYMENT_QR_IMAGE || '').trim(),
     // Below this, a balance counts as settled.
     settledBelow: Number(process.env.PAYMENT_SETTLED_BELOW || 1),
+    // How often held orders are re-checked against the portal's balance, so
+    // a payment made straight to the bank releases the order by itself.
+    heldCheckMinutes: Number(process.env.HELD_ORDER_CHECK_MINUTES || 15),
+  },
+
+  // LOSS BILLING (founder, 30 Sep): an order line sold below our purchase
+  // cost is punched only after Prateek Sir's OK (core/lossBilling).
+  lossBilling: {
+    approvers: nameMap(process.env.LOSS_APPROVER_NUMBERS || '919999492550:Prateek Sir'),
+    // The portal's base_price is our purchase cost; the customer's price
+    // includes GST. Compared ex-GST unless the cost is said to include it.
+    costIncludesGst: String(process.env.LOSS_COST_INCLUDES_GST || '').toLowerCase() === 'true',
+    defaultTaxPercent: Number(process.env.LOSS_DEFAULT_TAX_PERCENT || 18),
+    enabled: String(process.env.LOSS_BILLING_CHECK || 'true').toLowerCase() !== 'false',
   },
 
   creation: {
@@ -308,6 +345,24 @@ const config = {
     approvers: nameMap(process.env.CREATION_APPROVER_NUMBERS),
     // Told when an account is made, so the desk is not surprised by it.
     notify: nameMap(process.env.CREATION_NOTIFY_NUMBERS),
+    // NEW-CUSTOMER APPROVAL (founder, 29 Sep): the request goes ONLY to these,
+    // and only they can approve or reject it. The approvers above keep every
+    // other request (orders, the daily report).
+    accountApprovers: nameMap(process.env.ACCOUNT_APPROVER_NUMBERS || '919773900582:Arun Sir'),
+    // Told when a new customer is approved or rejected (besides the agent who
+    // opened it and the customer).
+    accountDecisionNotify: nameMap(process.env.ACCOUNT_DECISION_NOTIFY || '919999492550:Prateek Sir'),
+    // WHO GETS THE NEW CUSTOMER'S DETAILS once the account is open (founder,
+    // 29 Sep: Tez Expert - Alam ji and Shubham Kumar). "phone:name,...".
+    accountCreatedTeam: nameMap(process.env.ACCOUNT_CREATED_TEAM || '919217030408:Alam ji,919122781913:Shubham Kumar'),
+    // Told when an agent sets up or changes a discount. A notice only: the
+    // rule is approved or rejected on the Dealer Portal by a Super Admin.
+    discountSetupNotify: nameMap(process.env.DISCOUNT_SETUP_NOTIFY || '919999492550:Prateek Sir'),
+    // WHO APPROVES A DISCOUNT ON WHATSAPP before it goes to the portal
+    // (founder, 30 Sep: Arun Sir). Only these may say OK / NO to a DSC-…;
+    // their decision goes to discountSetupNotify (Prateek Sir), who then
+    // approves or rejects the rule on the Dealer Portal as Super Admin.
+    discountApprovers: nameMap(process.env.DISCOUNT_APPROVER_NUMBERS || '919773900582:Arun Sir'),
     // The commercial terms a CUSTOMER is never asked for. A person being
     // onboarded does not set their own credit limit.
     defaultCreditDays: parseInt(process.env.CREATION_DEFAULT_CREDIT_DAYS || '1', 10),
@@ -379,6 +434,10 @@ const config = {
     // AGENT_ALLOW_FROM is gone: with no template path, a list could only
     // decide who gets no answer at all.
     enabled: String(process.env.AGENT_ENABLED || 'true').toLowerCase() !== 'false',
+    // The STAFF agent (agent/staff): sales team, agents and admins are
+    // understood and answered by the model, which drives the desk. Off =
+    // the desk answers them directly, as before.
+    staffEnabled: String(process.env.AGENT_STAFF || 'true').toLowerCase() !== 'false',
     // A runaway loop costs money and makes a customer wait. Measured: a
     // normal part-and-price turn is 2 to 4 tool calls.
     maxToolCalls: parseInt(process.env.AGENT_MAX_TOOL_CALLS || '10', 10),

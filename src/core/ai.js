@@ -108,6 +108,10 @@ function bareQty(text) {
   const t = String(text || '').trim();
   if (!t || t.length > 30) return null;
   const stripped = t
+    // "Quantity 2", "qty: 2", "2 quantity" (30 Sep, live, Ujjwal: the line
+    // under the part number was looked up as a part called "Quantity").
+    .replace(/^(?:then|toh|ok)?\s*(?:quantity|qty)\s*[:=-]?\s*/i, '')
+    .replace(/\s*(?:quantity|qty)\s*$/i, '')
     .replace(/^(send|bhejo|bhej\s*do|dena|de\s*do|chahiye|need|want)\s+/i, '')
     // "1 kr do", "2 kardo", "3 hi", "4 chahiye", "5 rakho" - still just a
     // quantity (14 Sep, live: "1 kr do" was looked up as a part called "kr do").
@@ -297,6 +301,15 @@ function parseLinesBlock(rawText) {
   };
 
   if (out.length) return withTrailing(out);
+
+  // A digits-only part number (a barcode, 8906105000797) with its quantity on
+  // the line under it: the token scan below does not see a number without
+  // letters as a part (30 Sep, live, Ujjwal: "8906105000797 / Quantity 2").
+  if (trailingQty !== null) {
+    const partLines = String(text || '').split(/\n/).map((l) => l.trim()).filter((l) => l && bareQty(l) === null);
+    // Never a mobile number (a customer's, with the order under it).
+    if (partLines.length === 1 && /^\d{7,13}$/.test(partLines[0]) && !/^(?:91)?[6-9]\d{9}$/.test(partLines[0])) return [{ item: partLines[0], qty: trailingQty, price: null }];
+  }
 
   // Nothing had a quantity attached — but a part number on its own IS an
   // order. This is the commonest photo of all: the customer snaps the Maruti
@@ -554,9 +567,10 @@ function modelAvailable() {
 }
 
 // user may be a plain string or a content-block array (for images)
-async function model(system, user) {
+// opts: { modelName, timeoutMs } for a call that wants a lighter model.
+async function model(system, user, opts) {
   if (modelStub) return modelStub(system, user);
-  return geminiJson(system, user);
+  return geminiJson(system, user, opts);
 }
 
 // The same call with Google Search behind it, for facts the model should look
@@ -804,6 +818,16 @@ async function parseOrderImage(base64, mediaType) {
   // finished answer, not a failure: it returns an empty list.
   const primary = await geminiOrderImage(base64, mediaType);
   if (!primary) {
+    // GEMINI COULD NOT ANSWER (no key, out of credit, down): the words on the
+    // photo are read on this machine instead (core/ocr). 30 Sep, live: Gemini
+    // answered 402 and every photo came back "part number nahi padh paya".
+    const why = modelAvailable() ? lastImageNote : 'there is no AI key on this machine';
+    const local = modelStub ? null : await require('./ocr').orderLines(base64).catch(() => null);
+    if (local && local.length) {
+      lastImageNote = null;
+      store.log('ai', `photo read by the local text reader (${why}): ${local.length} line(s)`);
+      return local;
+    }
     if (!modelAvailable()) {
       lastImageNote = 'there is no AI key on this machine, so photos cannot be read';
       store.log('ai', 'no vision key on this machine — the photo cannot be read');
@@ -1045,5 +1069,6 @@ module.exports = {
   _setModel: (fn) => {
     modelStub = fn || null;
   },
+  _stubbed: () => Boolean(modelStub),
   // exported for tests
   _internals: { scanPartTokens, maxTokensPerLine, isPartToken, isJunkItem, joinSpacedPartNumbers, sanitizeOrderLines, PART_TOKEN_RE, QTY_UNIT_TOKEN } };

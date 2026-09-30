@@ -69,6 +69,21 @@ function customers(events) {
       odooPartner: facts.odooPartner || null,
       note: rej && rej.note ? rej.note : null,
     });
+    // WAITING, AND THE APPROVER NEVER GOT IT (founder, 29 Sep): Arun Sir had
+    // not written to the bot for 24 hours, so WhatsApp refused the request.
+    // It goes to him again the moment he writes (customerBot.resendUndelivered).
+    const row = out[out.length - 1];
+    if (row.status === 'waiting for approval') {
+      const dw = require('./deliveryWatch');
+      const cfg = require('../config');
+      const names = { ...(cfg.creation.approvers || {}), ...(cfg.creation.accountApprovers || {}) };
+      const missed = dw.undeliveredFor(row.id);
+      if (missed.length) {
+        const who = missed.map((p) => names[p] || '+' + p).join(', ');
+        row.approvalNotDelivered = who;
+        row.note = `Approval not delivered to ${who} — WhatsApp needs them to message the bot first (24-hour window). It is sent again as soon as they do.`;
+      }
+    }
   }
   return out.sort((a, b) => String(b.requestedAt).localeCompare(String(a.requestedAt)));
 }
@@ -79,11 +94,15 @@ function discounts(events) {
     const req = list.find((e) => e.event === 'requested') || {};
     const done = list.find((e) => e.event === 'approved');
     const rej = list.find((e) => e.event === 'rejected');
+    // Since 28 Sep a request goes straight to the portal ("sent to portal",
+    // with the rule number); the portal's Super Admin decides it there.
+    const sent = [...list].reverse().find((e) => e.event === 'sent to portal');
     out.push({
       id: list[0].id,
       requestedAt: req.at || list[0].at,
       decidedAt: (done || rej || {}).at || null,
-      status: done ? 'approved' : rej ? 'rejected' : 'waiting for approval',
+      status: done ? 'approved' : rej ? 'rejected' : sent ? 'waiting for Super Admin' : 'waiting for approval',
+      portalDetail: sent ? sent.detail : null,
       customer: req.customer || (done && done.customer) || (rej && rej.customer) || null,
       asked: req.detail || null,
       result: (done && done.detail) || (rej && rej.detail) || null,
@@ -122,11 +141,15 @@ function orders(events) {
     ({ confirmed: 'placed', approval: 'waiting for approval', awaitingPayment: 'waiting for payment', rejected: 'rejected' })[o.status] || null;
   const out = [];
   for (const o of store.orders()) {
-    const st = status(o);
+    // A punch the portal refused is shown whatever state the order was left
+    // in - a cart confirmed straight from the chat stays a draft when the
+    // portal says no, and used to vanish from here.
+    const refusedHere = o.punchRefused && o.status !== 'confirmed';
+    const st = status(o) || (refusedHere ? 'refused by portal' : null);
     if (!st) continue; // drafts and carts nobody confirmed
     const log = logByOrder.get('order:' + o.id) || [];
     const req = log.find((e) => e.event === 'requested');
-    const failed = log.find((e) => e.event === 'failed');
+    const failed = [...log].reverse().find((e) => e.event === 'failed') || (refusedHere ? { detail: o.punchRefused.why, at: o.punchRefused.at } : null);
     const pc = o.portalCustomer || (typeof o.customer === 'object' ? o.customer : null) || {};
     const chatPhone = phoneOf(o.chatId);
     // Who placed it, as recorded when it was asked for; the number's role
@@ -141,8 +164,10 @@ function orders(events) {
     const amount = punched.reduce((s, l) => s + (Number(l.rate) || Number(l.mrp) || 0) * Math.min(Number(l.qty) || 0, Number(l.available) || 0), 0);
     out.push({
       id: o.id,
-      at: o.confirmedAt || o.approvalAskedAt || o.createdAt || null,
-      status: failed && st !== 'placed' ? 'refused by portal' : st,
+      at: o.confirmedAt || o.approvalAskedAt || (refusedHere && o.punchRefused.at) || o.createdAt || null,
+      // Punched, then cancelled on the portal (core/cancelWatch): not placed.
+      status: o.portalCancelled ? 'cancelled on portal' : failed && st !== 'placed' ? 'refused by portal' : st,
+      cancelledAt: o.portalCancelled ? o.portalCancelled.at : null,
       customer: pc.name || (typeof o.customer === 'string' && !/@/.test(o.customer) ? o.customer : null),
       customerId: pc.buyerId || null,
       placedBy: agent ? (/^Admin /.test(agent) ? agent : agent + ' (agent)') : 'customer',
@@ -153,7 +178,7 @@ function orders(events) {
       lines: (o.lines || []).map((l) => `${l.partNo || l.item} x${l.qty}`).join(', '),
       amount: Math.round(amount * 100) / 100,
       paymentHold: o.paymentId || null,
-      note: failed ? failed.detail : null,
+      note: o.portalCancelled ? 'cancelled on the portal after the punch (portal order ' + o.portalCancelled.so + ')' + (o.portalCancelled.told ? ' — customer told' : '') : failed ? failed.detail : null,
     });
   }
   return out.sort((a, b) => String(b.at).localeCompare(String(a.at)));
@@ -184,9 +209,184 @@ async function enrich(list) {
   return list;
 }
 
+// ---------------------------------------------------------------- the portal
+//
+// THE BOT'S RECORD AND THE PORTAL'S, SIDE BY SIDE (founder, 28 Sep: "status
+// of order, customer creation, discount and all data take from dealer portal
+// and bot data"). The approval log says what was asked and decided here; the
+// portal says where each thing stands there - allocated, invoiced,
+// dispatched; the account open or not; the rule approved by the Super Admin,
+// still pending, or gone. Every read is cached for five minutes and capped in
+// number, so opening the dashboard can never flood the portal; if the portal
+// does not answer, the bot's own record still shows and `sources` says so.
+const TTL_MS = 5 * 60 * 1000;
+const cacheOf = new Map(); // key -> { at, value }
+async function cached(key, fn) {
+  const hit = cacheOf.get(key);
+  if (hit && Date.now() - hit.at < TTL_MS) return hit.value;
+  const value = await fn();
+  cacheOf.set(key, { at: Date.now(), value });
+  if (cacheOf.size > 2000) cacheOf.delete(cacheOf.keys().next().value);
+  return value;
+}
+// A few at a time, in order.
+async function eachLimited(items, n, fn) {
+  let i = 0;
+  const run = async () => {
+    while (i < items.length) {
+      const it = items[i++];
+      await fn(it).catch(() => {});
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(n, items.length) }, run));
+}
+
+// ORDERS: the portal order behind each one - its allocation, invoice and
+// dispatch - for the 60 most recent that reached the portal.
+async function portalOrders(list) {
+  const portal = require('../integrations/dealerPortal');
+  const withSo = list.filter((o) => o.portalOrder).slice(0, 60);
+  await eachLimited(withSo, 4, async (o) => {
+    const id = String(o.portalOrder).split(/\s*\/\s*/)[0].trim();
+    if (!/^\d+$/.test(id)) return;
+    const raw = await cached('order:' + id, () => portal.order(Number(id)));
+    const p = (raw && raw.data) || raw || {};
+    const lines = p.lines || p.order_lines || [];
+    const disc = lines.map((l) => Number(l.item_discount_per) || 0);
+    o.portal = {
+      order: id,
+      status: p.status || null,
+      doStatus: p.do_status || null,
+      invoice: p.invoice_status || null,
+      invoiceNo: p.invoice_no || null,
+      dispatch: p.tracker_status || null,
+      dispatchedAt: p.dispatched_at || null,
+      odooSo: p.odoo_so_name || null,
+      closed: Boolean(p.is_closed),
+      total: p.total_amount != null ? Number(p.total_amount) : null,
+      discount: disc.length ? (disc.some((x) => x > 0) ? Math.max(...disc) + '%' : '0%') : null,
+    };
+    // Cancelled there before the watcher's next look: shown as such at once.
+    if (/cancel/i.test(String(p.status || '') + ' ' + String(p.do_status || '')) && o.status === 'placed') {
+      o.status = 'cancelled on portal';
+      o.note = o.note || 'cancelled on the portal after the punch (portal order ' + id + ')';
+    }
+    // Where it stands, in one word the team uses.
+    o.portalStage = p.dispatched_at || /dispatch|deliver/i.test(p.tracker_status || '')
+      ? 'dispatched'
+      : p.invoice_no || /invoiced|done|complete/i.test(p.invoice_status || '')
+        ? 'invoiced'
+        : p.is_closed
+          ? 'closed'
+          : p.status
+            ? String(p.status).toLowerCase()
+            : null;
+  });
+}
+
+// DISCOUNTS: every request's rule as the portal has it now, and the rules
+// kept on the portal for a customer that the bot never asked for.
+function ruleIdOf(d) {
+  const m = String([d.result, d.asked, d.portalDetail].filter(Boolean).join(' ')).match(/rule\s*#?\s*(\d{3,})/i);
+  return m ? Number(m[1]) : null;
+}
+async function portalDiscounts(list) {
+  const portal = require('../integrations/dealerPortal');
+  const rules = await cached('discount-rules', () => portal.listDiscountRules());
+  const byId = new Map(rules.map((r) => [Number(r.rule_id || r.id), r]));
+  const seen = new Set();
+  const status = (r) => {
+    const s = String((r && r.approval_status) || '').toUpperCase();
+    if (!r) return 'not on portal';
+    if (r.is_active === false) return 'inactive on portal';
+    // Past its end date it prices nothing, approved or not.
+    if (r.valid_to && new Date(r.valid_to).getTime() < Date.now()) return 'expired';
+    return s === 'APPROVED' ? 'approved' : s === 'REJECTED' ? 'rejected' : 'waiting for Super Admin';
+  };
+  const facts = (r) => ({
+    rule: Number(r.rule_id || r.id),
+    name: r.rule_name || null,
+    on: r.rule_type === 'ITEM' ? 'part ' + r.part_no : r.brand ? 'brand ' + r.brand : 'all parts',
+    value: r.discount_value != null ? r.discount_value + (String(r.discount_mode || '').toUpperCase() === 'PERCENT' ? '%' : '') : null,
+    approval: r.approval_status || null,
+    validFrom: r.valid_from || null,
+    validTo: r.valid_to || null,
+    dealer: r.dealer_id || null,
+  });
+  for (const d of list) {
+    const id = d.ruleId || ruleIdOf(d);
+    if (!id) continue;
+    d.ruleId = id;
+    seen.add(id);
+    const r = byId.get(id);
+    d.portal = r ? facts(r) : { rule: id, approval: null };
+    // The portal decides now: a Sales Head's "OK" on WhatsApp was never
+    // approval there.
+    d.status = status(r);
+    // Decided on the portal: its last update is when the Super Admin said
+    // yes or no - the date a "discounts approved on 28 Sep" count reads.
+    if (r && !d.decidedAt && /approved|rejected|expired/.test(d.status)) d.decidedAt = r.updated_at || null;
+  }
+  // Rules the BOT wrote on the portal that its log does not have (written
+  // before the log kept them). Only the bot's (founder, 28 Sep: "take data
+  // from portal only bot report, not all report") - a rule typed on the
+  // portal by someone is the portal's business, not this dashboard's.
+  for (const r of rules) {
+    const id = Number(r.rule_id || r.id);
+    if (seen.has(id) || !r.dealer_id) continue;
+    if (!(r.rule_metadata && r.rule_metadata.source === 'whatsapp-bot')) continue;
+    list.push({
+      id: 'RULE-' + id,
+      ruleId: id,
+      requestedAt: r.created_at || null,
+      decidedAt: /^(APPROVED|REJECTED)$/i.test(String(r.approval_status || '')) ? r.updated_at || null : null,
+      status: status(r),
+      customer: String(r.rule_name || '').replace(/\s+\S+\s+-?[\d.]+%?$/, '').trim() || null,
+      asked: facts(r).on + ' ' + (facts(r).value || ''),
+      result: null,
+      createdBy: r.requested_by_name || r.requested_by || (r.rule_metadata && r.rule_metadata.setBy) || 'portal',
+      source: r.rule_metadata && r.rule_metadata.source === 'whatsapp-bot' ? 'bot' : 'portal',
+      portal: facts(r),
+    });
+  }
+  list.sort((a, b) => String(b.requestedAt || '').localeCompare(String(a.requestedAt || '')));
+}
+
+// CUSTOMERS: is the account on the portal - found by its mobile number - and
+// under which account id and dealer. For the 80 most recent requests.
+async function portalCustomers(list) {
+  const so = require('./salesOrder');
+  const recent = list.filter((c) => c.phone).slice(0, 80);
+  await eachLimited(recent, 4, async (c) => {
+    const ten = String(c.phone).replace(/\D/g, '').slice(-10);
+    if (ten.length !== 10) return;
+    const rows = await cached('acct:' + ten, () => so.findByKey({ phone: '91' + ten }));
+    const r = (rows || [])[0] || null;
+    c.portal = r ? { account: r.id, name: r.name || null, gst: r.gst_no || null, dealer: r.home_branch_dealer_id || null, accounts: rows.length } : { account: null };
+    c.portalStatus = r ? 'on portal' : c.status === 'created' ? 'NOT found on portal' : 'not on portal yet';
+    if (r && !c.gst && r.gst_no) c.gst = r.gst_no;
+  });
+}
+
 async function buildLive() {
   const out = build();
-  await enrich(out.customers).catch(() => {});
+  out.sources = { bot: 'ok' };
+  const step = async (name, fn) => {
+    try {
+      await fn();
+      out.sources[name] = 'ok';
+    } catch (e) {
+      out.sources[name] = 'portal did not answer: ' + String((e && e.message) || e).slice(0, 80);
+    }
+  };
+  await Promise.all([
+    step('customers', async () => {
+      await enrich(out.customers);
+      await portalCustomers(out.customers);
+    }),
+    step('orders', () => portalOrders(out.orders)),
+    step('discounts', () => portalDiscounts(out.discounts)),
+  ]);
   return out;
 }
 
@@ -206,6 +406,8 @@ function build() {
         placed: count(o, 'placed'),
         waiting: count(o, 'waiting for approval') + count(o, 'waiting for payment'),
         rejected: count(o, 'rejected'),
+        refused: count(o, 'refused by portal'),
+        cancelled: count(o, 'cancelled on portal'),
         value: Math.round(o.filter((x) => x.status === 'placed').reduce((s, x) => s + x.amount, 0)),
       },
       discounts: { total: d.length, approved: count(d, 'approved'), waiting: count(d, 'waiting for approval'), rejected: count(d, 'rejected') },

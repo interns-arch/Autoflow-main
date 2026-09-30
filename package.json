@@ -24,7 +24,8 @@
     "test:gst": "node scripts/test-gst.js",
     "test:watext": "node scripts/test-watext.js",
     "test:discount": "node scripts/test-discount.js",
-    "check:portal": "node scripts/check-portal-contracts.js"
+    "check:portal": "node scripts/check-portal-contracts.js",
+    "test:staff": "node scripts/test-staff-agent.js"
   },
   "dependencies": {
     "@langchain/core": "^1.2.12",
@@ -40,6 +41,7 @@
     "pdfkit": "^0.15.2",
     "pg": "^8.23.0",
     "qrcode": "^1.5.4",
+    "tesseract.js": "^6.0.1",
     "whatsapp-web.js": "^1.34.7",
     "xlsx": "^0.18.5"
   }

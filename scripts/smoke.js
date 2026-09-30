@@ -41,6 +41,7 @@ process.env.GEMINI_API_KEY = ''; // voice notes are not transcribed in the suite
 // actually returned for scripts/fixtures/test_order.png. The suite is about
 // what the bot does with the lines, not about who read them off the picture.
 process.env.ORDER_CONFIRM_ENABLED = 'true'; // mock portal — safe to punch here
+process.env.PHOTO_ALBUM_WAIT_MS = '0'; // each photo answered at once; the album has its own test
 
 const path = require('path');
 const fs = require('fs');
@@ -50,7 +51,20 @@ const config = require('../src/config');
 // Most of this suite finds customers by name and GSTIN; the mobile-only
 // search (the default since 26 Sep) has its own section, [74].
 config.customerSearchBy = 'any';
+// This suite is about the DESK: the staff agent in front of it has its own
+// check with the real model (npm run test:staff). Some sections below set a
+// stand-in Gemini key, and the staff agent must not try it.
+config.agent.staffEnabled = false;
+config.etaOffers = true; // off live for now (29 Sep); the offer flow is still tested
+// Set per test below (29 Sep): who approves a new customer, who hears of a
+// customer decision or a discount setup.
+config.creation.accountApprovers = {};
+config.creation.accountDecisionNotify = {};
+config.creation.discountSetupNotify = {};
 config.dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'autoflow-smoke-'));
+// The local photo reader (core/ocr) is not started by these tests: it would
+// fetch its language data. Its reading is tested on text it produced ([78]).
+process.env.OCR_FALLBACK = 'false';
 config.customerDms = ['919899555001'];
 config.adminNumbers = ['919800000009'];
 config.escalationNumber = '917004130460';
@@ -127,6 +141,100 @@ async function main() {
     subject: 'Delhi Dealers',
     customer: '919899000888',
   });
+
+  // SEVERAL PHOTOS ARE ONE MESSAGE (29 Sep, live: four screenshots, four
+  // replies, one only "senior se confirm karke batata hoon").
+  {
+    process.env.PHOTO_ALBUM_WAIT_MS = '60';
+    const ab = new CustomerBot();
+    const asked = [];
+    ab.answerRead = async (m, text, att) => (asked.push({ chat: m.chatId, att }), true);
+    const mm = (n) => ({ chatId: 'sim-album', from: '919811100077', id: 'p' + n });
+    const photo = (lines) => ({ kind: 'photo', lines });
+    ab.collectPhoto(mm(1), '', photo([{ item: '22100M83K40', qty: 1 }, { item: '22400M83K02', qty: 1 }]), async () => true, (en) => en);
+    ab.collectPhoto(mm(2), '', photo([{ item: '29938434', qty: 5 }]), async () => true, (en) => en);
+    ab.collectPhoto(mm(3), '', photo([]), async () => true, (en) => en);
+    await new Promise((r) => setTimeout(r, 150));
+    const one = asked[0] && asked[0].att;
+    check('photos sent together are answered once, every line in one message', asked.length === 1 && one.album === 3 && one.unread === 1 && one.lines.map((l) => l.item).join(',') === '22100M83K40,22400M83K02,29938434');
+    check('...and the agent is told to answer them as one list', /Sent 3 PHOTOS together — answer them as ONE list/.test(require('../src/agent/incoming').describeAttachment(one)) && /3\. 29938434 x 5/.test(require('../src/agent/incoming').describeAttachment(one)));
+    ab.collectPhoto(mm(4), '', photo([{ item: '37995M79M02', qty: 10 }]), async () => true, (en) => en);
+    await new Promise((r) => setTimeout(r, 150));
+    check('...a single photo is still answered on its own', asked.length === 2 && !asked[1].att.album && asked[1].att.lines[0].item === '37995M79M02');
+    process.env.PHOTO_ALBUM_WAIT_MS = '0';
+  }
+
+  // A CHEQUE GIVEN AND NOT YET IN ODOO COUNTS AS PAID ONCE RECEIVED (29 Sep).
+  {
+    const ch = require('../src/core/cheques');
+    portal.setMockCustomers([{ id: 9001, name: 'Cheque Motors', phone: '919811100009', balance: '10000.00', credit_limit: '50000', credit_days: 7 }]);
+    portal.setMockPdc({
+      balance: { 9001: { balance: '10000.00', customer_outstanding: '10000.00', pdc_amount: '6000.00', balance_is_live: true } },
+      cheques: [
+        { txn_id: 1, acc_id: 9001, pdc_number: '004512', pdc_amount: '6000.00', cheque_date: '2026-10-02', status: 'deposited', bank_name: 'HDFC' },
+        { txn_id: 2, acc_id: 9001, pdc_number: '004499', pdc_amount: '3000.00', cheque_date: '2026-09-01', status: 'rejected', bank_name: 'HDFC' },
+        { txn_id: 3, acc_id: 9001, pdc_number: '004400', pdc_amount: '5000.00', cheque_date: '2026-08-01', status: 'cleared', bank_name: 'HDFC' },
+      ],
+    });
+    const pos = await ch.positionOf(9001, { fresh: true });
+    check('cheques: a deposited cheque counts, a rejected or cleared one does not', pos.owed === 10000 && pos.chequeAmount === 6000 && pos.afterCheques === 4000 && pos.cheques.length === 1 && pos.failed.length === 1);
+    const due = await require('../src/core/payments').dueOf({ buyerId: 9001, name: 'Cheque Motors' });
+    check('...what they still owe is Odoo less the cheque', due && due.due === 4000 && due.owed === 10000 && due.chequeAmount === 6000);
+    const said = await require('../src/core/customerLookup')._ledgerFor({ id: 9001, name: 'Cheque Motors', balance: '10000.00' }, (en, hi) => hi);
+    check('...and the ledger answer says so, cheque by cheque', /baaki ₹4,000/.test(said) && /004512 · ₹6,000/.test(said) && !/004499/.test(said), said);
+    // THE HOLD SPELLS IT OUT (29 Sep): total due, the cheque, what is left.
+    const pay = require('../src/core/payments');
+    const bd = pay.breakdown(due, (en, hi) => en);
+    check('...the breakdown says total, cheque and what is still to pay', /Total due: Rs\.10,000/.test(bd) && /Cheque received: Rs\.6,000 \(no\. 004512/.test(bd) && /Still to pay: Rs\.4,000/.test(bd), bd);
+    const cb = new CustomerBot();
+    const heldOrder = { id: 'ORD-CHQ1', chatId: 'sim-919800000301', lines: [] };
+    const hold = await cb.holdForPayment(heldOrder, { buyerId: 9001, name: 'Cheque Motors' }, { customerPhone: '919811100009', agent: 'Krishna Kumar' });
+    const toCust = cb.transport.outbox.map((o) => o.text || '').join('\n');
+    check('...short of the due: the order is held for the rest only', hold && hold.due === 4000 && hold.owed === 10000 && hold.chequeAmount === 6000 && heldOrder.status === 'awaitingPayment');
+    check('...and the customer is shown the cheque was counted and what is left', /cheque mil gaya/i.test(toCust) && /Total baaki: Rs\.10,000/.test(toCust) && /Abhi dena hai: Rs\.4,000/.test(toCust), toCust);
+    portal.setMockPdc({
+      balance: { 9001: { balance: '10000.00', customer_outstanding: '10000.00', balance_is_live: true } },
+      cheques: [{ txn_id: 1, acc_id: 9001, pdc_number: '004512', pdc_amount: '10000.00', cheque_date: '2026-10-02', status: 'verified' }],
+    });
+    const freeOrder = { id: 'ORD-CHQ2', chatId: 'sim-919800000301', lines: [] };
+    const none = await cb.holdForPayment(freeOrder, { buyerId: 9001, name: 'Cheque Motors' });
+    check('...covered by the cheque: not held, and the order carries why', none === null && freeOrder.chequeCovered && freeOrder.chequeCovered.chequeAmount === 10000);
+    check('...which the news of the order says', /covered by the cheque/.test(cb.chequeCoveredNote(freeOrder, (en) => en)) && /Still to pay: nil/.test(cb.chequeCoveredNote(freeOrder, (en) => en)));
+
+    // The watch first sees the rejected cheque that was already there.
+    portal.setMockPdc({ balance: {}, cheques: [{ txn_id: 2, acc_id: 9001, status: 'rejected', pdc_amount: '3000.00' }] });
+    const told = [];
+    const fakeBot = { transport: { sendText: async (to, text) => told.push([to, text]) } };
+    const watch = require('../src/core/chequeWatch');
+    check('...a bounce already there when the watch starts is not announced', (await watch.checkOnce(fakeBot)).length === 0 && told.length === 0);
+    portal.setMockPdc({ balance: {}, cheques: [{ txn_id: 1, acc_id: 9001, dealer_name: 'Cheque Motors', pdc_number: '004512', pdc_amount: '6000.00', status: 'bounced' }, { txn_id: 2, acc_id: 9001, status: 'rejected', pdc_amount: '3000.00' }] });
+    const fresh = await watch.checkOnce(fakeBot);
+    check('...a new bounce is told to the staff, once', fresh.length === 1 && told.length >= 1 && /Cheque bounced/.test(told[0][1]) && /004512/.test(told[0][1]) && (await watch.checkOnce(fakeBot)).length === 0);
+    portal.setMockPdc({});
+    portal.setMockCustomers([]);
+  }
+
+  // ONE CONVERSATION PER CUSTOMER IN A GROUP (29 Sep): their own key, sent
+  // back to the group, addressed to them.
+  {
+    const gc = require('../src/core/groupChat');
+    const k = gc.memberKey('simgroup-delhi dealers', '919811100001');
+    check('group: a member key carries the group', gc.groupOf(k) === 'simgroup-delhi dealers' && gc.groupOf('sim-919811100001') === null && gc.groupOf('919811100001@cloud') === null);
+    const got = [];
+    const wrapped = gc.wrapTransport({ sendToChat: async (id, text) => got.push([id, text]), other: 1 });
+    gc.noteName(k, 'Kalra Motors');
+    await wrapped.sendToChat(k, 'BP-1001 stock mein hai');
+    await wrapped.sendToChat(k, 'Kalra Motors ji, order ho gaya');
+    await wrapped.sendToChat('sim-919811100001', 'a DM');
+    check('...a send to it goes to the group, addressed to the customer', got[0][0] === 'simgroup-delhi dealers' && got[0][1] === '*Kalra Motors* — BP-1001 stock mein hai');
+    check('...not twice when the reply already names them, and a DM is untouched', got[1][1] === 'Kalra Motors ji, order ho gaya' && got[2][0] === 'sim-919811100001' && got[2][1] === 'a DM' && wrapped.other === 1);
+    const route = require('../src/pipeline/route');
+    const g = { isGroup: true, chatId: 'some-other-group', from: '919811100001' };
+    check('...a group the bot did not create is not answered by default', !route.listensTo(g));
+    config.groupsAnswerAll = true;
+    check('...unless GROUPS_ANSWER_ALL', route.listensTo(g));
+    config.groupsAnswerAll = false;
+  }
 
   const customer = new CustomerBot();
   // THE FLOWS BELOW ARE STAFF TOOLING NOW.
@@ -425,8 +533,150 @@ async function main() {
   markAsked('sim-' + BLOCKED);
   await dm(customer, BLOCKED, 'yes');
   check('any other refusal reads the same to the customer, and still reaches a person', /system order accept nahi|system is not taking/i.test(sent(customer)) && alerts7.length > 0);
+  // 28 Sep, founder: "if order punch reject it also show that" - on the
+  // dashboard, whichever path punched it (this one: straight from the chat,
+  // so the order stays a draft).
+  {
+    const draft7 = orders.findDraft('sim-' + BLOCKED);
+    check('a refused punch is kept on the order, with why', draft7 && draft7.punchRefused && /portal refused/.test(draft7.punchRefused.why), JSON.stringify(draft7 && draft7.punchRefused));
+    const dash7 = await require('../src/core/dashboardData').buildLive().catch((e) => ({ error: String(e.message) }));
+    const row7 = ((dash7 && dash7.orders) || []).find((o) => draft7 && o.id === draft7.id);
+    check('...and the dashboard shows it as refused by portal, with the reason', row7 && row7.status === 'refused by portal' && /portal refused/.test(row7.note || ''), JSON.stringify(row7 || dash7.error));
+    check('...counted on the Orders card', dash7.summary && dash7.summary.orders.refused >= 1, JSON.stringify(dash7.summary && dash7.summary.orders));
+  }
   customer.transport.sendText = hadText7;
   portal.confirm = realConfirm7;
+
+  // 29 Sep, founder: "whatever agent do for customer and it get approved or
+  // decline send msg to both that agent and customer".
+  console.log('\n[5b-vii-b] an agent\'s order or account declined: agent AND customer told');
+  {
+    const AG = '919000000281';
+    const CU = '919000000282';
+    const o9 = orders.getOrCreateDraft('sim-' + AG, 'Decline Test');
+    o9.lines = [{ item: '16510M65L10', partNo: '16510M65L10', qty: 1, source: 'available', available: 5 }];
+    o9.status = 'approval';
+    o9.requestedBy = AG;
+    o9.portalCustomer = { buyerId: 1, name: 'Decline Test Motors', phone: CU };
+    require('../src/store').save();
+    const chatOfWas9 = customer.customerChatOf;
+    customer.customerChatOf = () => 'sim-' + CU;
+    customer.transport.outbox.length = 0;
+    try {
+      await customer.decideOrder({ from: '919999492550', chatId: 'sim-919999492550' }, { yes: false, requestId: String(o9.id).toUpperCase() }, async () => true, (en, hi) => hi);
+      const toAg = customer.transport.outbox.filter((o) => String(o.to).includes(AG)).map((o) => o.text).join('\n');
+      const toCu = customer.transport.outbox.filter((o) => String(o.to).includes(CU)).map((o) => o.text).join('\n');
+      check('an agent\'s order declined: the agent is told', /approve nahi kiya|not approved/i.test(toAg), toAg);
+      check('...and the customer too, kindly', /approve nahi ho paya|could not be approved/i.test(toCu) && /(maaf|sorry)/i.test(toCu), toCu);
+    } finally {
+      customer.customerChatOf = chatOfWas9;
+    }
+    // An account an agent opened, declined.
+    const cc9 = require('../src/core/customerCreate');
+    const form9 = { chatId: 'sim-' + AG, byName: 'Shubham', answers: { requestId: 'WA-DECL9', phone: CU, name: 'DECLINE TEST MOTORS', businessType: 'retailer' } };
+    cc9.park(form9);
+    customer.transport.outbox.length = 0;
+    await customer.decideNewCustomer({ from: '919999492550', chatId: 'sim-919999492550' }, { yes: false, requestId: 'WA-DECL9' }, async () => true, (en, hi) => hi);
+    const toAg9 = customer.transport.outbox.filter((o) => String(o.to).includes(AG)).map((o) => o.text).join('\n');
+    const toCu9 = customer.transport.outbox.filter((o) => String(o.to).includes(CU)).map((o) => o.text || '').join('\n');
+    check('an agent\'s account request declined: the agent is told', /approve nahi kiya|not approved/i.test(toAg9) && /WA-DECL9/.test(toAg9), toAg9);
+    check('...and the customer too', /jaankari chahiye|more information/i.test(toCu9), toCu9);
+  }
+
+  // 29 Sep, founder: an agent's customer whose approval never reached Arun
+  // Sir (no message from him in 24 h) shows as pending on the dashboard and
+  // goes to him when he writes; a created account's details go to Tez Expert.
+  console.log('\n[5b-vii-c] an account approval that never reached the approver; the new customer to Tez Expert');
+  {
+    const cfgC = require('../src/config').creation;
+    const apprWasC = cfgC.accountApprovers;
+    const ARUN = '919773900582';
+    cfgC.accountApprovers = { [ARUN]: 'Arun Sir' };
+    const cc = require('../src/core/customerCreate');
+    const dw = require('../src/core/deliveryWatch');
+    const formC = { chatId: 'sim-919000000291', byName: 'Nirmal', answers: { requestId: 'WA-UNDEL1', phone: '919000000292', name: 'UNDELIVERED MOTORS', businessType: 'retailer', gstNo: '08AAPCR8256F1ZU', city: 'Jaipur', state: 'Rajasthan', address: 'Mansarovar' } };
+    cc.park(formC);
+    // As finishNewCustomer records it when the form goes for approval.
+    require('../src/core/approvalLog').record({ kind: 'account', id: 'WA-UNDEL1', event: 'requested', by: 'Nirmal', ...require('../src/core/approvalLog').accountFacts(formC.answers) });
+    try {
+      dw.markUndelivered('WA-UNDEL1', ARUN, 'no message from the approver in 24 hours');
+      const rowC = require('../src/core/dashboardData').build().customers.find((c) => c.id === 'WA-UNDEL1');
+      check('the dashboard shows it pending, and that it never reached Arun Sir', rowC && rowC.status === 'waiting for approval' && rowC.approvalNotDelivered === 'Arun Sir' && /not delivered to Arun Sir/.test(rowC.note || ''), JSON.stringify(rowC));
+      customer.transport.outbox.length = 0;
+      await customer.transport.injectIncoming({ id: 'wamid.arun-hi', from: ARUN, chatId: 'sim-' + ARUN, isGroup: false, body: 'Hi', mediaType: 'chat' });
+      const toArun = customer.transport.outbox.filter((o) => String(o.to).includes(ARUN)).map((o) => o.text || '').join('\n');
+      check('when Arun Sir writes, the request that never reached him is sent to him', /UNDELIVERED MOTORS|WA-UNDEL1/.test(toArun) && /pehle pahunch nahi paya|could not be delivered earlier/i.test(toArun), toArun.slice(0, 300));
+      const rowC2 = require('../src/core/dashboardData').build().customers.find((c) => c.id === 'WA-UNDEL1');
+      check('...and the dashboard no longer says it never reached him', rowC2 && !rowC2.approvalNotDelivered, JSON.stringify(rowC2));
+      customer.transport.outbox.length = 0;
+      const told = await customer.tellAccountCreatedTeam(formC, { username: 'undelivered_motors' }, 'Arun Sir');
+      const toAlam = customer.transport.outbox.filter((o) => String(o.to).includes('919217030408')).map((o) => o.text || '').join('\n');
+      const toShubham = customer.transport.outbox.filter((o) => String(o.to).includes('919122781913')).map((o) => o.text || '').join('\n');
+      check('a created customer\'s details go to Alam ji and Shubham Kumar', told === 2 && /New customer created/.test(toAlam) && /New customer created/.test(toShubham), JSON.stringify(customer.transport.outbox.map((o) => o.to)));
+      check('...with the details: name, GSTIN, address, portal login, who opened and who approved', /UNDELIVERED MOTORS/.test(toAlam) && /08AAPCR8256F1ZU/.test(toAlam) && /Jaipur/.test(toAlam) && /undelivered_motors/.test(toAlam) && /Nirmal/.test(toAlam) && /Arun Sir/.test(toAlam), toAlam);
+      // 29 Sep, live: WhatsApp refused Alam ji's copy (no window, no billing).
+      const alamMsg = customer.transport.outbox.find((o) => String(o.to).includes('919217030408') && /New customer created/.test(o.text || ''));
+      await dw.onFailed(customer, { id: alamMsg && (alamMsg.id || alamMsg.wamid), to: '919217030408', code: 131047, why: 'Re-engagement message' });
+      check('a notice WhatsApp refused is kept for that person', dw.undeliveredFor('notice:WA-UNDEL1').includes('919217030408'), JSON.stringify(dw.allUndelivered()));
+      customer.transport.outbox.length = 0;
+      await customer.transport.injectIncoming({ id: 'wamid.alam-hi', from: '919217030408', chatId: 'sim-919217030408', isGroup: false, body: 'Hi', mediaType: 'chat' });
+      const again = customer.transport.outbox.filter((o) => String(o.to).includes('919217030408')).map((o) => o.text || '').join('\n');
+      check('...and sent to them the moment they write', /New customer created/.test(again) && /UNDELIVERED MOTORS/.test(again) && /(pahunch nahi paya|could not deliver)/i.test(again), again.slice(0, 200));
+      check('...only once', !dw.undeliveredFor('notice:WA-UNDEL1').includes('919217030408'));
+    } finally {
+      cc.unpark('WA-UNDEL1');
+      dw.delivered('WA-UNDEL1', ARUN);
+      cfgC.accountApprovers = apprWasC;
+    }
+  }
+
+  // 28 Sep, founder: an order punched and then CANCELLED on the portal (by the
+  // Super Admin) - the customer and the salesman are told, and the dashboard
+  // shows it.
+  console.log('\n[5b-viii] an order cancelled on the portal after the punch');
+  {
+    const cw = require('../src/core/cancelWatch');
+    const AGENT8 = '919000000268';
+    const CUSTP8 = '919000000269';
+    const mk = (chat, hoursAgo, so, byAgent) => {
+      const o = orders.getOrCreateDraft(chat, 'Cancel Test');
+      o.lines = [{ item: '16510M65L10', partNo: '16510M65L10', qty: 2, source: 'available', available: 5 }];
+      o.status = 'confirmed';
+      o.soNumber = so;
+      o.placed = [{ soNumber: so }];
+      o.confirmedAt = new Date(Date.now() - hoursAgo * 3600e3).toISOString();
+      o.portalCustomer = { buyerId: 1, name: 'Cancel Test Motors', phone: CUSTP8 };
+      if (byAgent) o.requestedBy = AGENT8;
+      require('../src/store').save();
+      return o;
+    };
+    const fresh8 = mk('sim-' + AGENT8, 1, '9901', true);
+    const old8 = mk('sim-919000000270', 24 * 5, '9902', false);
+    const orderWas8 = portal.order;
+    const chatOfWas8 = customer.customerChatOf;
+    customer.customerChatOf = (o) => (o.requestedBy ? 'sim-' + CUSTP8 : null);
+    portal.order = async (id) => ({ order_id: id, status: 'cancelled', do_status: 'cancelled' });
+    customer.transport.outbox.length = 0;
+    try {
+      const found8 = await cw.checkOnce(customer);
+      check('an order cancelled on the portal after the punch is found and marked', fresh8.portalCancelled && fresh8.portalCancelled.so === '9901' && found8.some((f) => f.id === fresh8.id), JSON.stringify(found8));
+      const toAgent8 = customer.transport.outbox.filter((o) => String(o.to).includes(AGENT8)).map((o) => o.text).join('\n');
+      const toCust8 = customer.transport.outbox.filter((o) => String(o.to).includes(CUSTP8)).map((o) => o.text).join('\n');
+      check('...the salesman is told it will not be supplied', /cancel/i.test(toAgent8) && /9901/.test(toAgent8), toAgent8);
+      check('...and so is the customer, warmly, with the parts', /cancel/i.test(toCust8) && /16510M65L10/.test(toCust8) && /(maaf|sorry)/i.test(toCust8), toCust8);
+      check('an older one is marked for the dashboard, but nobody is messaged about it', old8.portalCancelled && old8.portalCancelled.told === 0 && !customer.transport.outbox.some((o) => String(o.to).includes('919000000270')));
+      customer.transport.outbox.length = 0;
+      check('...and nobody is told twice', (await cw.checkOnce(customer)).length === 0 && customer.transport.outbox.length === 0);
+      const dash8 = require('../src/core/dashboardData').build();
+      const row8 = dash8.orders.find((o) => o.id === fresh8.id);
+      check('the dashboard shows it as cancelled on portal, not placed', row8 && row8.status === 'cancelled on portal' && dash8.summary.orders.cancelled >= 2, JSON.stringify(row8));
+    } finally {
+      portal.order = orderWas8;
+      customer.customerChatOf = chatOfWas8;
+      orders.cancel(fresh8);
+      orders.cancel(old8);
+    }
+  }
 
   // ---- 5c. GROUP safety: only the customer's unmistakable YES orders ----
   console.log('\n[5c] group — staff are not customers, filler words do not confirm');
@@ -1127,7 +1377,9 @@ async function main() {
   for (const [said, back] of mirrors) {
     customer.transport.outbox.length = 0;
     await dm(customer, HIC, said);
-    check('"' + said + '" is answered with "' + back + '"', lastOut(customer) === back);
+    // (Everyone is staff in these tests - line 249 - and staff get a fresh-start
+    // line under the greeting since 30 Sep; the greeting itself is mirrored.)
+    check('"' + said + '" is answered with "' + back + '"', lastOut(customer).split('\n')[0] === back);
   }
   check('the greeting is not a sales pitch', !/part number/i.test(lastOut(customer)));
 
@@ -2415,7 +2667,7 @@ async function main() {
   // DISCOUNT RULES (founder, 22 Sep). Every rule - set up by the agent for a
   // new account, or a change to one that exists - goes to the Sales Head as
   // "OK DSC-…" first; the portal is only touched once it is approved. A
-  // part-wise rule is set by the lowest sale price against the portal's MRP.
+  // part-wise rule is set in %, with the portal's MRP shown (29 Sep).
   {
     const cc20 = require('../src/core/customerCreate');
     const ds20 = require('../src/core/discountSetup');
@@ -2424,7 +2676,20 @@ async function main() {
     const dpCfg20 = require('../src/config').dealerPortal;
     const listWas20 = dpCfg20.listPriceAccountId;
     dpCfg20.listPriceAccountId = 3822; // the house account MRPs are read from, as live
-    cr20.approvers = { 919999492550: 'Prateek Sir' };
+    cr20.approvers = { 919999492550: 'Prateek Sir', 919800000666: 'Shad' };
+    // 29 Sep: a new customer is approved only by the customer approver (Arun
+    // Sir live; the approver above here), and Prateek Sir hears of every
+    // customer decision and every discount setup (a stand-in number here).
+    const PRATEEK20 = '919800000555';
+    cr20.accountApprovers = { 919999492550: 'Arun Sir' };
+    cr20.accountDecisionNotify = { [PRATEEK20]: 'Prateek Sir' };
+    cr20.discountSetupNotify = { [PRATEEK20]: 'Prateek Sir' };
+    // 30 Sep: Arun Sir approves every discount on WhatsApp first (a stand-in).
+    const ARUN20 = '919800000444';
+    const discApprWas20 = cr20.discountApprovers;
+    cr20.discountApprovers = { [ARUN20]: 'Arun Sir' };
+    const toArun20 = (out) => out.filter((o) => String(o.to).indexOf(ARUN20) >= 0).map((o) => o.text || '').join(String.fromCharCode(10));
+    const toPrateek20 = (out) => out.filter((o) => String(o.to).indexOf(PRATEEK20) >= 0).map((o) => o.text || '').join(String.fromCharCode(10));
     const APPR20 = '919999492550';
     const AGENT20 = '919000000301';
     const agentChat20 = 'sim-' + AGENT20;
@@ -2453,41 +2718,60 @@ async function main() {
       for (let i = 0; i < 4; i++) await say20(AGENT20, 'skip');
       const sum20 = text20(await say20(AGENT20, '3 mahine'));
       check('the rule is named customer + brand + discount', /KALRA MOTORS CARTRENDS 12%/.test(sum20) && /Min qty: 1/.test(sum20) && /3 months/.test(sum20));
+      // 30 Sep, founder: ARUN SIR approves a discount on WhatsApp first; his
+      // decision goes to Prateek Sir, who approves the rule as Super Admin.
       const sent20 = await say20(AGENT20, 'Haan', 'DSC_YES');
-      const id20 = dscIn20(sent20);
-      const toAppr20 = sent20.filter((o) => o.to === APPR20).map((o) => o.text).join('\n');
-      check('the rule goes to the Sales Head for approval', Boolean(id20) && /\*Discount rule\*/.test(toAppr20) && /CARTRENDS — 12%/.test(toAppr20) && /OK DSC-/.test(toAppr20));
+      const id20 = dscIn20(sent20) || ((toArun20(sent20).match(/DSC-[A-Z0-9]{4}/) || [])[0]);
+      check('the discount goes to Arun Sir for approval, with OK / NO', /OK DSC-/.test(toArun20(sent20)) && /KALRA MOTORS/.test(toArun20(sent20)), toArun20(sent20));
+      check('...not to the Sales Head, and nothing to Prateek Sir yet', !sent20.some((o) => o.to === APPR20) && !toPrateek20(sent20));
+      check('...the agent is told it is with Arun Sir', /Arun Sir ko approval ke liye bhej diya/.test(text20(sent20)), text20(sent20));
       await say20(AGENT20, 'Bas itna', 'DSC_MORE_NO');
+      check('someone else cannot decide it', /sirf Arun Sir/.test(text20(await say20(APPR20, 'OK ' + id20))));
+      const ok20d = await say20(ARUN20, 'OK ' + id20);
+      const note20 = toPrateek20(ok20d);
+      check('Arun Sir\'s OK is told to Prateek Sir: approved by Arun Sir, who set it, for whom, what', /Approved by Arun Sir/.test(note20) && /Discount setup\* by Shubham/.test(note20) && /KALRA MOTORS/.test(note20) && /Brand CARTRENDS — \*12%\*/.test(note20) && /new account WA-DSC20 is approved/.test(note20), note20);
+      check('...and the agent is told Arun Sir approved it', customer.transport.outbox.some((o) => String(o.to).indexOf(AGENT20) >= 0 && /Arun Sir ne .* approve kar diya/.test(o.text || '')));
       const before20 = (await portal.listDiscountRules()).length;
-      // the account is approved first: the rule waits for its own OK
+      // the account is approved: the rule goes to the portal with it
+      // Only the customer approver decides a new customer.
+      customer.transport.outbox.length = 0;
+      const shad20 = text20(await say20('919800000666', 'OK WA-DSC20'));
+      check('another approver cannot approve a new customer', /Naye customer ka approval ab Arun Sir karte hain/.test(shad20) && require('../src/core/customerCreate').parked('WA-DSC20'), shad20);
+      customer.transport.outbox.length = 0;
       await customer.decideNewCustomer({ chatId: 'sim-' + APPR20, from: APPR20 }, { yes: true, requestId: 'WA-DSC20' }, async () => true, tt20);
-      check('an unapproved rule is not created with the account', (await portal.listDiscountRules()).length === before20);
-      await say20(APPR20, 'OK ' + id20);
+      const ok20 = toPrateek20(customer.transport.outbox);
+      check('an approved customer is told to Prateek Sir, with who opened it', /New customer \*KALRA MOTORS\*/.test(ok20) && /approved by Prateek Sir|approved by Arun Sir/.test(ok20) && /Opened by Shubham/.test(ok20), ok20);
+      check('...and to the customer', customer.transport.outbox.some((o) => String(o.to).indexOf('919000000302') >= 0 && /account khul gaya/i.test(o.text || '')));
       const rules20 = await portal.listDiscountRules();
       const made20 = rules20[rules20.length - 1] || {};
-      check('"OK DSC-…" creates it on the portal', rules20.length === before20 + 1 && made20.rule_type === 'BRAND' && made20.brand === 'CARTRENDS' && made20.discount_value === 12);
+      check('when the account opens the rule is written to the portal', rules20.length === before20 + 1 && made20.rule_type === 'BRAND' && made20.brand === 'CARTRENDS' && made20.discount_value === 12);
+      check('...as PENDING, for the Super Admin to approve there', made20.approval_status === 'PENDING', made20.approval_status);
+      const watch20 = require('../src/core/discountWatch');
+      check('...and it is watched for that approval', watch20.pending().some((w) => String(w.ruleId) === String(made20.rule_id || made20.id)));
       check('...for the customer as the portal has them, for 3 months from today', made20.dealer_id === 1 && made20.rule_name === 'Mock Customer CARTRENDS 12%' && Date.parse(made20.valid_to) - Date.parse(made20.valid_from) > 85 * 864e5);
       check('a customer registering themselves is not asked for a discount', !ds20.pending('sim-919000000302'));
 
-      // ---- a part-wise rule, set by the lowest sale price ----
+      // ---- a part-wise rule, set in % ----
       portal.setMockStock([{ part_no: '16510M65L10', name: 'Oil Filter', quantity: 50, price: 90, mrp: 200, vendor: 'K' }]);
       const form21 = { chatId: agentChat20, byName: 'Shubham', answers: { ...form20.answers, requestId: 'WA-DSC21', phone: '919000000303' } };
       cc20.park(form21);
       await customer.startDiscountSetup({ chatId: agentChat20, from: AGENT20 }, form21, (text) => customer.askDiscount({ chatId: agentChat20, from: AGENT20 }, text), tt20);
       await say20(AGENT20, 'Part wise', 'DSC_PART');
       const mrp21 = text20(await say20(AGENT20, '16510M65L10'));
-      check('part-wise: the portal MRP is shown and the lowest price asked', /MRP ₹200/.test(mrp21) && /Minimum kitne mein bechna/.test(mrp21));
-      check('...and the discount is worked out from it', /₹170 \/ MRP ₹200 = 15% discount/.test(text20(await say20(AGENT20, '170'))));
+      check('part-wise: the portal MRP is shown and the discount asked in %', /MRP ₹200/.test(mrp21) && /Kitna discount \(%\)/.test(mrp21) && !/bechna/.test(mrp21));
+      check('...and the price it sells at is shown', /MRP ₹200 pe 15% discount: ₹170 mein bikega/.test(text20(await say20(AGENT20, '15'))));
       for (let i = 0; i < 4; i++) await say20(AGENT20, 'skip');
       await say20(AGENT20, '30 din');
       const sent21 = await say20(AGENT20, 'Haan', 'DSC_YES');
-      const toAppr21 = sent21.filter((o) => o.to === APPR20).map((o) => o.text).join('\n');
-      check('...and the Sales Head sees MRP, sale price and the discount', /Part: 16510M65L10 — 15%/.test(toAppr21) && /MRP ₹200 → sells at ₹170 \(15% off, ₹30 per piece\)/.test(toAppr21));
+      check('...and nothing about it goes to the Sales Head', !sent21.some((o) => o.to === APPR20));
       await say20(AGENT20, 'Bas itna', 'DSC_MORE_NO');
       // rejected with the account: the rule goes with it
-      const id21 = dscIn20(sent21);
+      const waiting21 = ds20.forAccount('WA-DSC21').map((r) => r.id);
+      customer.transport.outbox.length = 0;
       await customer.decideNewCustomer({ chatId: 'sim-' + APPR20, from: APPR20 }, { yes: false, requestId: 'WA-DSC21' }, async () => true, tt20);
-      check('a rejected account takes its discount rules with it', !ds20.find(id21));
+      const no21 = toPrateek20(customer.transport.outbox);
+      check('a rejected customer is told to Prateek Sir, the agent and the customer', /rejected by/.test(no21) && customer.transport.outbox.some((o) => String(o.to).indexOf('919000000303') >= 0) && customer.transport.outbox.some((o) => o.to === agentChat20 || String(o.to).indexOf(AGENT20) >= 0), no21 + ' | ' + JSON.stringify(customer.transport.outbox.map((o) => o.to)));
+      check('a rejected account takes its discount rules with it', waiting21.length === 1 && !ds20.find(waiting21[0]));
 
       // ---- an AGENT changes an EXISTING customer's discount ----
       // Only the sales team sets discounts (founder, 25 Sep): the agent names
@@ -2511,21 +2795,105 @@ async function main() {
       // live — the next message was read as a no and the change was lost).
       const sent22 = await say20(AGENT20, '15');
       check('...shown the change as it is sent', /12% → 15%/.test(text20(sent22)));
-      const id22 = dscIn20(sent22);
-      check('the change goes to the Sales Head, not the portal', /\*Discount change\*/.test(sent22.filter((o) => o.to === APPR20).map((o) => o.text).join('\n')) && (await portal.listDiscountRules())[0].discount_value === 12);
-      const ok22 = await say20(APPR20, 'OK ' + id22);
+      check('the change goes to Arun Sir, and the portal is not touched yet', /DSC-/.test(toArun20(sent22)) && (await portal.listDiscountRules())[0].discount_value === 12, toArun20(sent22));
+      const id22 = (toArun20(sent22).match(/DSC-[A-Z0-9]{4}/) || [])[0];
+      const ok22d = await say20(ARUN20, 'OK ' + id22);
+      const note22 = toPrateek20(ok22d);
+      check('Arun Sir\'s OK: Prateek Sir is told and asked to approve rule #501 on Super Admin', /Approved by Arun Sir/.test(note22) && /Discount change\* by Shubham/.test(note22) && /12% → \*15%\*/.test(note22) && /approve or reject rule #501 on the Dealer Portal \(Super Admin\)/.test(note22), note22);
+      check('...with a short brief about the customer (what the portal knows, and discounts now)', /Customer: \*Mock Customer\*\n/.test(note22) && /Discounts now: /.test(note22), note22);
       const rule22 = (await portal.listDiscountRules())[0];
-      check('"OK DSC-…" updates only the discount on the portal', rule22.discount_value === 15 && rule22.brand === 'CARTRENDS' && rule22.rule_name === 'Mock Customer CARTRENDS 15%');
-      check('...and the agent is told', ok22.some((o) => String(o.to).indexOf(AGENT20) >= 0 && /12% → 15%/.test(o.text || '')));
-      // a NO leaves it as it was
+      check('...and the change is on the portal now, only the discount changed', rule22.discount_value === 15 && rule22.brand === 'CARTRENDS' && rule22.rule_name === 'Mock Customer CARTRENDS 15%', JSON.stringify(rule22));
+      check('...and the agent is told it waits for the Super Admin', ok22d.some((o) => String(o.to).indexOf(AGENT20) >= 0 && /Dealer Portal pe approval ke liye bhej diya/.test(o.text || '') && /rule #501/.test(o.text || '')), text20(ok22d));
+      // The Super Admin approves it on the portal: the agent hears it.
+      rule22.approval_status = 'APPROVED';
+      customer.transport.outbox.length = 0;
+      const told22 = await require('../src/core/discountWatch').checkOnce(customer);
+      check('once approved on the portal, the agent is told orders get it from now', told22.some((x) => String(x.ruleId) === '501' && x.status === 'APPROVED') && customer.transport.outbox.some((o) => String(o.to).indexOf(AGENT20) >= 0 && /approve ho gaya — ab se order pe discount lagega/.test(o.text || '')), text20(customer.transport.outbox));
+      // 29 Sep, founder: "the approved msg goes to agent but not to customer".
+      const toCust22 = customer.transport.outbox.filter((o) => String(o.to).indexOf(CUST22) >= 0).map((o) => o.text || '').join('\n');
+      check('...and the CUSTOMER is told too, on their own number, with the discount', /discount set ho gaya|discount is now set/i.test(toCust22) && /15%/.test(toCust22), toCust22 || JSON.stringify(customer.transport.outbox.map((o) => o.to)));
+      check('...and the agent hears that the customer was told', customer.transport.outbox.some((o) => String(o.to).indexOf(AGENT20) >= 0 && /Customer ko bhi bata diya/.test(o.text || '')));
+      check('...and is told only once', (await require('../src/core/discountWatch').checkOnce(customer)).length === 0);
+      // 30 Sep, founder: a discount set up for a customer, then "order karna
+      // hai" is that customer's order - "bot didn't ask for which customer";
+      // after a "hi" it asks.
+      // Every agent is on the sales team as well (30 Sep: "all the sales agent
+      // can create customer, discount, order").
+      config.salesTeamNumbers.push(AGENT20);
+      const ord22 = text20(await say20(AGENT20, 'order karna hai'));
+      check('after a discount for Mock Customer, "order karna hai" is their order - not "which customer?"', /Mock Customer/.test(ord22) && !/Kis customer|Which customer/i.test(ord22), ord22);
+      await say20(AGENT20, 'hi');
+      const ord22b = text20(await say20(AGENT20, 'I want to order'));
+      check('...and after "hi" the same ask is "which customer?"', /Kis customer|Which customer/i.test(ord22b) && !/Mock Customer/.test(ord22b), ord22b);
+      config.salesTeamNumbers.splice(config.salesTeamNumbers.indexOf(AGENT20), 1);
+      require('../src/core/salesOrder').clear(agentChat20);
+      if (orders.findDraft(agentChat20)) orders.cancel(orders.findDraft(agentChat20));
+      // ARUN SIR REJECTS: nothing on the portal; Prateek Sir, the agent and
+      // the customer are told.
       await say20(AGENT20, 'discount change karna hai');
       await say20(AGENT20, '9000000304');
       await say20(AGENT20, 'haan');
       await say20(AGENT20, '1');
-      const id23 = dscIn20(await say20(AGENT20, '20'));
-      await say20(APPR20, 'NO ' + id23);
-      check('"NO DSC-…" changes nothing', (await portal.listDiscountRules())[0].discount_value === 15);
+      const sent23 = await say20(AGENT20, '20');
+      const id23 = (toArun20(sent23).match(/DSC-[A-Z0-9]{4}/) || [])[0];
+      const no23 = await say20(ARUN20, 'NO ' + id23);
+      check('Arun Sir\'s NO: nothing changes on the portal', (await portal.listDiscountRules())[0].discount_value === 15);
+      check('...Prateek Sir is told it was rejected by Arun Sir', /Rejected by Arun Sir/.test(toPrateek20(no23)) && /Nothing was set on the Dealer Portal/.test(toPrateek20(no23)), toPrateek20(no23));
+      check('...and the agent and the customer are told', no23.some((o) => String(o.to).indexOf(AGENT20) >= 0 && /approve nahi kiya/.test(o.text || '')) && no23.some((o) => String(o.to).indexOf(CUST22) >= 0), JSON.stringify(no23.map((o) => o.to)));
       cr20.team = teamWas22;
+
+      // ---- a yes typed any way at all (29 Sep, live: a sales agent) ----
+      // "Hnnn", "Hn", "Ofcourse", "Haaaaan" were each answered with the same
+      // question again. The model reads the reply against the question; with
+      // no model, the fallback still reads a stretched word as its short self.
+      const rr25 = require('../src/core/replyReader');
+      check('fallback: the six live yeses are yes', ['Hnnn', 'Hnnn', 'Hn', 'Ofcourse', 'Haaaaan', 'Hn'].every((x) => rr25._fallback(x) === 'yes'));
+      check('fallback: a no, and a message of its own, are not yes', rr25._fallback('nhi rehne do') === 'no' && rr25._fallback('Maruti ka headlight kitne ka hai') === 'other' && rr25._fallback('16510M68K00 2') === 'other');
+      const ai25 = require('../src/core/ai');
+      const keyWas25 = require('../src/config').gemini.apiKey;
+      const asked25 = [];
+      require('../src/config').gemini.apiKey = 'test-key';
+      ai25._setModel(async (system, user) => {
+        if (!/^You are reading one WhatsApp reply from a member of the Cartrends sales team/.test(system)) return { intent: 'other' };
+        asked25.push(user);
+        return { answer: /jhakaas/.test(user) ? 'yes' : 'unclear', why: 'stub', say: 'Matlab bhej doon, sir?' };
+      });
+      try {
+        portal.setMockCustomers([{ id: 1, name: 'Mock Customer', phone: '919000000304', gst_no: '07AAAAA0000A1Z5', address: 'Karol Bagh, Delhi', credit_limit: '50000.00', credit_days: 7, balance: '1200' }]);
+        cr20.team = { ...(cr20.team || {}), [AGENT20]: 'Shubham' };
+        await say20(AGENT20, 'discount change karna hai');
+        await say20(AGENT20, '9000000304');
+        const on25 = text20(await say20(AGENT20, 'jhakaas'));
+        check('model: a yes no list knows goes on to the rules', /discount rules/i.test(on25) && /1\. Mock Customer CARTRENDS/.test(on25), on25);
+        check('...read with the question that was asked', asked25.some((u) => /Mock Customer ka discount setup karein\?/.test(u) && /Their reply:\njhakaas/.test(u)));
+      } finally {
+        ai25._setModel(null);
+        require('../src/config').gemini.apiKey = keyWas25;
+        cr20.team = teamWas22;
+        ds20.cancel(agentChat20);
+      }
+
+      // ---- "Costamber creat karni h" (29 Sep, live: Nirmal) ----
+      // Spelt past the word list: Gemini reads it, and the form opens.
+      {
+        const ai26 = require('../src/core/ai');
+        const cfg26 = require('../src/config');
+        const keyWas26 = cfg26.gemini.apiKey;
+        const teamWas26 = cr20.team;
+        cr20.team = { ...(teamWas26 || {}), 919800000401: 'Nirmal' };
+        cfg26.gemini.apiKey = 'test-key';
+        ai26._setModel(async (system) => (/^A member of the Cartrends sales team/.test(system) ? { newAccount: true, why: 'stub' } : { intent: 'other' }));
+        try {
+          const out26 = text20(await say20('919800000401', 'Costamber creat karni h'));
+          check('an agent asking for a customer account in any spelling gets the form', /Kiska account banana hai/.test(out26) && require('../src/core/customerCreate').pending('sim-919800000401'), out26);
+        } finally {
+          ai26._setModel(null);
+          cfg26.gemini.apiKey = keyWas26;
+          require('../src/core/customerCreate').cancel('sim-919800000401');
+          cr20.team = teamWas26;
+        }
+        check('...and "Hi" never asks Gemini', (await require('../src/core/replyReader').wantsNewAccount('Hi')) === false);
+      }
 
       // ---- the same flow with NOTHING TAPPED ----
       // The bot sends no buttons any more, so every step above has to work
@@ -2548,7 +2916,7 @@ async function main() {
       for (let i = 0; i < 4; i++) await say20(AGENT24, 'skip');
       await say20(AGENT24, '3 mahine');
       const sent24 = await say20(AGENT24, 'haan');
-      check('...typed "haan" sends it for approval', Boolean(dscIn20(sent24)));
+      check('...typed "haan" sends it for approval', /Dealer Portal/.test(text20(sent24)), text20(sent24));
       const done24 = text20(await say20(AGENT24, 'done'));
       check(
         '...and typed "done" at "another rule?" FINISHES — it does not start another',
@@ -2557,6 +2925,10 @@ async function main() {
       );
     } finally {
       cr20.approvers = apprWas20;
+      cr20.discountApprovers = discApprWas20;
+      cr20.accountApprovers = {};
+      cr20.accountDecisionNotify = {};
+      cr20.discountSetupNotify = {};
       dpCfg20.listPriceAccountId = listWas20;
       portal._setMockDiscountRules([]);
       portal.setMockStock([
@@ -5553,12 +5925,15 @@ async function main() {
     const dup66 = await cc66.answer(CHD, {}, '33AAACC1206D1ZN', t66);
     gst66.lookup = countWas66;
     check('a GSTIN already on the portal costs no paid GST lookup', paid66 === 0);
-    // A CUSTOMER is told the account exists - never whose it is - and sent
-    // on to ordering. A GSTIN on the portal is an account; there is nothing
-    // "different" to send.
-    check('a GSTIN already on the portal tells the customer the account exists', /account pehle se bana hua hai/i.test(dup66.reply));
+    // A CUSTOMER typing another firm's GSTIN is NOT that firm (founder, 28
+    // Sep): told it is registered elsewhere, asked for their OWN, and never
+    // offered an order on it - nor told whose it is.
+    check('a GSTIN already on the portal: the customer is told it belongs to another account', /pehle se kisi aur account pe registered/i.test(dup66.reply), dup66.reply);
+    check('...and asked for their OWN valid GST number', /apna khud ka sahi 15 character ka GST number/i.test(dup66.reply));
+    check('...never offered an order on it', !/order laga|part number aur quantity/i.test(dup66.reply));
     check('...without saying whose it is', !/Existing Traders/.test(dup66.reply));
-    check('...and the form is closed', !cc66.pending(CHD));
+    check('...and the form stays open at the GST question', Boolean(cc66.pending(CHD)) && !cc66.pending(CHD).answers.gstNo);
+    cc66.cancel(CHD);
 
     // A SALES AGENT is told whose it is, so they take the order there.
     cfg66.team = { ...(teamWas66 || {}), 919811100066: 'Shubham' };
@@ -6045,11 +6420,13 @@ async function main() {
         check('"ok\'" with one request open approves it', punched73 === 1 && /SO-73/.test(said73), said73);
         check('...and is never answered "no order pending"', !/pending nahi|no order/i.test(said73), said73);
 
-        customer.openApprovals = () => ['DSC-AAAA', 'ORD-9999'];
+        // A discount is Arun Sir's alone (30 Sep), so it is not among Shad's.
+        customer.openApprovals = () => ['DSC-AAAA', 'ORD-9998', 'ORD-9999'];
         customer.transport.outbox.length = 0;
         await customer.transport.injectIncoming({ id: 'wamid.s73b', from: '916388059016', chatId: '916388059016@cloud', isGroup: false, body: 'ok', hasMedia: false, mediaType: 'chat' });
         const ask73 = customer.transport.outbox.filter((o) => /6388059016/.test(o.to || '')).map((o) => o.text).join('\n');
-        check('with two open, a bare "ok" decides nothing and asks which', punched73 === 1 && /OK DSC-AAAA/.test(ask73) && /OK ORD-9999/.test(ask73), ask73);
+        check('with two open, a bare "ok" decides nothing and asks which', punched73 === 1 && /OK ORD-9998/.test(ask73) && /OK ORD-9999/.test(ask73), ask73);
+        check('...and a discount, not his to decide, is not offered to him', !/DSC-AAAA/.test(ask73), ask73);
       } finally {
         customer.openApprovals = openWas73;
         customer.isOperator = opWas73;
@@ -6098,6 +6475,96 @@ async function main() {
         so74._resetDirectory();
       }
 
+      // 28 Sep, founder: "agent say order karna hai 8800556388 so bot understand
+      // the msg and start taking order for that customer - not 'ok send
+      // customer no.'"; and a customer already known is not asked for again.
+      console.log('\n[74a] the desk names the customer in the order itself');
+      config.salesTeamNumbers.push(S74);
+      try {
+        so74._resetDirectory();
+        if (orders.findDraft(C74)) orders.cancel(orders.findDraft(C74));
+        const o74 = await say74('order karna hai 9811122233');
+        check('"order karna hai <number>" does not ask for the number', !/number bhejiye|send the customer/i.test(o74), o74);
+        check('...it asks only which of that number\'s accounts', /order kiske liye/i.test(o74) && /Kalra Motors/.test(o74), o74);
+        const pick74 = (o74.match(/(\d)\. Kalra Motors/) || [])[1] || '2';
+        const p74 = await say74(pick74);
+        check('...and the pick starts the order for them, asking for the parts', /Kalra Motors ka order — parts bataiye/.test(p74), p74);
+        check('...with Kalra Motors as the customer being ordered for', (so74.activeCustomer(C74) || {}).name === 'Kalra Motors');
+        so74._resetDirectory();
+        const op74 = await say74('9811122233 ka order punch karo 16510M65L10 2');
+        const pp74 = await say74((op74.match(/(\d)\. Kalra Motors/) || [])[1] || '2');
+        check('parts in the same message are checked for that customer, not asked for again', /16510M65L10/.test(pp74) && !/parts bataiye/i.test(pp74), pp74);
+        if (orders.findDraft(C74)) orders.cancel(orders.findDraft(C74));
+        // Just looked up: "order punch karna hai" is for them.
+        so74._resetDirectory();
+        so74.rememberLookedUp(C74, { id: 265, name: 'Kalra Motors', phone: '9811122233' });
+        const k74 = await say74('order punch karna hai');
+        check('"order punch karna hai" right after a customer is for that customer — no number asked', /Kalra Motors/.test(k74) && /parts bataiye/.test(k74) && !/number bhejiye\b(?!.*Kisi aur)/.test(k74.replace(/\(Kisi aur[^)]*\)/g, '')), k74);
+        so74._resetDirectory();
+        const n74 = await say74('order karna hai');
+        check('...and with no customer known, whose is asked', /Kis customer ke liye/.test(n74), n74);
+        so74._resetDirectory();
+        // The same for a discount and for a new account.
+        const ds74 = require('../src/core/discountSetup');
+        ds74.cancel(C74);
+        const d74 = await say74('discount create karna hai 9811122233');
+        check('"discount create karna hai <number>" does not ask whose', !/Kis customer ka discount/.test(d74) && /Kalra Motors/.test(d74), d74);
+        ds74.cancel(C74);
+        require('../src/core/customerCreate').cancel(C74);
+        const c74 = await say74('customer bana do 9812345670');
+        check('"customer bana do <number>" opens the form for that number, not asking it again', /9812345670 ka account bana rahe hain/.test(c74) && !/WhatsApp number bhejiye/i.test(c74), c74);
+        require('../src/core/customerCreate').cancel(C74);
+        // 29 Sep, live (Nirmal): a number with no account is ASKED about, and
+        // "Ha" opens the account for it.
+        so74._resetDirectory();
+        const lookupWas74 = portal.lookupCustomer;
+        portal.lookupCustomer = async (mob) => (String(mob).endsWith('9812345671') ? { found: false } : lookupWas74.call(portal, mob));
+        const q74 = await say74('9812345671').finally(() => (portal.lookupCustomer = lookupWas74));
+        check('a number with no account: "open one?" is asked, not "type customer bana do"', /Iska naya account khol dun\? \(haan \/ nahi\)/.test(q74) && !/likhiye/.test(q74), q74);
+        const h74 = await say74('Ha');
+        check('...and "Ha" opens it for that number', /9812345671 ka account bana rahe hain/.test(h74) && require('../src/core/customerCreate').pending(C74), h74);
+        require('../src/core/customerCreate').cancel(C74);
+      } finally {
+        config.salesTeamNumbers.splice(config.salesTeamNumbers.indexOf(S74), 1);
+        so74._resetDirectory();
+        if (orders.findDraft(C74)) orders.cancel(orders.findDraft(C74));
+      }
+
+      // 28 Sep, live (7355374975): invoices of a customer, then "ledger" -
+      // and the bot asked for the mobile number again.
+      console.log('\n[74b] a ledger right after an invoice is for the same customer');
+      config.salesTeamNumbers.push(S74);
+      try {
+        so74._resetDirectory();
+        // The mock has two accounts on this number: the desk picks Kalra.
+        const which74 = await say74('9811122233 ka invoice');
+        const kalra74 = (which74.match(/(\d)\. Kalra Motors/) || [])[1] || '2';
+        const inv74 = await say74(kalra74);
+        check('the invoice is looked up for Kalra Motors', /Kalra Motors/.test(inv74), which74 + ' || ' + inv74);
+        const led74 = await say74('ledger');
+        check('"ledger" next is Kalra Motors\' ledger - not "whose ledger?"', /Kalra Motors/.test(led74) && !/Whose ledger|Kiska ledger|mobile number/i.test(led74), led74);
+        const inv74b = await say74('invoice bhejo');
+        check('...and "invoice bhejo" after that is theirs too', /Kalra Motors/.test(inv74b) && !/Whose invoice|Kiska invoice/i.test(inv74b), inv74b);
+        so74._resetDirectory();
+        const cold74 = await say74('ledger');
+        check('with nobody asked about, "ledger" still asks whose', /Whose ledger|Kiska ledger/i.test(cold74), cold74);
+        // Same day, same number: "9122781913. Is customer ke liye".
+        const k74 = (x) => JSON.stringify(so74.readCustomerKey(x));
+        check('"9811122233. Is customer ke liye" names the customer', k74('9811122233. Is customer ke liye') === JSON.stringify({ phone: '919811122233' }));
+        check('..."9811122233 ke liye" and "9811122233 for this customer" too', k74('9811122233 ke liye') === k74('9811122233') && k74('9811122233 for this customer') === k74('9811122233'));
+        check('..."9811122233 ka ledger" is not just a number', so74.readCustomerKey('9811122233 ka ledger') === null);
+        // "Kiska invoice?" left open, then an order: the number is the order's.
+        so74._resetDirectory();
+        await say74('invoice dedo');
+        so74.holdItems(C74, [{ partNo: '16510M68K00', qty: 1 }]);
+        so74.orderAsked(C74);
+        const ord74 = await say74('9811122233');
+        check('after the desk moved on to an order, the number is not taken as the invoice ask', !/latest invoices|linked to Odoo|invoice/i.test(ord74), ord74);
+      } finally {
+        config.salesTeamNumbers.splice(config.salesTeamNumbers.indexOf(S74), 1);
+        so74._resetDirectory();
+      }
+
       // 26 Sep, live: Houseneed (ACCOUNT 227) had its discount rule written to
       // DEALER 227 - Dhakad Car Decor. Houseneed's dealer is 3340.
       console.log('\n[75] discount rules go to the customer\'s DEALER id, never its account id');
@@ -6127,6 +6594,251 @@ async function main() {
         check("a bot rule REJECTED on the portal gives no discount", rej75.length === 0, JSON.stringify(rej75));
         portal._resetDealerCache();
         portal._setMockDiscountRules([]);
+      }
+
+      // 30 Sep, founder: "order punch direct when customer has no due balance
+      // ... due balance ... gentle remainder ... hold the order until payment
+      // received ... loss billing ... approval to prateek sir ... only then punch".
+      console.log('\n[76] no due: punched directly; loss billing waits for Prateek Sir; held orders go on once paid');
+      {
+        const loss = require('../src/core/lossBilling');
+        const payments = require('../src/core/payments');
+        const cfgLB = config.lossBilling;
+        const lbWas = { approvers: cfgLB.approvers, inc: cfgLB.costIncludesGst };
+        const apprWas76 = config.creation.approvers;
+        const onWas76 = config.dealerPortal.confirmEnabled;
+        const PRATEEK76 = '919800000761';
+        const SHAD76 = '919800000762';
+        cfgLB.approvers = { [PRATEEK76]: 'Prateek Sir' };
+        cfgLB.costIncludesGst = false;
+        config.creation.approvers = { [SHAD76]: 'Shad', [PRATEEK76]: 'Prateek Sir' };
+        config.dealerPortal.confirmEnabled = true;
+        const toNum76 = (n) => customer.transport.outbox.filter((o) => String(o.to || '').indexOf(n) >= 0).map((o) => o.text || o.caption || '').join('\n---\n');
+        try {
+          // The rule itself: ex-GST selling price against our cost.
+          const l1 = { partNo: 'X1', qty: 2, rate: 118, taxPercent: 18, _raw: { price: 118, allocations: [{ qty: 2, base_price: 120 }] } };
+          const l2 = { partNo: 'X2', qty: 1, rate: 236, taxPercent: 18, _raw: { price: 236, allocations: [{ qty: 1, base_price: 150 }] } };
+          const c76 = loss.check([l1, l2]);
+          check('a line selling at ₹100 ex-GST against a ₹120 cost is a loss of ₹20 a piece; one above cost is not', c76 && c76.lines.length === 1 && c76.lines[0].partNo === 'X1' && c76.lines[0].lossUnit === 20 && c76.total === 40, JSON.stringify(c76));
+          check('a line with no cost from the portal is never called a loss', loss.check([{ partNo: 'X3', qty: 1, rate: 10, _raw: { price: 10 } }]) === null);
+          cfgLB.costIncludesGst = true;
+          check('LOSS_COST_INCLUDES_GST compares incl. GST (₹118 vs ₹120 is still a loss)', loss.check([l1]) && loss.check([l1]).lines[0].lossUnit === 2);
+          cfgLB.costIncludesGst = false;
+
+          // A stock row whose cost is above what this customer pays.
+          portal.setMockStock([
+            { part_no: 'LOSS-76', name: 'Loss Part', quantity: 10, price: 900, mrp: 1000, cost: 900, vendor: 'Northend' },
+            { part_no: 'GAIN-76', name: 'Gain Part', quantity: 10, price: 300, mrp: 1000, cost: 300, vendor: 'Northend' },
+          ]);
+          portal.setMockCustomers([{ id: 7601, name: 'Loss Motors', phone: '9000007601', balance: 0 }, { id: 7602, name: 'Due Motors', phone: '9000007602', balance: 5000 }]);
+          const mkOrder = (id, part, pc, chat) => {
+            const o = { id, chatId: chat, status: 'draft', lines: [{ item: part, partNo: part, requested: part, qty: 2, available: 2, source: 'stock' }], portalCustomer: pc, createdAt: new Date().toISOString(), quotedAt: new Date().toISOString() };
+            store.orders().push(o);
+            store.save();
+            return o;
+          };
+          const LM = { buyerId: 7601, name: 'Loss Motors', phone: '9000007601' };
+
+          const gain = mkOrder('ORD-7601', 'GAIN-76', LM, '919000007601@cloud');
+          const rg = await orders.confirm(gain);
+          check('no due and no loss: the order is punched straight away, no approval asked', !!rg.soNumber && gain.status === 'confirmed' && !toNum76(PRATEEK76) && !toNum76(SHAD76), JSON.stringify(rg));
+
+          customer.transport.outbox.length = 0;
+          const lo = mkOrder('ORD-7602', 'LOSS-76', LM, '919000007601@cloud');
+          const rl = await orders.confirm(lo);
+          check('a line sold below our cost is NOT punched: confirm answers loss', !!rl.loss && !rl.soNumber && lo.status === 'draft' && rl.loss.lines[0].partNo === 'LOSS-76', JSON.stringify(rl));
+          const sentL = await customer.requestOrderApproval(lo, { loss: rl.loss });
+          const pr76 = toNum76(PRATEEK76);
+          check('...it goes to Prateek Sir only, as a loss billing approval with the loss spelt out', sentL === 1 && /Loss billing approval\* — ORD-7602/.test(pr76) && /LOSS-76 × 2/.test(pr76) && /vs cost ₹900/.test(pr76) && /total loss/.test(pr76) && /OK ORD-7602/.test(pr76) && !toNum76(SHAD76), pr76);
+
+          const say76 = async (from, body) => {
+            customer.transport.outbox.length = 0;
+            await customer.transport.injectIncoming({ from, chatId: from + '@cloud', isGroup: false, body, hasMedia: false, mediaType: 'text' });
+            return toNum76(from);
+          };
+          const shad76 = await say76(SHAD76, 'OK ORD-7602');
+          check('a Sales Head who is not the loss approver cannot pass it', /only Prateek Sir|sirf Prateek Sir/.test(shad76) && lo.status === 'approval', shad76);
+          const ok76 = await say76(PRATEEK76, 'OK ORD-7602');
+          check("Prateek Sir's OK punches it on the portal", lo.status === 'confirmed' && !!lo.soNumber && /Placed|Place ho gaya/.test(ok76), ok76);
+
+          const lo2 = mkOrder('ORD-7603', 'LOSS-76', LM, '919000007601@cloud');
+          const rl2 = await orders.confirm(lo2);
+          await customer.requestOrderApproval(lo2, { loss: rl2.loss });
+          customer.transport.outbox.length = 0;
+          await customer.transport.injectIncoming({ from: PRATEEK76, chatId: PRATEEK76 + '@cloud', isGroup: false, body: 'NO ORD-7603', hasMedia: false, mediaType: 'text' });
+          const toCust76 = toNum76('919000007601');
+          check('his NO: nothing is punched, and the customer is told', lo2.status === 'rejected' && !lo2.soNumber && /not approved|approve nahi/.test(toCust76), toCust76);
+          check('...and never hears about cost or loss', !/cost|loss|margin/i.test(toCust76), toCust76);
+
+          // A DUE: held, a gentle reminder, released once the portal shows it paid.
+          const DM = { buyerId: 7602, name: 'Due Motors', phone: '9000007602' };
+          const due76 = mkOrder('ORD-7604', 'GAIN-76', DM, '919000007602@cloud');
+          const hold76 = await customer.holdForPayment(due76, DM);
+          check('a customer who owes Rs.5,000 has the order held, not punched', !!hold76 && due76.status === 'awaitingPayment' && !due76.soNumber);
+          const gentle76 = customer.gentleDueText(DM, hold76, (en) => en);
+          check('...with a gentle reminder: thanks first, the amount, and that the order goes ahead once paid', /Thank you for your order/.test(gentle76) && /gentle reminder/.test(gentle76) && /Rs\.5,000/.test(gentle76) && /goes ahead the moment the payment is received/.test(gentle76), gentle76);
+          const agentHold76 = mkOrder('ORD-7605', 'GAIN-76', DM, '919000000999@cloud');
+          customer.transport.outbox.length = 0;
+          await customer.holdForPayment(agentHold76, DM, { customerPhone: '919000007602', agent: 'Rohit' });
+          const toDue76 = toNum76('919000007602');
+          check("on an agent's order the customer gets the gentle reminder too", /gentle reminder|vinamra yaad-dihani/.test(toDue76) && /Rohit/.test(toDue76), toDue76);
+          check('the payment request lives a month, not the day other chat state gets', payments.find(due76.paymentId) && require('../src/core/chatState').MAX_AGE_MS < 30 * 86400000);
+
+          check('still owing: the watcher keeps it held', (await customer.checkHeldOrders()) === 0 && due76.status === 'awaitingPayment');
+          portal.setMockCustomers([{ id: 7601, name: 'Loss Motors', phone: '9000007601', balance: 0 }, { id: 7602, name: 'Due Motors', phone: '9000007602', balance: 0 }]);
+          // Held for two days: paid late, it still goes on (not "quote expired").
+          due76.quotedAt = new Date(Date.now() - 2 * 86400000).toISOString();
+          agentHold76.status = 'cancelled';
+          customer.transport.outbox.length = 0;
+          const rel76 = await customer.checkHeldOrders();
+          const relMsg76 = toNum76('919000007602');
+          check('paid on the portal: the held order is punched by itself, even two days later', rel76 === 1 && due76.status === 'confirmed' && !!due76.soNumber, JSON.stringify({ rel76, status: due76.status }));
+          check('...and the customer is thanked and given the order number', /payment is received|payment mil gaya/.test(relMsg76) && /order no\./.test(relMsg76), relMsg76);
+          check('...and the payment request is marked settled', payments.find(due76.paymentId).status === 'settled');
+          // 30 Sep, founder: an agent done with one customer says hi to start on
+          // another - "context refresh start with no previous context" (Ujjwal's
+          // log: after "Hii", "Ledger" still sent ujjwal test 1's).
+          console.log('\n[77] a staff member saying hi starts fresh; a named customer wins; English orders and "2 quantity"');
+          {
+            const S77 = '919000000771';
+            const C77 = 'sim-' + S77;
+            const so77 = require('../src/core/salesOrder');
+            const cs77 = require('../src/core/chatState');
+            const staff77 = require('../src/agent/staff');
+            const searchWas77 = config.customerSearchBy;
+            config.salesTeamNumbers.push(S77);
+            config.customerSearchBy = 'any';
+            portal.setMockCustomers([
+              { id: 265, name: 'Kalra Motors', home_branch_dealer: 23, address: 'Gurgaon, Haryana (IN)', gst_no: '06AABCK1234L1Z5', phone: '9811122233', balance: 0 },
+              { id: 777, name: 'Old Motors', home_branch_dealer: 23, address: 'Delhi (IN)', phone: '9811100077', balance: 0 },
+            ]);
+            const say77 = async (body) => {
+              customer.transport.outbox.length = 0;
+              await customer.transport.injectIncoming({ id: 'wamid.s77-' + Math.random(), from: S77, chatId: C77, isGroup: false, body, hasMedia: false, mediaType: 'text' });
+              return customer.transport.outbox.filter((o) => String(o.to || '').indexOf(S77) >= 0).map((o) => o.text || o.caption || '').join('\n');
+            };
+            const onOld77 = () => cs77.slot('sales.session').set(C77, { stage: 'active', customer: { buyerId: 777, name: 'Old Motors' }, at: Date.now() });
+            try {
+              onOld77();
+              cs77.slot('askQty.pending').set(C77, { items: [{ item: '8906105000797' }], at: Date.now() });
+              const cart77 = { id: 'ORD-7701', chatId: C77, status: 'draft', lines: [{ item: 'BP-1001', partNo: 'BP-1001', qty: 1 }], portalCustomer: { buyerId: 777, name: 'Old Motors' }, createdAt: new Date().toISOString() };
+              store.orders().push(cart77);
+              const thread77 = staff77.threadOf(C77);
+              const hi77 = await say77('Hii');
+              check('"Hii" from an agent: greeted, told what was closed, asked which customer now', /Old Motors/.test(hi77) && /cart of 1 item/.test(hi77) && /Naya shuru karte hain|Starting fresh/.test(hi77), hi77);
+              check('...the customer in hand, the pending quantity ask and the cart are gone', !so77.activeCustomer(C77) && !cs77.slot('askQty.pending').get(C77) && cart77.status === 'cancelled');
+              check("...and the staff agent's conversation starts a new thread", staff77.threadOf(C77) !== thread77 && /#\d+$/.test(staff77.threadOf(C77)), staff77.threadOf(C77));
+              const led77 = await say77('Ledger');
+              check('after hi, "Ledger" asks whose - not the old customer\'s', /Whose ledger|Kiska ledger/i.test(led77) && !/Old Motors/.test(led77), led77);
+
+              onOld77();
+              const named77 = await say77('Give me ledger of Kalra Motors');
+              check('"Give me ledger of Kalra Motors" is Kalra\'s, though Old Motors was in hand', /Kalra Motors/.test(named77) && !/Old Motors/.test(named77), named77);
+              cs77.slot('sales.session').delete(C77);
+              cs77.slot('sales.lookedUp').delete(C77);
+              const eng77 = await say77('I want to order');
+              check('"I want to order" asks which customer - it is not looked up as a part', /Which customer|Kis customer/i.test(eng77) && !/Stock check/i.test(eng77), eng77);
+
+              // 30 Sep, live, Shubham Maurya (with Gemini down, the desk alone):
+              // "Ladger of M/S Kumar Moters", "Kalra motor", "Lucky autospare".
+              portal.setMockCustomers([
+                { id: 265, name: 'Kalra Motors', home_branch_dealer: 23, address: 'Gurgaon, Haryana (IN)', gst_no: '06AABCK1234L1Z5', phone: '9811122233', balance: 0 },
+                { id: 778, name: 'Lucky Auto Spare Parts', home_branch_dealer: 23, address: 'Delhi (IN)', phone: '9811100078', balance: 0 },
+              ]);
+              await say77('hi');
+              const lad77 = await say77('Ladger of Kalra Motors');
+              check('"Ladger of Kalra Motors" (misspelt) is Kalra\'s ledger, not "didn\'t get that"', /Kalra Motors/.test(lad77) && !/didn't get that|samajh nahi/i.test(lad77), lad77);
+              await say77('hi');
+              const bare77 = await say77('Kalra motor');
+              check('"Kalra motor" on its own finds Kalra Motors', /Kalra Motors/.test(bare77) && !/didn't get that/i.test(bare77), bare77);
+              await say77('hi');
+              const lucky77 = await say77('Lucky autospare');
+              check('"Lucky autospare" finds Lucky Auto Spare Parts', /Lucky Auto Spare Parts/.test(lucky77), lucky77);
+              await say77('hi');
+              const bal77 = await say77('check balance');
+              check('"check balance" with nobody in hand asks whose - not "no customer called balance"', !/called "balance"|naam se koi/i.test(bal77) && /Whose ledger|Kiska ledger/i.test(bal77), bal77);
+              const vo77 = require('../src/core/voiceOrder');
+              check('"Haaaaan", "Hnnn", "Ofcourse", "okkk" are a yes; "nahiii" a no', ['Haaaaan', 'Hnnn', 'Ofcourse', 'okkk'].every((x) => vo77.readAnswer(x) === 'yes') && vo77.readAnswer('nahiii') === 'no');
+              await say77('hi');
+              await say77('customer create karna hai');
+              const form77 = await say77('9811122233 iska discount setup karna hai');
+              check('a discount asked for while the account form waits leaves the form - not "already registered"', !require('../src/core/customerCreate').pending(C77) && !/pehle se hamare paas registered|already registered/i.test(form77), form77);
+
+              // Every ledger PDF showed twice in the chat log (30 Sep, live).
+              {
+                const cl77 = require('../src/core/chatLog');
+                const outWas77 = cl77.outgoing;
+                let logged77 = 0;
+                cl77.outgoing = () => { logged77++; };
+                try {
+                  const bot77 = { transport: require('../src/wa/transport')._watched({ async sendDocument() { return 'wamid.x'; } }, 'customer') };
+                  staff77._tapFiles(bot77);
+                  await bot77.transport.sendDocument('x@cloud', Buffer.from('a'), 'Ledger.pdf', 'application/pdf', 'cap');
+                  check('a file sent through the staff tap is logged once, and still counted as sent', logged77 === 1 && bot77._filesSent.get('x@cloud').length === 1, String(logged77));
+                } finally {
+                  cl77.outgoing = outWas77;
+                }
+              }
+
+              // 30 Sep, founder: "change credit day with collection days".
+              {
+                const mockWas77 = portal._setMockCredit;
+                portal._setMockCredit({ account_id: 265, credit_days: 1, collection_days: 15, credit_limit: 100000 });
+                const card77 = await so77.customerCard({ id: 265, name: 'Kalra Motors', credit_limit: 100000, credit_days: 1 }, (en) => en);
+                const brief77 = await so77.customerBrief({ id: 265, name: 'Kalra Motors', credit_limit: 100000, credit_days: 1 });
+                const led77b = await require('../src/core/customerLookup')._ledgerFor({ id: 265, name: 'Kalra Motors', balance: 0, credit_limit: 100000, credit_days: 1 }, (en) => en).catch((e) => 'ERR ' + e.message);
+                check('the card, the brief and the ledger summary show COLLECTION days, not "1 day(s)"', /Credit: ₹1,00,000 · collection 15 days/.test(card77) && /Credit ₹1,00,000 \/ collection 15 days/.test(brief77) && /collection 15 days/.test(led77b) && !/1 day\(s\)|\/ 1 day\b/.test(card77 + brief77 + led77b), card77 + ' || ' + brief77 + ' || ' + led77b);
+                portal._setMockCredit(null);
+                void mockWas77;
+              }
+
+              const q77 = require('../src/core/askQty');
+              check('"2 quantity", "Quantity 2" and "Then 1 quantity" are quantities', JSON.stringify([q77.readAnswer('2 quantity', 1), q77.readAnswer('Quantity 2', 1), q77.readAnswer('Then 1 quantity', 1)]) === '[[2],[2],[1]]');
+              const ai77 = require('../src/core/ai');
+              check('a barcode part number with "Quantity 2" under it is that part x2', JSON.stringify(ai77.parseLinesBlock('8906105000797\n\nQuantity 2')) === JSON.stringify([{ item: '8906105000797', qty: 2, price: null }]));
+              check('...but a mobile number with a number under it is not a part', ai77.parseLinesBlock('9811122233\n2').length === 0);
+            } finally {
+              config.salesTeamNumbers.splice(config.salesTeamNumbers.indexOf(S77), 1);
+              config.customerSearchBy = searchWas77;
+              cs77.slot('sales.session').delete(C77);
+            }
+          }
+          // 30 Sep, founder: "bot unable to take parts from photo" - Gemini at
+          // 402 (credit used up), and nothing behind it. The text the local
+          // reader got from Shubham Maurya's two photos, as it came out.
+          console.log('\n[78] with Gemini down, a photo is read on this machine: a stock sheet and a Maruti label');
+          {
+            const ocr78 = require('../src/core/ocr');
+            const sheet78 = [
+              'PART NO Name ~ [stock |~',
+              '13780M72R00 Air Filter| | Maruti 144',
+              '13780M68P01 Air Filter| | Maruti 125',
+              '13780M82PS0 Air Filter| | Maruti 16',
+              '13780M68PAD Air Filter | | Marut 1',
+              '13780M50R00 Air Filter| | Maruti 10°',
+            ].join('\n');
+            const s78 = ocr78.linesFrom(sheet78);
+            check('a stock sheet: every part number, and the STOCK column is not taken as a quantity', s78.length === 5 && s78.every((l) => l.qty === 1 && l.qtyMissing) && s78[0].item === '13780M72R00' && s78[4].item === '13780M50R00', JSON.stringify(s78));
+            const label78 = [
+              '§ S$ maruT Suzy | I\'S', 'GENUINE PARTS & ACCESSO ]', 'Cd 13700 m 7280p = N\\', '| G.FLOOR CLEANER ASSY, AIR =', '| 4 ary 4 Unit MED. on 09 2925 [of',
+              'MRP : 7 445 gg (Incl. of aj Taxes)', 'es BATCH: AE', '. 2 : 2509M0620001549p3pp', 'ry NELSON spel Li rr KUN, NEW DELHI410070', 'Customer Care: Name and address as above Te. 18001021800', '13700M72R00', 'OTY 1 Numha',
+            ].join('\n');
+            const l78 = ocr78.linesFrom(label78);
+            check('a Maruti label: only the part number (not the batch code, pincode or a half-read line), with its QTY', l78.length === 1 && l78[0].item === '13700M72R00' && l78[0].qty === 1 && !l78[0].qtyMissing, JSON.stringify(l78));
+            check('a typed-looking list keeps its quantities', JSON.stringify(ocr78.linesFrom('16510M65L10 2\n57300M55R03').map((l) => [l.item, l.qty])) === JSON.stringify([['16510M65L10', 2], ['57300M55R03', 1]]));
+            portal.setMockStock([
+              { part_no: '13780M82P50', name: 'Air Filter', quantity: 16, price: 300, mrp: 400, vendor: 'Northend' },
+              { part_no: '13780M72R00', name: 'Air Filter', quantity: 144, price: 300, mrp: 400, vendor: 'Northend' },
+            ]);
+            const fx78 = await ocr78.fixMisreads([{ item: '13780M82PS0', qty: 1 }, { item: '13780M72R00', qty: 1 }]);
+            check('a one-character misread ("PS0") is corrected to the number the portal knows (P50); a known one is left alone', fx78[0].item === '13780M82P50' && fx78[1].item === '13780M72R00', JSON.stringify(fx78));
+          }
+        } finally {
+          cfgLB.approvers = lbWas.approvers;
+          cfgLB.costIncludesGst = lbWas.inc;
+          config.creation.approvers = apprWas76;
+          config.dealerPortal.confirmEnabled = onWas76;
+        }
       }
     } finally {
       config.salesTeamNumbers.splice(config.salesTeamNumbers.indexOf(S71), 1);

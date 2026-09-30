@@ -79,6 +79,18 @@ async function dueSoon(now = new Date()) {
       const [partner] = await odoo._call('res.partner', 'read', [[p.pid]], { fields: ['phone'] }).catch(() => [null]);
       phone = String((partner && partner.phone) || '').replace(/\D/g, '').slice(-10);
     }
+    // A CHEQUE THEY GAVE COUNTS AS PAID ONCE RECEIVED (founder, 29 Sep; core/
+    // cheques): Odoo still shows these bills open until it posts the cheque.
+    // Covered in full, there is nothing to remind them of; otherwise the
+    // reminder asks only for what the cheques leave.
+    const pos = acct ? await require('./cheques').positionOf(acct.id).catch(() => null) : null;
+    const billsDue = Math.round(due.reduce((s, i) => s + i.pending, 0) * 100) / 100;
+    const chequeAmount = pos ? pos.chequeAmount : 0;
+    const left = pos && chequeAmount ? Math.min(billsDue, pos.afterCheques) : billsDue;
+    if (chequeAmount && left < 1) {
+      store.log('reminders', `${(acct && acct.name) || p.name}: ${due.length} bill(s) due, covered by cheque(s) of ₹${chequeAmount} not yet in Odoo - no reminder`);
+      return;
+    }
     out.push({
       name: (acct && acct.name) || p.name,
       phone: phone.length === 10 ? '91' + phone : null,
@@ -86,8 +98,9 @@ async function dueSoon(now = new Date()) {
       collectionDays,
       collectDate: target,
       invoices: due,
-      dueAmount: Math.round(due.reduce((s, i) => s + i.pending, 0) * 100) / 100,
-      totalDue: acct && acct.balance != null ? Number(acct.balance) : null,
+      dueAmount: Math.round(left * 100) / 100,
+      chequeAmount,
+      totalDue: pos && chequeAmount ? pos.afterCheques : acct && acct.balance != null ? Number(acct.balance) : null,
     });
   };
   for (let i = 0; i < partners.length; i += 6) await Promise.all(partners.slice(i, i + 6).map((p) => one(p).catch(() => {})));
@@ -98,10 +111,11 @@ async function dueSoon(now = new Date()) {
 // chat that writes in English.
 function message(r, t) {
   const inv = r.invoices.length === 1 ? `invoice ${r.invoices[0].name} (${pretty(r.invoices[0].date)})` : `${r.invoices.length} invoices (${r.invoices.map((i) => i.name).join(', ')})`;
+  const cheque = r.chequeAmount ? { en: ` (after the cheque of ${rs(r.chequeAmount)} you gave us — thank you!)`, hi: ` (aapke ${rs(r.chequeAmount)} ke cheque ke baad — shukriya!)` } : { en: '', hi: '' };
   const extra = r.totalDue && r.totalDue > r.dueAmount + 1 ? { en: `\nYour total open balance with us is ${rs(r.totalDue)}.`, hi: `\nAapka kul open balance ${rs(r.totalDue)} hai.` } : { en: '', hi: '' };
   return t(
-    `Namaste ${r.name} ji 😊\n\nThank you for your continued trust in Cartrends — it means a lot to us.\n\nA gentle reminder: ${rs(r.dueAmount)} for ${inv} is due on *${pretty(r.collectDate)}*, in two days.${extra.en}\n\nYou can pay with the QR below, and just reply "payment done" once it is sent. If it is already on its way, please ignore this — and thank you!\n\nWarm regards,\nTeam Cartrends`,
-    `Namaste ${r.name} ji 😊\n\nCartrends par aapke bharose ke liye dil se shukriya — aapke saath kaam karke hamein hamesha khushi hoti hai.\n\nBas ek chhota sa yaad dilana tha: ${inv} ka ${rs(r.dueAmount)} *${pretty(r.collectDate)}* tak dena hai, yaani 2 din mein.${extra.hi}\n\nNeeche diye QR se pay kar sakte hain, aur pay karke bas "payment kar diya" likh dijiye. Agar payment pehle hi bhej diya hai to is message ko ignore kar dijiye — shukriya!\n\nSaadar,\nTeam Cartrends`,
+    `Namaste ${r.name} ji 😊\n\nThank you for your continued trust in Cartrends — it means a lot to us.\n\nA gentle reminder: ${rs(r.dueAmount)} for ${inv} is due on *${pretty(r.collectDate)}*, in two days${cheque.en}.${extra.en}\n\nYou can pay with the QR below, and just reply "payment done" once it is sent. If it is already on its way, please ignore this — and thank you!\n\nWarm regards,\nTeam Cartrends`,
+    `Namaste ${r.name} ji 😊\n\nCartrends par aapke bharose ke liye dil se shukriya — aapke saath kaam karke hamein hamesha khushi hoti hai.\n\nBas ek chhota sa yaad dilana tha: ${inv} ka ${rs(r.dueAmount)} *${pretty(r.collectDate)}* tak dena hai, yaani 2 din mein${cheque.hi}.${extra.hi}\n\nNeeche diye QR se pay kar sakte hain, aur pay karke bas "payment kar diya" likh dijiye. Agar payment pehle hi bhej diya hai to is message ko ignore kar dijiye — shukriya!\n\nSaadar,\nTeam Cartrends`,
   );
 }
 

@@ -4,11 +4,13 @@
 # already memory- and CPU-constrained, so this image is deliberately small and
 # the compose file caps what it can take. See docker-compose.yml.
 #
+# PHOTOS go to Gemini vision, which costs a little money and no CPU. Behind it
+# (30 Sep: Gemini out of credit, every photo "nahi padh paya") sits tesseract.js
+# from package.json - pure WASM, no system packages - used ONLY when Gemini
+# cannot answer: one worker, started on demand, stopped after a minute idle,
+# ~2 s a photo (core/ocr). Its language data is fetched once into /data.
+#
 # NOT installed on purpose:
-#   * any character recogniser — photos go to Gemini vision,
-#     which costs a little money and no CPU. The local reader that
-#     used to sit in front of it was Windows-only, never ran here, and has been
-#     taken out of the code as well.
 #   * puppeteer / chromium — only the old QR-linked-device transport needed
 #     those, and the bot runs on the Cloud API now.
 #

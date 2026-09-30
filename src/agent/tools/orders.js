@@ -71,6 +71,21 @@ const addToOrder = tool(
     const bad = wanted.find((i) => !Number.isInteger(Number(i.qty)) || Number(i.qty) < 1);
     if (bad) return JSON.stringify({ error: 'quantity for ' + bad.partNumber + ' must be a whole number of at least 1 — ask the customer how many they want' });
 
+    // NO ACCOUNT, NO CART (founder, 28 Sep): a number with no account on the
+    // portal can search parts and hear prices, but nothing goes into a cart
+    // until the account exists - there is nobody to bill it to. Said at once,
+    // at the moment they want to add it, not after a cart has been built.
+    if (!(ctx.customer && (ctx.customer.buyerId || ctx.customer.accountId))) {
+      store.log('agent', `${ctx.phone}: wanted ${wanted.map((i) => i.partNumber + ' x' + i.qty).join(', ')} in the cart — no account yet, nothing added`);
+      return JSON.stringify({
+        added: false,
+        noAccount: true,
+        wanted: wanted.map((i) => ({ partNumber: i.partNumber, qty: Number(i.qty) })),
+        tellCustomer:
+          'Nothing was added: this number has no account with us yet, and an order needs one. Tell them warmly and respectfully, in their language, that their account has to be created first and that you will add these parts to the cart as soon as it is; offer to create it now (account_form "start"). Do not say anything was added or reserved.',
+      });
+    }
+
     let resolved = [];
     try {
       resolved = await availability.resolve(
@@ -149,6 +164,24 @@ const confirmOrder = tool(
         store.log('agent', 'due check failed: ' + String((e && e.message) || e).slice(0, 90));
         return null;
       });
+      // A cheque is in but does not cover it all (founder, 29 Sep): the
+      // total, the cheque and what is still to pay, all three said.
+      if (hold && hold.chequeAmount > 0) {
+        return JSON.stringify({
+          placed: false,
+          paymentDue: true,
+          totalDue: 'Rs.' + hold.owed,
+          chequeReceived: 'Rs.' + hold.chequeAmount,
+          cheques: hold.cheques.map((c) => ({ number: c.number, amount: 'Rs.' + c.amount, date: c.date, status: c.status })),
+          stillToPay: 'Rs.' + hold.due,
+          paymentRequest: hold.req.id,
+          qrSent: hold.qrSent,
+          why:
+            'Their cheque has been received and counted, but it does not cover everything they owe. Tell them, in their language, all three: the total due (' + ('Rs.' + hold.owed) + '), the cheque received (' + ('Rs.' + hold.chequeAmount) + ', with its number and date), and the amount still to pay (' + ('Rs.' + hold.due) + '). The new order is kept and goes ahead once that remaining amount is paid and confirmed' +
+            (hold.qrSent ? '; a payment QR for the remaining amount has been sent to them just now' : '; our team will share how to pay') +
+            '. When they say they have paid, call payment_done. It is NOT placed and NOT sent for approval yet.',
+        });
+      }
       if (hold) {
         return JSON.stringify({
           placed: false,
@@ -157,9 +190,9 @@ const confirmOrder = tool(
           paymentRequest: hold.req.id,
           qrSent: hold.qrSent,
           why:
-            'Their previous balance is not settled. Tell them, in their language: the previous amount of ' + ('Rs.' + hold.due) + ' has to be paid to settle the account before this new order goes ahead' +
+            'Their previous balance is not settled. Give them a GENTLE, warm reminder in their language - thank them for the order first, then say politely that ' + ('Rs.' + hold.due) + ' from earlier is still pending on their account, and that the new order is kept ready and goes ahead the moment the payment is received' +
             (hold.qrSent ? '; the payment QR has been sent to them just now' : '; our team will share how to pay') +
-            '. The order is kept and goes for approval as soon as the payment is confirmed. When they say they have paid, call payment_done. It is NOT placed and NOT sent for approval yet.',
+            '. Never sound like a demand or a refusal. When they say they have paid, call payment_done. It is NOT placed yet.',
         });
       }
     }
@@ -175,7 +208,7 @@ const confirmOrder = tool(
     if (res && res.busy) return JSON.stringify({ placed: false, why: 'this order is already being placed — say nothing further about it' });
     // A number the portal has no account for: there is nobody to bill.
     if (res && res.noCustomer) {
-      return JSON.stringify({ placed: false, why: 'this number has no account on our system, so the order cannot be placed yet — offer to open an account (account_form), or ask_a_person' });
+      return JSON.stringify({ placed: false, why: 'this number has no account on our system, so the order cannot be placed - not on any other account either, whatever GST number or shop name they gave. Tell them in a line, and offer to open THEIR OWN account (account_form "start").' });
     }
     // Placing is switched off: the order goes to the Sales Head, and his
     // "OK ORD-…" places it on the portal (customerBot.decideOrder). 25 Sep,
@@ -189,7 +222,20 @@ const confirmOrder = tool(
         placed: false,
         sentForApproval: true,
         requestId: order.id,
+        ...chequeFacts(order),
         why: 'orders are placed once the Sales Head approves them. It has gone to him; the customer will get the portal order number when he does. Say exactly that — it is NOT placed yet.',
+      });
+    }
+    // LOSS BILLING (founder, 30 Sep): below our cost, so it waits for Prateek
+    // Sir's OK before it is punched. Cost, margin and loss are ours alone.
+    if (res && res.loss) {
+      const sent = bot && bot.requestOrderApproval ? await bot.requestOrderApproval(order, { loss: res.loss }).catch(() => 0) : 0;
+      if (!sent) return JSON.stringify({ placed: false, why: 'the order could not be sent for its final check', askAPerson: true });
+      return JSON.stringify({
+        placed: false,
+        pendingFinalCheck: true,
+        requestId: order.id,
+        why: 'the order is received and goes through one final check by our team before it is placed; the customer gets the order number as soon as it is placed. Thank them warmly and say exactly that. NEVER mention cost, margin, loss or approval of pricing - that is internal. It is NOT placed yet.',
       });
     }
     // Nothing in the cart is in stock, and only stock is punched (founder,
@@ -208,7 +254,7 @@ const confirmOrder = tool(
         cart: JSON.parse(cartState(order)),
       });
     }
-    return JSON.stringify({ placed: true, orderNumber: res && res.soNumber, backordered: (res && res.backordered) || null });
+    return JSON.stringify({ placed: true, orderNumber: res && res.soNumber, backordered: (res && res.backordered) || null, ...chequeFacts(order) });
   },
   {
     name: 'confirm_order',
@@ -218,6 +264,17 @@ const confirmOrder = tool(
     schema: z.object({}),
   },
 );
+
+// A due that Odoo still shows but their cheque covers (customerBot
+// holdForPayment sets it): said with the news, so they know it was counted.
+function chequeFacts(order) {
+  const c = order && order.chequeCovered;
+  if (!c) return {};
+  return {
+    dueCoveredByCheque: { totalDue: 'Rs.' + c.owed, chequeReceived: 'Rs.' + c.chequeAmount, stillToPay: 'Rs.0' },
+    chequeNote: 'Their cheque covers what they owed, so the order went ahead: mention it in a line (total due, cheque received, nothing left to pay).',
+  };
+}
 
 const cancelOrder = tool(
   async (_input, config) => {

@@ -77,7 +77,8 @@ function clear(chatId) {
   pending.delete(chatId);
 }
 
-const UNIT = '(?:pcs?|pc|pise|peices?|pieces?|nos?|no|set|sets|box|boxes|pkts?|packets?)';
+// "2 quantity", "1 qty" (30 Sep, live, Ujjwal: read as a part named "quantity").
+const UNIT = '(?:pcs?|pc|pise|peices?|pieces?|nos?|no|set|sets|box|boxes|pkts?|packets?|qty|qtys|quantity|quantities)';
 
 // Read a quantity answer against `count` waiting items. Returns an array of
 // quantities (one per item) or null when the message is not an answer at all.
@@ -93,7 +94,7 @@ const UNIT = '(?:pcs?|pc|pise|peices?|pieces?|nos?|no|set|sets|box|boxes|pkts?|p
 // verb that LEAD used to require to be the very first word, so "I need one
 // piece of each item" (13 Sep, live) matched nothing and fell through to the
 // free-text parser instead of closing the pending ask.
-const LEAD = /^[?\s]*(?:i|we|hum|hume|humein|mujhe)?\s*(?:add|send|sent|bhejo|bhej\s*do|bhej|de\s*do|dedo|dena|chahiye|need(?:ed)?|want|order|qty|give|please|pls)?\s*/i;
+const LEAD = /^[?\s]*(?:then|toh|to|ok|okay)?\s*(?:i|we|hum|hume|humein|mujhe)?\s*(?:add|send|sent|bhejo|bhej\s*do|bhej|de\s*do|dedo|dena|chahiye|need(?:ed)?|want|order|qty|quantity|give|please|pls)?\s*(?:[:=-]\s*)?/i;
 const TAIL = /\s*(?:needed|chahiye|required|reqd|if\s+available|if\s+avl|if\s+possible|avl|available|only|more|extra|bhi)?\s*[.!]*$/i;
 
 function readAnswer(text, count) {

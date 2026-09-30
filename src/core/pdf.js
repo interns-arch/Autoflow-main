@@ -73,7 +73,7 @@ function heading(doc, title, sub) {
 }
 
 // A customer's ledger. s = odoo.statement(); c = { name, phone, gst, address,
-// portalId, creditLimit, creditDays }.
+// portalId, creditLimit, collectionDays }.
 async function ledgerPdf(s, c = {}) {
   const doc = new PDFDocument({ size: 'A4', margin: 36, info: { Title: `Ledger — ${c.name || s.name}` } });
   heading(doc, 'CUSTOMER LEDGER', `${dmy(s.from)} to ${dmy(s.to)}`);
@@ -83,7 +83,7 @@ async function ledgerPdf(s, c = {}) {
     c.phone ? 'Phone: ' + c.phone : null,
     c.gst ? 'GSTIN: ' + c.gst : null,
     c.portalId ? 'Account id: ' + c.portalId : null,
-    c.creditLimit != null ? `Credit: ${rs(c.creditLimit)}${c.creditDays != null ? ' / ' + c.creditDays + ' day(s)' : ''}` : null,
+    c.creditLimit != null ? `Credit: ${rs(c.creditLimit)}${c.collectionDays ? ' / collection ' + c.collectionDays + ' days' : ''}` : null,
   ].filter(Boolean);
   if (who.length) doc.text(who.join('   ·   '));
   if (c.address) doc.text(c.address);

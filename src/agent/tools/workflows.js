@@ -149,23 +149,32 @@ const accountForm = tool(
 
     if (action === 'start') {
       if (open) return JSON.stringify({ alreadyInProgress: true, note: 'a form is already open — use action "answer" with what they say' });
-      if (!forSomeoneElse) {
-        // A registered customer asking for "an account" is, almost always,
-        // opening one for somebody else — a friend's garage, a second shop.
-        const already = await customers.resolve(ctx.phone).catch(() => ({ found: null }));
-        if (already && already.found === null) return JSON.stringify({ error: 'the portal is not answering, so we cannot tell whether they already have an account — ask them to try again in a few minutes' });
-        if (already && already.found) {
-          return JSON.stringify({
-            alreadyRegistered: true,
-            name: already.name || null,
-            note: 'they already have an account. Ask whether this one is for someone else; if yes, call again with forSomeoneElse: true',
-          });
-        }
+      // A CUSTOMER OPENS ONLY THEIR OWN ACCOUNT (founder, 28 Sep). An account
+      // for somebody else - another shop, another number - is opened by our
+      // sales team, not on this chat: one number cannot speak for another.
+      // (Every caller of this tool is a customer: staff never reach the agent.)
+      if (forSomeoneElse) {
+        store.log('agent', `${ctx.phone}: asked to open an account for someone else — customers cannot; told the sales team does it`);
+        return JSON.stringify({
+          started: false,
+          refused: 'account_for_someone_else',
+          tellCustomer:
+            'An account for someone else is opened by our sales team, not on this chat - that person can message us from their own number to open theirs. Tell them that in a line, in their language. Do not ask for anyone\'s GST number or details.',
+        });
       }
-      const first = customerCreate.start(chatId, ctx.phone, facts, { forSomeoneElse: Boolean(forSomeoneElse) });
-      return JSON.stringify({ started: true, forSomeoneElse: Boolean(forSomeoneElse), nextQuestion: first });
+      // THIS number already has an account: there is nothing to open.
+      const already = await customers.resolve(ctx.phone).catch(() => ({ found: null }));
+      if (already && already.found === null) return JSON.stringify({ error: 'the portal is not answering, so we cannot tell whether they already have an account — ask them to try again in a few minutes' });
+      if (already && already.found) {
+        return JSON.stringify({
+          alreadyRegistered: true,
+          name: already.name || null,
+          note: 'this number already has an account. Tell them so; they can order on it. An account for someone else is not opened on this chat.',
+        });
+      }
+      const first = customerCreate.start(chatId, ctx.phone, facts, { forSomeoneElse: false });
+      return JSON.stringify({ started: true, nextQuestion: first });
     }
-
     if (action === 'answer') {
       if (!open) return JSON.stringify({ inProgress: false, note: 'no account form is open' });
       // The message itself, so a shop photo or a dropped pin reaches the form.
@@ -192,8 +201,9 @@ const accountForm = tool(
   {
     name: 'account_form',
     description:
-      'Open a customer account on the portal, one question at a time: GST number, shop name, a photo of the shop, a location pin and so on. The request then goes to the Sales Head for approval. ' +
-      'action "start" when they ask to open an account (forSomeoneElse: true when it is for someone else); "answer" with what they said whenever a form is open — a photo or a location they send is passed on automatically; "cancel" if they drop it; "status" to check. ' +
+      'Open THIS customer\'s OWN account on the portal, one question at a time: GST number, shop name, a photo of the shop, a location pin and so on. The request then goes to the Sales Head for approval. ' +
+      'action "start" when they ask to open their own account. An account for SOMEONE ELSE is not opened here (our sales team does that): "start" with forSomeoneElse: true only returns that answer. "answer" with what they said whenever a form is open — a photo or a location they send is passed on automatically; "cancel" if they drop it; "status" to check. ' +
+      'A GST number that is already another account is refused by the form: tell them exactly what the form says (send their OWN valid GST number) and nothing else — do not offer to take an order on it. ' +
       'It returns what the form needs next ("nextQuestion" / "formSays") as a fact: ask it in your own words and the customer\'s language, one question at a time. ' +
       'The shop photo and the shop location are REQUIRED: if they say they cannot send one ("photo not available", "location nahi hai"), still call "answer" with exactly what they said — the form explains it is required and asks again; tell them that. A photo taken with a GPS camera app carries the location, and then the location is not asked for. Owner date of birth and bank details are optional ("skip" moves on). ' +
       'The request has gone for approval ONLY when this tool returns done:true with a requestId — then say so and give the requestId. Until then it has NOT been sent: never say it has, and never name an approver.',

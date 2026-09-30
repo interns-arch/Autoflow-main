@@ -49,6 +49,36 @@ function nameOf(number) {
   return (config.creation.approvers || {})[p] || (config.creation.team || {})[p] || '+' + p;
 }
 
+// APPROVALS THAT NEVER ARRIVED, kept (founder, 29 Sep: a customer an agent
+// opened, and Arun Sir had not written to the bot for 24 hours - the request
+// sat unseen). Shown on the dashboard, and sent again the moment that approver
+// writes to the bot (customerBot.resendUndelivered).
+const undelivered = chatState.slot('delivery.undelivered'); // ref -> { at, to: { phone: why } }
+function undeliveredFor(ref) {
+  const u = undelivered.get(ref);
+  return u && u.to ? Object.keys(u.to) : [];
+}
+function allUndelivered() {
+  return [...undelivered.entries()].map(([ref, u]) => ({ ref, ...u }));
+}
+// Known undelivered without a failure report (the catch-up at boot, for
+// requests sent before this was kept).
+function markUndelivered(ref, phone, why) {
+  const p = norm(phone);
+  if (!ref || !p) return;
+  const u = undelivered.get(ref) || { at: Date.now(), to: {} };
+  if (u.to[p]) return;
+  u.to[p] = String(why || 'not delivered').slice(0, 160);
+  undelivered.set(ref, u);
+}
+function delivered(ref, phone) {
+  const u = undelivered.get(ref);
+  if (!u || !u.to) return;
+  delete u.to[norm(phone)];
+  if (Object.keys(u.to).length) undelivered.set(ref, u);
+  else undelivered.delete(ref);
+}
+
 async function onFailed(bot, info) {
   const to = norm(info.to);
   if (to) {
@@ -58,6 +88,11 @@ async function onFailed(bot, info) {
   }
   const tr = info.id && tracked.get(info.id);
   if (!tr) return;
+  {
+    const u = undelivered.get(tr.ref) || { at: Date.now(), to: {} };
+    u.to[tr.to] = explain(info.code, (en) => en) || String(info.why || info.code || 'not delivered').slice(0, 160);
+    undelivered.set(tr.ref, u);
+  }
   const key = tr.ref + '|' + tr.to;
   if (warned.has(key)) return;
   warned.add(key);
@@ -108,6 +143,12 @@ async function flush(bot, ref) {
   const b = batches.get(ref);
   batches.delete(ref);
   if (!b || !b.failed.size) return;
+  // A NOTICE (the new-customer details) is not an approval: nobody is asked
+  // to act on its failure. It is kept and goes when they write.
+  if (String(ref).startsWith('notice:')) {
+    store.log('delivery', `${ref}: not delivered to ${[...b.failed].join(', ')} — kept, sent when they write`);
+    return;
+  }
   const lang = require('./lang');
   const sentTo = recipientsOf(ref);
   const reached = [...sentTo].filter((p) => !b.failed.has(p));
@@ -144,4 +185,4 @@ async function _flushAll(bot) {
   }
 }
 
-module.exports = { track, onFailed, explain, warningText, _flushAll, _reset: () => { recent.clear(); batches.clear(); warned.clear(); } };
+module.exports = { track, onFailed, explain, warningText, undeliveredFor, allUndelivered, delivered, markUndelivered, _flushAll, _reset: () => { recent.clear(); batches.clear(); warned.clear(); undelivered.clear(); } };

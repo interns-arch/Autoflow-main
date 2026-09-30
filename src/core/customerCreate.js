@@ -443,6 +443,33 @@ function start(chatId, phone, t, opts) {
   return t(lead + '\n\n' + first.ask[1], lead + '\n\n' + first.ask[1]);
 }
 
+// WHAT EACH FIELD WANTS, for Gemini to read a typed reply against.
+const WANTS = {
+  phoneFor: "The WhatsApp number of the customer whose account is being opened (not the sender's own). value: 10 digits.",
+  gstNo: 'The firm\'s GST number (GSTIN, 15 characters, e.g. 06CIYPK2053H1ZZ). value: the GSTIN alone, no spaces. Only if they say the firm has NO GST registration at all is it a skip (that sends the account to a person); not having the number to hand right now is unclear.',
+  name: 'The firm or shop name. value: the name alone.',
+  businessType: 'The kind of business. value: one of "retailer", "wholesaler", "garage", "fleet".',
+  contactPerson: "The contact person's name. value: the name alone.",
+  contactPhone: 'The contact person\'s phone number. value: 10 digits — or "same" if it is the number they are writing from.',
+  panNo: 'PAN number (10 characters, e.g. AABCU9603R), optional. value: the PAN alone.',
+  email: 'Email address (invoices go to it). value: the email address alone.',
+  address: 'The full shop address. value: the address as written.',
+  city: 'The city. value: the city name.',
+  state: 'The state. value: the state name.',
+  pin: 'The 6-digit PIN code. value: the 6 digits.',
+  shopPhoto: 'A PHOTO of the shop front is wanted here, so typed words are not the answer: saying they have no photo is a skip; anything else about the photo is unclear.',
+  location: 'The shop LOCATION shared from WhatsApp (attach → Location) is wanted here, so typed words are not the answer: saying they cannot share it is a skip; anything else about it is unclear.',
+  creditLimit: 'The credit limit in rupees for this customer. value: the number only ("1 lakh" -> 100000, "50k" -> 50000).',
+  collectionDays: 'How many days the customer has to pay each bill (1 to 30). value: the number only.',
+  dob: "The owner's date of birth, optional. value: DD/MM/YYYY.",
+  bankDetails: 'Bank account number, IFSC and bank name, optional. value: as written.',
+  remarks: 'Anything else they want to add, optional ("nahi", "kuch nahi" is a skip). value: as written.',
+};
+function fieldWants(field, form) {
+  const w = WANTS[field.key] || `The ${field.key}. value: as written.`;
+  return `${w}${field.req ? '' : ' (Optional.)'}${form.forSomeoneElse ? ' The sender is opening this account for someone else.' : ''}`;
+}
+
 // One answer. `m` is the whole message, so a photo or a dropped pin can be
 // the answer as easily as text.
 //
@@ -453,10 +480,37 @@ async function answer(chatId, m, text, t) {
   const field = fieldAt(form.idx);
   if (!field) return null;
 
-  const said = String(text || '').trim();
+  let said = String(text || '').trim();
   form.at = Date.now();
 
-  if (QUIT.test(said) || (said.length <= 90 && QUIT_IN.test(said))) {
+  // GEMINI READS THE TYPED REPLY (founder, 29 Sep) against what this field
+  // wants and the chat so far: an answer (its value pulled out of the
+  // sentence), a skip, a way out, a message of its own, or unclear. The value
+  // then goes through the field's own checks below, as if typed that way.
+  // A photo, a pin or a document is read by vision as before. No model: the
+  // patterns below read it, as they always did.
+  const hasMedia = Boolean(m && (m.mediaBase64 || m.location)) || !['', 'chat', 'text', 'interactive', 'button'].includes(String((m && m.mediaType) || '').toLowerCase());
+  let read = null;
+  if (said && !hasMedia) {
+    read = await require('./replyReader').readFormReply({
+      flow: form.byName ? `opening a new customer account, filled in by sales agent ${form.byName}` : 'a customer opening their own account',
+      step: fieldWants(field, form),
+      question: field.ask[1],
+      reply: said,
+      phone: store.normPhone((m && m.from) || form.phone),
+    });
+  }
+  if (read) {
+    if (read.intent === 'new') {
+      store.log('create', `${chatId}: "${said.slice(0, 50)}" is not an answer to ${field.key} (Gemini) - passed on, form waits`);
+      return null;
+    }
+    if (read.intent === 'unclear') return { reply: read.say || field.ask[1], done: false, form };
+    if (read.intent === 'skip') said = 'skip';
+    if (read.intent === 'answer') said = read.value;
+  }
+
+  if (read ? read.intent === 'quit' : QUIT.test(said) || (said.length <= 90 && QUIT_IN.test(said))) {
     open.delete(chatId);
     store.log('create', `${chatId}: customer form cancelled by the customer`);
     return {
@@ -494,7 +548,7 @@ async function answer(chatId, m, text, t) {
     };
   }
 
-  if (notAnAnswer(field, m, said)) {
+  if ((!read || hasMedia) && notAnAnswer(field, m, said)) {
     store.log('create', `${chatId}: "${said.slice(0, 50) || '(' + ((m && m.mediaType) || 'media') + ')'}" is not an answer to ${field.key} - passed on, form waits`);
     return null;
   }
@@ -871,13 +925,20 @@ async function refuseIfTaken(form, field, value, t) {
         form,
       };
     }
+    // A CUSTOMER typing a GST number that is already an account is NOT that
+    // account (founder, 28 Sep): the order would be billed to whoever the
+    // number belongs to, and anyone can type anyone's GSTIN. So nothing is
+    // offered on it - no "send the part number, I will place the order" -
+    // and the form stays at the GST question for their OWN one. The firm's
+    // owner writing from a new number is told how that is done, without being
+    // shown whose account it is.
+    open.set(form.chatId, form);
     return {
       reply: t(
-        'There is already an account on this GST number. Send the part number and quantity and I will place the order.',
-        'Is GST number par account pehle se bana hua hai. Part number aur quantity bhejiye, order laga deta hoon.',
+        'This GST number is already registered with another account, so a new account cannot be opened on it. Please send YOUR OWN valid 15-character GST number. If that firm is yours and you are writing from a new number, our sales team can add this number to your account.',
+        'Ye GST number pehle se kisi aur account pe registered hai, is par naya account nahi khul sakta. Apna khud ka sahi 15 character ka GST number bhejiye. Agar ye firm aapki hi hai aur aap naye number se message kar rahe hain, to hamari sales team ye number aapke account mein jod degi.',
       ),
       done: false,
-      closed: true,
       form,
     };
   }
@@ -913,8 +974,10 @@ async function fillFromGst(form, gstin, t) {
   // Wrong shape. Caught before the network, so a typo never costs a credit.
   if (firm && firm.error === 'shape') {
     return gstFail(form, 'shape', t(
-      'That is not a GST number — they are 15 characters, like 07AABCU9603R1ZM. Send it again.',
-      'Ye GST number nahi lag raha — 15 character ka hota hai, jaise 07AABCU9603R1ZM. Dobara bhejiye.',
+      // No sample number: 28 Sep, live, a customer sent the sample back as
+      // their own GSTIN.
+      'That is not a GST number — a GST number has 15 characters (2 digits, 10 letters and digits of the PAN, then 3 more). Please check and send yours again.',
+      'Ye GST number nahi lag raha — GST number 15 character ka hota hai (2 digit, phir PAN ke 10 character, phir 3 aur). Check karke apna dobara bhejiye.',
     ), t);
   }
 
@@ -1110,7 +1173,8 @@ function summary(form, t) {
     a.createdByName ? 'Opened by: ' + a.createdByName + (a.openedFor ? ' (for ' + a.openedFor + ')' : '') : null,
     '',
     line('Credit limit', a.creditLimit != null ? 'Rs ' + Number(a.creditLimit).toLocaleString('en-IN') : null),
-    a.creditDays != null ? 'Credit billing: ' + (Number(a.creditDays) === 1 ? '1 invoice at a time' : a.creditDays + ' days') : null,
+    // Collection days only (founder, 30 Sep): the credit days line ("Credit
+    // billing: 1 invoice at a time") is the same on every account.
     line('Collection days', a.collectionDays),
     line('Remarks', a.remarks),
     '',
@@ -1146,11 +1210,23 @@ function readBareDecision(text) {
   return null;
 }
 
+// A customer approver is an approver too: their "OK WA-…" is read as one.
 function isApprover(phone) {
-  return Boolean(config.creation.approvers[store.normPhone(phone)]);
+  const p = store.normPhone(phone);
+  return Boolean(config.creation.approvers[p] || (config.creation.accountApprovers || {})[p]);
+}
+// Only these approve or reject a NEW CUSTOMER (founder, 29 Sep: Arun Sir).
+// With none configured, the approvers above do, as before.
+function accountApprovers() {
+  const own = Object.keys(config.creation.accountApprovers || {});
+  return own.length ? own : Object.keys(config.creation.approvers || {});
+}
+function isAccountApprover(phone) {
+  return accountApprovers().includes(store.normPhone(phone));
 }
 function approverName(phone) {
-  return config.creation.approvers[store.normPhone(phone)] || store.normPhone(phone);
+  const p = store.normPhone(phone);
+  return config.creation.approvers[p] || (config.creation.accountApprovers || {})[p] || p;
 }
 
 // Forms waiting on a yes, by request id. Kept out of the per-chat slot
@@ -1240,6 +1316,8 @@ module.exports = {
   readDecision,
   readBareDecision,
   isApprover,
+  isAccountApprover,
+  accountApprovers,
   approverName,
   park,
   parked,
