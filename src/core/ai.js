@@ -108,6 +108,10 @@ function bareQty(text) {
   const t = String(text || '').trim();
   if (!t || t.length > 30) return null;
   const stripped = t
+    // "Quantity 2", "qty: 2", "2 quantity" (30 Sep, live, Ujjwal: the line
+    // under the part number was looked up as a part called "Quantity").
+    .replace(/^(?:then|toh|ok)?\s*(?:quantity|qty)\s*[:=-]?\s*/i, '')
+    .replace(/\s*(?:quantity|qty)\s*$/i, '')
     .replace(/^(send|bhejo|bhej\s*do|dena|de\s*do|chahiye|need|want)\s+/i, '')
     // "1 kr do", "2 kardo", "3 hi", "4 chahiye", "5 rakho" - still just a
     // quantity (14 Sep, live: "1 kr do" was looked up as a part called "kr do").
@@ -297,6 +301,15 @@ function parseLinesBlock(rawText) {
   };
 
   if (out.length) return withTrailing(out);
+
+  // A digits-only part number (a barcode, 8906105000797) with its quantity on
+  // the line under it: the token scan below does not see a number without
+  // letters as a part (30 Sep, live, Ujjwal: "8906105000797 / Quantity 2").
+  if (trailingQty !== null) {
+    const partLines = String(text || '').split(/\n/).map((l) => l.trim()).filter((l) => l && bareQty(l) === null);
+    // Never a mobile number (a customer's, with the order under it).
+    if (partLines.length === 1 && /^\d{7,13}$/.test(partLines[0]) && !/^(?:91)?[6-9]\d{9}$/.test(partLines[0])) return [{ item: partLines[0], qty: trailingQty, price: null }];
+  }
 
   // Nothing had a quantity attached — but a part number on its own IS an
   // order. This is the commonest photo of all: the customer snaps the Maruti

@@ -99,6 +99,13 @@ const pendingCancel = require('../core/chatState').slot('cancelAsk');
 // question are read as the answer to it. Any other message means they have
 // moved on, and the question is dropped.
 const createAsk = require('../core/chatState').slot('createAsk');
+// Everything a chat remembers about the work in hand, all keyed on the chat:
+// cleared when a staff member says hi (freshStaffStart).
+const FRESH_SLOTS = [
+  'sales.session', 'sales.discussing', 'sales.lookedUp', 'sales.lastList', 'sales.lists', 'sales.fileAnalysis', 'salesOrder.heldItems',
+  'quotable', 'rateOptions', 'spokenCar', 'nearAsk', 'createAsk', 'cancelAsk', 'customerCreate',
+  'askQty.pending', 'askQty.recent', 'clarify.pending', 'clarify.lastAsked', 'focus', 'vehicle', 'voiceOrder',
+];
 
 // A NOTICE KEPT UNTIL IT ARRIVES (the new-customer details to Tez Expert):
 // "notice:<request>|<phone>" -> { text, at } until delivered; then
@@ -608,6 +615,13 @@ class CustomerBot {
       return this.answerCustomer(m, asWritten, t);
     }
 
+    // A STAFF MEMBER SAYING HI STARTS CLEAN (founder, 30 Sep: "if any agent
+    // working on any customer work but he need to do work for other customer
+    // then when agent say hi then context refresh start with no previous
+    // context"). Live, Ujjwal: after "Hii", "Ledger" and "I want to Ledger of
+    // customer" still sent ujjwal test 1's ledger.
+    if (!m._desk && !m.hasMedia && !m._fresh && this.isOperator(m) && agent.isGreetingOnly(m.body)) m._fresh = this.freshStaffStart(m.chatId);
+
     // STAFF, UNDERSTOOD AND ANSWERED BY THE STAFF AGENT (agent/staff), which
     // drives everything below through the desk tool. Approvals, the helper's
     // answers, buttons and media stay with the desk directly (staff.takes).
@@ -888,6 +902,13 @@ class CustomerBot {
       } else if (!this.isOperator(m)) {
         const cHit = store.customers().find((c) => store.normPhone(c.phone) === store.normPhone(m.from));
         if (cHit && cHit.name) greetingReply += ' ' + cHit.name;
+      }
+      // A staff member's fresh start (freshStaffStart): what was dropped, and
+      // a fresh ask.
+      if (m._fresh && this.isOperator(m)) {
+        greetingReply +=
+          (m._fresh.length ? '\n' + t(`Closed what was open: ${m._fresh.join('; ')}.`, `Pichla kaam band kar diya: ${m._fresh.join('; ')}.`) : '') +
+          '\n' + t('Starting fresh — which customer shall we work on?', 'Naya shuru karte hain — kis customer ka kaam hai?');
       }
       await reply(greetingReply);
       // In a group the Cartrends people carry it on from here: no nudge.
@@ -3510,6 +3531,41 @@ Baaki ${payments.money(hold.due)} pay hone tak ${order.id} hold pe hai${custPhon
       .map((p) => own[p] || customerCreate.approverName(p))
       .join(', ');
     return t(`New-customer approvals are with ${names} now — nothing was changed.`, `Naye customer ka approval ab ${names} karte hain — kuch change nahi hua.`);
+  }
+
+  // A FRESH START FOR A STAFF CHAT: the customer being worked on, every
+  // question the desk was waiting on, the lists it offered, an unconfirmed
+  // cart, a half-filled account form or discount setup, and the staff agent's
+  // conversation. Orders already sent (for approval, held on a payment,
+  // placed) are the order's, not the chat's, and stay as they are.
+  // -> the unfinished work that was dropped, in words.
+  freshStaffStart(chatId) {
+    const dropped = [];
+    const active = salesOrder.activeCustomer(chatId);
+    if (active && active.name) dropped.push(active.name);
+    const form = customerCreate.pending(chatId);
+    if (form) dropped.push('account form' + (form.answers && form.answers.name ? ' for ' + form.answers.name : ''));
+    if (discountSetup.pending(chatId)) {
+      dropped.push('discount setup');
+      discountSetup.cancel(chatId);
+    }
+    const draft = orders.findDraft(chatId);
+    if (draft && draft.status === 'draft' && draft.lines.length) {
+      dropped.push(`cart of ${draft.lines.length} item(s)`);
+      orders.cancel(draft);
+    }
+    const st = store.load().chatState || {};
+    for (const name of FRESH_SLOTS) if (st[name] && Object.prototype.hasOwnProperty.call(st[name], chatId)) delete st[name][chatId];
+    for (const timers of [nudges, confirmNudges]) {
+      if (timers.has(chatId)) {
+        clearTimeout(timers.get(chatId));
+        timers.delete(chatId);
+      }
+    }
+    staffAgent.fresh(chatId);
+    store.save();
+    store.log(this.key, `${chatId} said hi — fresh start${dropped.length ? ', dropped: ' + dropped.join('; ') : ''}`);
+    return dropped;
   }
 
   // Whether this number decides this request - so a bare "ok" is taken for

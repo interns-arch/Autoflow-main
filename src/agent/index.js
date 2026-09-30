@@ -162,7 +162,10 @@ function build() {
 // before this keeps its thread. Not while a question is paused for the
 // specialist: his answer resumes THAT thread, and a new one would never hear it.
 const chatState = require('../core/chatState');
-const sessions = chatState.slot('agent.session'); // chatId -> { n, paused, at }
+// Kept a year, not the day every chat slot gets: dropped after a quiet day,
+// the session number fell back to 0 and the OLD thread - everything from
+// before the "hi" - came back.
+const sessions = chatState.slot('agent.session', { maxAgeMs: 365 * 86400000 }); // chatId -> { n, paused, at }
 const GREETING_ONLY = /^\s*(h+i+|h+e+y+|h+e+l+o+|hlo+|hii+|helo|namaste|namaskar|namaskaar|pranam|good\s*(morning|afternoon|evening)|gm|salam|salaam|sat\s*sri\s*akal|ram\s*ram|jai\s*shree\s*krishna|radhe\s*radhe)(\s+(ji|sir|bhai|bhaiya|madam|mam|dost|there))?[\s.!🙏👋😊]*$/iu;
 function threadOf(chatId) {
   const s = sessions.get(chatId);
@@ -467,4 +470,6 @@ function textOf(msg) {
   return '';
 }
 
-module.exports = { handle, resume, followUp, warmUp, enabled, lastFailure: () => lastFailure, TOOLS, _toolIndex: toolIndex, _threadOf: threadOf, _freshOnGreeting: freshOnGreeting, _markPaused: markPaused, _sessions: sessions, _build: build, _inventedMoney: inventedMoney, _claimsSentForApproval: claimsSentForApproval, _approvalThisTurn: approvalThisTurn };
+const isGreetingOnly = (text) => GREETING_ONLY.test(String(text || ''));
+
+module.exports = { handle, resume, followUp, warmUp, enabled, isGreetingOnly, lastFailure: () => lastFailure, TOOLS, _toolIndex: toolIndex, _threadOf: threadOf, _freshOnGreeting: freshOnGreeting, _markPaused: markPaused, _sessions: sessions, _build: build, _inventedMoney: inventedMoney, _claimsSentForApproval: claimsSentForApproval, _approvalThisTurn: approvalThisTurn };

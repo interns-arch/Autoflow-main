@@ -910,6 +910,17 @@ const LEDGER_RE = /\b(ledger|khata|statement|hisab|hisaab|account\s*statement)\b
 // newer invoices IS the portal order id.
 const INVOICE_RE = /\b(invoice|invoices|bill|bills)\b/i;
 const INVOICE_OF = /^(.+?)\s+(?:ka|ki|ke)\s+(?:(?:latest|last|pichla|pichhla|sab|saare|all)\s+)?(?:invoice|invoices|bill|bills)\b/i;
+const LEDGER_OF = /^(.+?)\s+(?:ka|ki|ke)\s+(?:(?:latest|last|pichla|pichhla|poora|pura|full)\s+)?(?:ledger|khata|statement|hisab|hisaab)\b/i;
+// "ledger of Arjun motors", "invoice for Kalra Motors", "Arjun ka ledger".
+const DOC_FOR = /\b(?:ledger|khata|statement|hisab|hisaab|invoice|invoices|bill|bills)\s+(?:of|for)\s+(.+?)\s*[.?!]*$/i;
+const DOC_FILLER = /^(?:(?:please|pls|plz|sir|ji|bhai|mujhe|muje|give\s+me|send\s+me|send|share|bhejo|bhej\s+do|de\s+do|dedo|i\s+want(?:\s+to)?|i\s+need|chahiye|the)\s+)+/i;
+function docNameIn(text, want) {
+  const s = String(text || '').trim();
+  const m1 = s.match(want === 'ledger' ? LEDGER_OF : INVOICE_OF);
+  const m2 = s.match(DOC_FOR);
+  const raw = (m1 && m1[1]) || (m2 && m2[1]) || '';
+  return raw.replace(DOC_FILLER, '').replace(/\s+(?:ka|ki|ke|bhejo|bhej\s+do|de\s+do|dedo|please|pls)\s*$/i, '').trim() || null;
+}
 
 async function withOdooPartner(row) {
   if (row.odoo_partner_id || !row.name) return row;
@@ -1028,7 +1039,7 @@ async function orderFor(bot, m, chosen, reply, t, lead = null) {
 // order is theirs straight away; several, and which is asked.
 const ORDER_ASK = /\b(order|orders|so|s\.o\.?|punch|sale\s*order|sales\s*order)\b/i;
 // An order wanted, and nothing else in the message: no customer, no part.
-const ORDER_WANT = /^\s*(?:(?:mujhe|muje|hume|humein|mereko|sir|bhai|ji)\s+)?(?:(?:ek|naya|new|a|an)\s+)?(?:order|so|s\.o\.?|sale\s*order|sales\s*order)\s+(?:(?:punch|place)\s+)?(?:karna|karni|krna|krni|lagana|lgana|banana|bnana|dalna|daalna|dena|lena)\s*(?:hai|h|he|tha)?[\s.!?]*$|^\s*(?:new|naya)\s+(?:order|so)[\s.!?]*$/i;
+const ORDER_WANT = /^\s*(?:(?:mujhe|muje|hume|humein|mereko|sir|bhai|ji)\s+)?(?:(?:ek|naya|new|a|an)\s+)?(?:order|so|s\.o\.?|sale\s*order|sales\s*order)\s+(?:(?:punch|place)\s+)?(?:karna|karni|krna|krni|lagana|lgana|banana|bnana|dalna|daalna|dena|lena)\s*(?:hai|h|he|tha)?[\s.!?]*$|^\s*(?:new|naya)\s+(?:order|so)[\s.!?]*$|^\s*(?:(?:i|we)\s+)?(?:want|wanna|need|would\s+like|have)\s+(?:to\s+)?(?:place\s+|punch\s+|make\s+|create\s+|book\s+)?(?:an?\s+|new\s+|one\s+)?(?:order|so)(?:\s+(?:please|pls|now|sir))?[\s.!?]*$|^\s*(?:please\s+)?(?:place|punch|create|make|book)\s+(?:an?\s+|new\s+)?(?:order|so)(?:\s+(?:please|pls|now))?[\s.!?]*$/i;
 function orderKeyIn(text) {
   const s = String(text || '');
   if (!ORDER_ASK.test(s) || STATUS.test(s) || LEDGER_RE.test(s) || INVOICE_RE.test(s)) return null;
@@ -1682,8 +1693,11 @@ async function handle(bot, m, text, reply, t) {
   if (want && (findKeyIn(text) || want === 'invoice' || !lookup.parse(text))) {
     const k = findKeyIn(text);
     let rows = k ? await findByKey(k).catch(() => []) : [];
-    if (!k && want === 'invoice') {
-      const nm = (String(text).trim().match(INVOICE_OF) || [])[1];
+    // THE CUSTOMER NAMED IN IT wins over the one in hand - a ledger as much as
+    // an invoice (30 Sep, live, Ujjwal: "Give me ledger of Arjun motors" sent
+    // ujjwal test 1's ledger, the customer he had been working on).
+    if (!k) {
+      const nm = docNameIn(text, want);
       if (nm && !mobileOnly() && !isGenericName(nm) && looksLikeName(nm.replace(/\b(is|us|mere|mera)\b/gi, '').trim() || 'x')) {
         const found = await findCustomers(nm).catch(() => ({ top: [] }));
         rows = found.top && found.top.length ? found.top : (await findCustomersFuzzy(nm).catch(() => ({ top: [] }))).top || [];

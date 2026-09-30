@@ -1374,7 +1374,9 @@ async function main() {
   for (const [said, back] of mirrors) {
     customer.transport.outbox.length = 0;
     await dm(customer, HIC, said);
-    check('"' + said + '" is answered with "' + back + '"', lastOut(customer) === back);
+    // (Everyone is staff in these tests - line 249 - and staff get a fresh-start
+    // line under the greeting since 30 Sep; the greeting itself is mirrored.)
+    check('"' + said + '" is answered with "' + back + '"', lastOut(customer).split('\n')[0] === back);
   }
   check('the greeting is not a sales pitch', !/part number/i.test(lastOut(customer)));
 
@@ -6676,6 +6678,61 @@ async function main() {
           check('paid on the portal: the held order is punched by itself, even two days later', rel76 === 1 && due76.status === 'confirmed' && !!due76.soNumber, JSON.stringify({ rel76, status: due76.status }));
           check('...and the customer is thanked and given the order number', /payment is received|payment mil gaya/.test(relMsg76) && /order no\./.test(relMsg76), relMsg76);
           check('...and the payment request is marked settled', payments.find(due76.paymentId).status === 'settled');
+          // 30 Sep, founder: an agent done with one customer says hi to start on
+          // another - "context refresh start with no previous context" (Ujjwal's
+          // log: after "Hii", "Ledger" still sent ujjwal test 1's).
+          console.log('\n[77] a staff member saying hi starts fresh; a named customer wins; English orders and "2 quantity"');
+          {
+            const S77 = '919000000771';
+            const C77 = 'sim-' + S77;
+            const so77 = require('../src/core/salesOrder');
+            const cs77 = require('../src/core/chatState');
+            const staff77 = require('../src/agent/staff');
+            const searchWas77 = config.customerSearchBy;
+            config.salesTeamNumbers.push(S77);
+            config.customerSearchBy = 'any';
+            portal.setMockCustomers([
+              { id: 265, name: 'Kalra Motors', home_branch_dealer: 23, address: 'Gurgaon, Haryana (IN)', gst_no: '06AABCK1234L1Z5', phone: '9811122233', balance: 0 },
+              { id: 777, name: 'Old Motors', home_branch_dealer: 23, address: 'Delhi (IN)', phone: '9811100077', balance: 0 },
+            ]);
+            const say77 = async (body) => {
+              customer.transport.outbox.length = 0;
+              await customer.transport.injectIncoming({ id: 'wamid.s77-' + Math.random(), from: S77, chatId: C77, isGroup: false, body, hasMedia: false, mediaType: 'text' });
+              return customer.transport.outbox.filter((o) => String(o.to || '').indexOf(S77) >= 0).map((o) => o.text || o.caption || '').join('\n');
+            };
+            const onOld77 = () => cs77.slot('sales.session').set(C77, { stage: 'active', customer: { buyerId: 777, name: 'Old Motors' }, at: Date.now() });
+            try {
+              onOld77();
+              cs77.slot('askQty.pending').set(C77, { items: [{ item: '8906105000797' }], at: Date.now() });
+              const cart77 = { id: 'ORD-7701', chatId: C77, status: 'draft', lines: [{ item: 'BP-1001', partNo: 'BP-1001', qty: 1 }], portalCustomer: { buyerId: 777, name: 'Old Motors' }, createdAt: new Date().toISOString() };
+              store.orders().push(cart77);
+              const thread77 = staff77.threadOf(C77);
+              const hi77 = await say77('Hii');
+              check('"Hii" from an agent: greeted, told what was closed, asked which customer now', /Old Motors/.test(hi77) && /cart of 1 item/.test(hi77) && /Naya shuru karte hain|Starting fresh/.test(hi77), hi77);
+              check('...the customer in hand, the pending quantity ask and the cart are gone', !so77.activeCustomer(C77) && !cs77.slot('askQty.pending').get(C77) && cart77.status === 'cancelled');
+              check("...and the staff agent's conversation starts a new thread", staff77.threadOf(C77) !== thread77 && /#\d+$/.test(staff77.threadOf(C77)), staff77.threadOf(C77));
+              const led77 = await say77('Ledger');
+              check('after hi, "Ledger" asks whose - not the old customer\'s', /Whose ledger|Kiska ledger/i.test(led77) && !/Old Motors/.test(led77), led77);
+
+              onOld77();
+              const named77 = await say77('Give me ledger of Kalra Motors');
+              check('"Give me ledger of Kalra Motors" is Kalra\'s, though Old Motors was in hand', /Kalra Motors/.test(named77) && !/Old Motors/.test(named77), named77);
+              cs77.slot('sales.session').delete(C77);
+              cs77.slot('sales.lookedUp').delete(C77);
+              const eng77 = await say77('I want to order');
+              check('"I want to order" asks which customer - it is not looked up as a part', /Which customer|Kis customer/i.test(eng77) && !/Stock check/i.test(eng77), eng77);
+
+              const q77 = require('../src/core/askQty');
+              check('"2 quantity", "Quantity 2" and "Then 1 quantity" are quantities', JSON.stringify([q77.readAnswer('2 quantity', 1), q77.readAnswer('Quantity 2', 1), q77.readAnswer('Then 1 quantity', 1)]) === '[[2],[2],[1]]');
+              const ai77 = require('../src/core/ai');
+              check('a barcode part number with "Quantity 2" under it is that part x2', JSON.stringify(ai77.parseLinesBlock('8906105000797\n\nQuantity 2')) === JSON.stringify([{ item: '8906105000797', qty: 2, price: null }]));
+              check('...but a mobile number with a number under it is not a part', ai77.parseLinesBlock('9811122233\n2').length === 0);
+            } finally {
+              config.salesTeamNumbers.splice(config.salesTeamNumbers.indexOf(S77), 1);
+              config.customerSearchBy = searchWas77;
+              cs77.slot('sales.session').delete(C77);
+            }
+          }
         } finally {
           cfgLB.approvers = lbWas.approvers;
           cfgLB.costIncludesGst = lbWas.inc;

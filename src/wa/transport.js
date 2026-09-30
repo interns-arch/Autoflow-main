@@ -450,6 +450,9 @@ function watched(transport, botKey) {
             return fn(m);
           });
       }
+      // A wrapper put on the transport (agent/staff's file tap) that calls the
+      // logged original itself: logging it again wrote every file twice (30 Sep).
+      if (v._innerLogged) return v;
       if (OUT_KINDS[prop]) {
         return async (...args) => {
           const sent = await v.apply(t, args);

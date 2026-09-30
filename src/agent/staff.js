@@ -36,6 +36,7 @@ You do nothing yourself. The DESK does the work, through the tool desk. You give
 - Understand what they want and WHO it is for. A 10-digit mobile number or a GST number in their message is the customer. "iska", "isi ka", "same customer", "is customer ka" means the customer you were just working on (the desk remembers who that is — you do not need to repeat the number).
 - Tell the desk in these words (Hinglish is fine, keep the customer's number and the part numbers exactly as written):
   • an order:            "order karna hai <number> <part number> <qty> …" (parts optional)
+    (English "I want to order …", "place an order" is the same thing: tell the desk "order karna hai …", never the English words as they are)
   • parts for the order being taken: "<part number> <qty>" one per line
   • customer details:    "check customer <number>"
   • ledger:              "<number> ka ledger"   (or "ledger" for the customer already in hand)
@@ -71,6 +72,9 @@ function tapFiles(bot) {
     bot._filesSent.set(chatId, list.slice(-20));
     return r;
   };
+  // The original (the logging wrapper) already writes this send to the chat
+  // log; the wrapper around this one must not write it a second time.
+  tr.sendDocument._innerLogged = true;
   tr._staffFileTap = true;
 }
 const filesSoFar = (bot, chatId) => ((bot._filesSent && bot._filesSent.get(chatId)) || []).length;
@@ -163,10 +167,25 @@ function takes(bot, m) {
   return true;
 }
 
+// A FRESH CONVERSATION ON "HI" (founder, 30 Sep: an agent done with one
+// customer says hi to start on another, "with no previous context"). The
+// thread carries a session number; a greeting moves to the next one
+// (customerBot.freshStaffStart clears the desk's side).
+const sessions = require('../core/chatState').slot('staffAgent.session', { maxAgeMs: 365 * 86400000 }); // chatId -> { n, at }
+function threadOf(chatId) {
+  const s = sessions.get(chatId);
+  return 'staff:' + chatId + (s && s.n ? '#' + s.n : '');
+}
+function fresh(chatId) {
+  const s = sessions.get(chatId) || { n: 0 };
+  sessions.set(chatId, { n: (s.n || 0) + 1, at: Date.now() });
+  return (s.n || 0) + 1;
+}
+
 // -> { handled, reply, deskCalls, deskSaid }
 async function handle(bot, m) {
   const c = {
-    thread_id: 'staff:' + m.chatId,
+    thread_id: threadOf(m.chatId),
     chatId: m.chatId,
     phone: m.from,
     customer: null,
@@ -181,7 +200,13 @@ async function handle(bot, m) {
   // and what they do here, in front of their words.
   const who = await require('../core/staffDirectory').whoIs(m.from).catch(() => null);
   const note = require('../core/staffDirectory').describe(who);
-  const content = (note ? note + '\n' : '') + String(m.body || '').trim();
+  // Just said hi: everything before is gone, and they are told what was left.
+  const freshNote = m._fresh
+    ? '[New conversation: they greeted, so everything before is cleared - no customer is selected now.' +
+      (m._fresh.length ? ' Work left unfinished and now dropped: ' + m._fresh.join('; ') + ' (say so in one short line).' : '') +
+      ' Greet them by name and ask which customer or what they want to work on. Do not call the desk for the greeting.]\n'
+    : '';
+  const content = (note ? note + '\n' : '') + freshNote + String(m.body || '').trim();
   let out;
   try {
     out = await build().invoke({ messages: [{ role: 'user', content }] }, { configurable: c, recursionLimit: 16 });
@@ -234,4 +259,4 @@ function inventedFigure(reply, deskSaid, asked) {
   return null;
 }
 
-module.exports = { enabled, takes, handle, STAFF_SYSTEM, _desk: desk, _inventedFigure: inventedFigure, _claimsFileSent: claimsFileSent };
+module.exports = { enabled, takes, handle, fresh, threadOf, STAFF_SYSTEM, _desk: desk, _inventedFigure: inventedFigure, _claimsFileSent: claimsFileSent };
