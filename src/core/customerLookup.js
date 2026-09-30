@@ -166,13 +166,15 @@ async function ledgerFor(row, t) {
     .positionOf(row.id)
     .catch(() => null);
   const withCheques = pos && pos.cheques.length;
+  // Collection days, not the portal's credit_days (always 1 - one invoice).
+  const collection = Number(row.credit_limit) ? await require('./salesOrder').collectionDaysOf(row.id, row).catch(() => null) : null;
   const head = [
     withCheques
       ? t('owes ₹', 'baaki ₹') + money(pos.afterCheques) + t(` (₹${money(row.balance)} less cheques ₹${money(pos.chequeAmount)})`, ` (₹${money(row.balance)} mein se cheque ₹${money(pos.chequeAmount)} ghata ke)`)
       : t('owes ₹', 'baaki ₹') + money(row.balance),
     !withCheques && Number(row.pdc_amount) ? 'PDC ₹' + money(row.pdc_amount) : null,
     Number(row.credit_limit)
-      ? 'limit ₹' + money(row.credit_limit) + (row.credit_days ? ' / ' + row.credit_days + t(Number(row.credit_days) === 1 ? ' day' : ' days', ' din') : '')
+      ? 'limit ₹' + money(row.credit_limit) + (collection ? t(' / collection ' + collection + ' days', ' / collection ' + collection + ' din') : '')
       : null,
   ].filter(Boolean);
   const out = [row.name + ' - ' + head.join(' · ')];

@@ -1173,7 +1173,8 @@ function summary(form, t) {
     a.createdByName ? 'Opened by: ' + a.createdByName + (a.openedFor ? ' (for ' + a.openedFor + ')' : '') : null,
     '',
     line('Credit limit', a.creditLimit != null ? 'Rs ' + Number(a.creditLimit).toLocaleString('en-IN') : null),
-    a.creditDays != null ? 'Credit billing: ' + (Number(a.creditDays) === 1 ? '1 invoice at a time' : a.creditDays + ' days') : null,
+    // Collection days only (founder, 30 Sep): the credit days line ("Credit
+    // billing: 1 invoice at a time") is the same on every account.
     line('Collection days', a.collectionDays),
     line('Remarks', a.remarks),
     '',

@@ -6780,6 +6780,18 @@ async function main() {
                 }
               }
 
+              // 30 Sep, founder: "change credit day with collection days".
+              {
+                const mockWas77 = portal._setMockCredit;
+                portal._setMockCredit({ account_id: 265, credit_days: 1, collection_days: 15, credit_limit: 100000 });
+                const card77 = await so77.customerCard({ id: 265, name: 'Kalra Motors', credit_limit: 100000, credit_days: 1 }, (en) => en);
+                const brief77 = await so77.customerBrief({ id: 265, name: 'Kalra Motors', credit_limit: 100000, credit_days: 1 });
+                const led77b = await require('../src/core/customerLookup')._ledgerFor({ id: 265, name: 'Kalra Motors', balance: 0, credit_limit: 100000, credit_days: 1 }, (en) => en).catch((e) => 'ERR ' + e.message);
+                check('the card, the brief and the ledger summary show COLLECTION days, not "1 day(s)"', /Credit: ₹1,00,000 · collection 15 days/.test(card77) && /Credit ₹1,00,000 \/ collection 15 days/.test(brief77) && /collection 15 days/.test(led77b) && !/1 day\(s\)|\/ 1 day\b/.test(card77 + brief77 + led77b), card77 + ' || ' + brief77 + ' || ' + led77b);
+                portal._setMockCredit(null);
+                void mockWas77;
+              }
+
               const q77 = require('../src/core/askQty');
               check('"2 quantity", "Quantity 2" and "Then 1 quantity" are quantities', JSON.stringify([q77.readAnswer('2 quantity', 1), q77.readAnswer('Quantity 2', 1), q77.readAnswer('Then 1 quantity', 1)]) === '[[2],[2],[1]]');
               const ai77 = require('../src/core/ai');

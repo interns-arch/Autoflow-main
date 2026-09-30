@@ -417,6 +417,29 @@ function label(row) {
   return extra ? row.name + ' (' + extra + ')' : row.name;
 }
 
+// COLLECTION DAYS, not credit days (founder, 30 Sep: "in customer creation
+// change credit day with collection days"). The portal's credit_days is 1 for
+// every bot account - one invoice on credit at a time - so "1 day(s)" after
+// the limit told nobody anything; the days a bill may stay unpaid are the
+// collection days, on the account's credit control. Kept an hour.
+const collectionCache = new Map(); // accountId -> { at, days }
+async function collectionDaysOf(accountId, row) {
+  if (row && row.collection_days != null && row.collection_days !== '') return Number(row.collection_days);
+  const id = String(accountId == null ? '' : accountId).replace(/\D/g, '');
+  if (!id) return null;
+  const hit = collectionCache.get(id);
+  if (hit && Date.now() - hit.at < 60 * 60 * 1000) return hit.days;
+  const cc = await require('../integrations/dealerPortal')
+    .creditControl(id)
+    .catch(() => null);
+  const v = cc && (cc.collection_days != null ? cc.collection_days : cc.collectionDays);
+  const days = v != null && v !== '' && Number(v) > 0 ? Number(v) : null;
+  // Only an answer is kept: a portal that did not answer is asked again.
+  if (days) collectionCache.set(id, { at: Date.now(), days });
+  return days;
+}
+const creditLine = (money, limit, days, sep = ' · ') => `${money(limit)}${days ? `${sep}collection ${days} day${days === 1 ? '' : 's'}` : ''}`;
+
 // EVERYTHING ABOUT ONE CUSTOMER, for the agent to check before acting on
 // the account (founder, 25 Sep: "show complete detail about the customer to
 // agent and after that agent say yes"). The portal's account row carries the
@@ -446,7 +469,7 @@ async function customerCard(row, t) {
     full.address || full.state_name ? 'Address: ' + [full.address, full.state_name].filter(Boolean).join(', ') : null,
     full.person ? 'Contact: ' + full.person : null,
     agentOf(full) ? 'Agent: ' + agentOf(full) : null,
-    full.credit_limit != null ? `Credit: ${money(full.credit_limit)}${full.credit_days != null ? ' · ' + full.credit_days + ' day(s)' : ''}` : null,
+    full.credit_limit != null ? 'Credit: ' + creditLine(money, full.credit_limit, await collectionDaysOf(full.id, full)) : null,
     // What they owe — Odoo's receivable, as the portal reads it live.
     left != null
       ? Number(left) >= 1
@@ -491,7 +514,7 @@ async function customerBrief(row) {
     [full.phone || full.mobile ? 'Phone ' + (full.phone || full.mobile) : null, full.gst_no ? 'GSTIN ' + full.gst_no : null].filter(Boolean).join(' · ') || null,
     [place(full), agentOf(full) ? 'agent ' + agentOf(full) : null].filter(Boolean).join(' · ') || null,
     [
-      full.credit_limit != null && full.credit_limit !== '' ? `Credit ${money(full.credit_limit)}${full.credit_days != null ? ' / ' + full.credit_days + ' days' : ''}` : null,
+      full.credit_limit != null && full.credit_limit !== '' ? 'Credit ' + creditLine(money, full.credit_limit, await collectionDaysOf(full.id, full), ' / ') : null,
       left != null && left !== '' ? (Number(left) >= 1 ? 'Due ' + money(left) : 'No dues') : null,
     ]
       .filter(Boolean)
@@ -884,7 +907,7 @@ async function sendLedgerPdf(bot, m, row, t) {
       address: [full.address, full.state_name].filter(Boolean).join(', ') || null,
       portalId: full.id,
       creditLimit: full.credit_limit != null ? Number(full.credit_limit) : null,
-      creditDays: full.credit_days != null ? full.credit_days : null,
+      collectionDays: await collectionDaysOf(full.id, full),
     });
     const safe = String(full.name || 'customer').replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
     // A cheque they gave and Odoo has not posted is not in this ledger; the
@@ -2397,6 +2420,7 @@ module.exports = {
   orderAsked,
   customerCard,
   customerBrief,
+  collectionDaysOf,
   findKeyIn,
   lastLookedUp,
   rememberLookedUp,
