@@ -1038,7 +1038,9 @@ function mockCommercial(lines) {
         : [],
       price: rate || null,
       mrp: mrp || null,
-      raw: null,
+      // A mock row with a `cost` carries it the way the portal does: as the
+      // allocation's base_price (core/lossBilling).
+      raw: row && row.cost && allocated ? { part_no: row.part_no, mrp, price: rate, allocations: [{ dealer_id: 23, dealer_name: row.vendor || 'Dealer 23', qty: allocated, price: rate, mrp, base_price: Number(row.cost) }] } : null,
     });
     out.rate = rate || null;
     out.mrp = mrp || null;

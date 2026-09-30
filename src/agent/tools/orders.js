@@ -190,9 +190,9 @@ const confirmOrder = tool(
           paymentRequest: hold.req.id,
           qrSent: hold.qrSent,
           why:
-            'Their previous balance is not settled. Tell them, in their language: the previous amount of ' + ('Rs.' + hold.due) + ' has to be paid to settle the account before this new order goes ahead' +
+            'Their previous balance is not settled. Give them a GENTLE, warm reminder in their language - thank them for the order first, then say politely that ' + ('Rs.' + hold.due) + ' from earlier is still pending on their account, and that the new order is kept ready and goes ahead the moment the payment is received' +
             (hold.qrSent ? '; the payment QR has been sent to them just now' : '; our team will share how to pay') +
-            '. The order is kept and goes for approval as soon as the payment is confirmed. When they say they have paid, call payment_done. It is NOT placed and NOT sent for approval yet.',
+            '. Never sound like a demand or a refusal. When they say they have paid, call payment_done. It is NOT placed yet.',
         });
       }
     }
@@ -224,6 +224,18 @@ const confirmOrder = tool(
         requestId: order.id,
         ...chequeFacts(order),
         why: 'orders are placed once the Sales Head approves them. It has gone to him; the customer will get the portal order number when he does. Say exactly that — it is NOT placed yet.',
+      });
+    }
+    // LOSS BILLING (founder, 30 Sep): below our cost, so it waits for Prateek
+    // Sir's OK before it is punched. Cost, margin and loss are ours alone.
+    if (res && res.loss) {
+      const sent = bot && bot.requestOrderApproval ? await bot.requestOrderApproval(order, { loss: res.loss }).catch(() => 0) : 0;
+      if (!sent) return JSON.stringify({ placed: false, why: 'the order could not be sent for its final check', askAPerson: true });
+      return JSON.stringify({
+        placed: false,
+        pendingFinalCheck: true,
+        requestId: order.id,
+        why: 'the order is received and goes through one final check by our team before it is placed; the customer gets the order number as soon as it is placed. Thank them warmly and say exactly that. NEVER mention cost, margin, loss or approval of pricing - that is internal. It is NOT placed yet.',
       });
     }
     // Nothing in the cart is in stock, and only stock is punched (founder,

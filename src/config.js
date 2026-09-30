@@ -321,6 +321,20 @@ const config = {
     qrImage: (process.env.PAYMENT_QR_IMAGE || '').trim(),
     // Below this, a balance counts as settled.
     settledBelow: Number(process.env.PAYMENT_SETTLED_BELOW || 1),
+    // How often held orders are re-checked against the portal's balance, so
+    // a payment made straight to the bank releases the order by itself.
+    heldCheckMinutes: Number(process.env.HELD_ORDER_CHECK_MINUTES || 15),
+  },
+
+  // LOSS BILLING (founder, 30 Sep): an order line sold below our purchase
+  // cost is punched only after Prateek Sir's OK (core/lossBilling).
+  lossBilling: {
+    approvers: nameMap(process.env.LOSS_APPROVER_NUMBERS || '919999492550:Prateek Sir'),
+    // The portal's base_price is our purchase cost; the customer's price
+    // includes GST. Compared ex-GST unless the cost is said to include it.
+    costIncludesGst: String(process.env.LOSS_COST_INCLUDES_GST || '').toLowerCase() === 'true',
+    defaultTaxPercent: Number(process.env.LOSS_DEFAULT_TAX_PERCENT || 18),
+    enabled: String(process.env.LOSS_BILLING_CHECK || 'true').toLowerCase() !== 'false',
   },
 
   creation: {

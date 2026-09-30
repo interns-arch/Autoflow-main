@@ -44,6 +44,7 @@ function ageOf(value) {
   return null;
 }
 
+const maxAge = new Map(); // slot name -> its own age limit, when it keeps longer than a day
 function janitor(name, root) {
   const now = Date.now();
   const fresh = !swept.has(root);
@@ -53,7 +54,7 @@ function janitor(name, root) {
   let dropped = 0;
   for (const k of Object.keys(root)) {
     const at = ageOf(root[k]);
-    if (at !== null && now - at > MAX_AGE_MS) {
+    if (at !== null && now - at > (maxAge.get(name) || MAX_AGE_MS)) {
       delete root[k];
       dropped++;
     }
@@ -66,7 +67,10 @@ function janitor(name, root) {
 
 const has = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
 
-function slot(name) {
+// `opts.maxAgeMs`: a slot whose entries must outlive a day (a payment an
+// order is held on waits as long as the customer takes to pay).
+function slot(name, opts = {}) {
+  if (opts.maxAgeMs) maxAge.set(name, opts.maxAgeMs);
   const root = () => {
     const r = rootOf(name);
     janitor(name, r);

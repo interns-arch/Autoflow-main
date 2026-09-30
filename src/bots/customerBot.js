@@ -180,6 +180,7 @@ const DISCOUNT_STEP = {
 };
 const approvalLog = require('../core/approvalLog');
 const payments = require('../core/payments');
+const lossBilling = require('../core/lossBilling');
 const advanceOrders = require('../core/advanceOrders');
 const deliveryWatch = require('../core/deliveryWatch');
 // The car a customer last NAMED in words, for the half hour after. "Swift
@@ -392,6 +393,12 @@ class CustomerBot {
     // Orders punched and then cancelled on the portal: marked, and the
     // customer (and the salesman) told (core/cancelWatch).
     require('../core/cancelWatch').start(this);
+    // Orders held on a due balance: released by themselves once the portal
+    // shows it paid (a payment made straight to the bank, never "payment done").
+    if (!this._heldTimer && config.payments.heldCheckMinutes > 0) {
+      this._heldTimer = setInterval(() => this.checkHeldOrders().catch(() => {}), config.payments.heldCheckMinutes * 60000);
+      if (this._heldTimer.unref) this._heldTimer.unref();
+    }
     // Account requests that went out while the approver's window was shut.
     setTimeout(() => this.catchUpUndelivered().catch((e) => store.log(this.key, 'undelivered catch-up failed: ' + String((e && e.message) || e).slice(0, 80))), 30 * 1000).unref();
     // A cheque that bounces or is rejected: the staff are told (core/chequeWatch).
@@ -656,10 +663,17 @@ class CustomerBot {
       // need not be Sales Heads otherwise; decideDiscount checks who.
       const discountApprover = this.discountApproverNumbers().includes(store.normPhone(m.from));
       if (decision && /^DSC-/.test(decision.requestId) && (discountApprover || customerCreate.isApprover(m.from))) return this.decideDiscount(m, decision, reply, t);
-      if (!decision && discountApprover && !customerCreate.isApprover(m.from)) {
+      // A LOSS BILLING order is decided by its own approver (Prateek Sir);
+      // decideOrder checks which kind of order it is and who may decide it.
+      const lossApprover = lossBilling.isApprover(m.from);
+      if (decision && /^ORD-/.test(decision.requestId) && (lossApprover || customerCreate.isApprover(m.from))) return this.decideOrder(m, decision, reply, t);
+      if (!decision && (discountApprover || lossApprover) && !customerCreate.isApprover(m.from)) {
         const bareD = customerCreate.readBareDecision(text);
-        const openD = bareD ? this.openApprovals().filter((id) => /^DSC-/.test(id)) : [];
-        if (bareD && openD.length === 1) return this.decideDiscount(m, { yes: bareD.yes, requestId: openD[0] }, reply, t);
+        const openD = bareD ? this.openApprovals().filter((id) => this.mayDecide(id, m.from)) : [];
+        if (bareD && openD.length === 1) {
+          const d = { yes: bareD.yes, requestId: openD[0] };
+          return /^DSC-/.test(d.requestId) ? this.decideDiscount(m, d, reply, t) : this.decideOrder(m, d, reply, t);
+        }
       }
       if (decision && customerCreate.isApprover(m.from)) {
         if (/^DSC-/.test(decision.requestId)) return this.decideDiscount(m, decision, reply, t);
@@ -686,7 +700,7 @@ class CustomerBot {
         if (bare) {
           const swiped = m.contextId && customerCreate.requestForMessage(m.contextId);
           // A new customer is not theirs to decide unless they are a customer approver.
-          const open = this.openApprovals().filter((id) => !/^WA-/.test(id) || customerCreate.isAccountApprover(m.from));
+          const open = this.openApprovals().filter((id) => this.mayDecide(id, m.from));
           const pick = swiped && open.includes(swiped) ? [swiped] : open;
           if (pick.length === 1) {
             store.log(this.key, `"${text}" from ${m.from}: the only open request is ${pick[0]} - taken as ${bare.yes ? 'OK' : 'NO'}`);
@@ -1888,6 +1902,13 @@ class CustomerBot {
         // amount and the QR, the accountant confirms the payment, and then the
         // order goes on by itself (to the Sales Heads while placing is off).
         const heldFor = salesOrder.activeCustomer(m.chatId);
+        // THEIR OWN ORDER, on the desk (founder, 30 Sep: "if customer has due
+        // balance then send customer a gentle remainder ... and hold the order
+        // until payment received"): held the same way, told gently here.
+        if (!heldFor && !this.isOperator(m) && order.portalCustomer && order.portalCustomer.buyerId) {
+          const hold = await this.holdForPayment(order, order.portalCustomer).catch(() => null);
+          if (hold) return reply(this.gentleDueText(order.portalCustomer, hold, t));
+        }
         if (heldFor && order.portalCustomer && order.portalCustomer.buyerId) {
           const pc = order.portalCustomer;
           const custPhone = String(pc.phone || (pc.raw && (pc.raw.phone || pc.raw.mobile)) || '').replace(/\D/g, '').slice(-10);
@@ -1904,20 +1925,20 @@ class CustomerBot {
 
 ${payments.breakdown(hold.detail, t)}
 
-${order.id} is on hold until the remaining ${payments.money(hold.due)} is paid${custPhone.length === 10 ? '; the breakdown and the payment QR went to the customer' : ''}. Once our accountant confirms the payment it goes for approval, and you get the order number here.`,
+${order.id} is on hold until the remaining ${payments.money(hold.due)} is paid${custPhone.length === 10 ? '; the breakdown and the payment QR went to the customer' : ''}. Once our accountant confirms the payment it goes ahead by itself, and you get the order number here.`,
                 `${heldFor.name} — cheque gin liya hai, par baaki abhi pura nahi hua:
 
 ${payments.breakdown(hold.detail, t)}
 
-Baaki ${payments.money(hold.due)} pay hone tak ${order.id} hold pe hai${custPhone.length === 10 ? '; ye detail aur payment QR customer ko bhej diya' : ''}. Accountant ke confirm karte hi approval ke liye jayega aur order number yahin milega.`,
+Baaki ${payments.money(hold.due)} pay hone tak ${order.id} hold pe hai${custPhone.length === 10 ? '; ye detail aur payment QR customer ko bhej diya' : ''}. Accountant ke confirm karte hi order apne aap aage jayega aur order number yahin milega.`,
               ),
             );
           }
           if (hold) {
             return reply(
               t(
-                `${heldFor.name} still owes ${payments.money(hold.due)} — with one invoice on credit, no new order until it is paid. ${order.id} is on hold${custPhone.length === 10 ? '; the amount and the payment QR went to the customer' : ''}. Once our accountant confirms the payment it goes for approval, and you get the order number here.`,
-                `${heldFor.name} ka ${payments.money(hold.due)} abhi baaki hai — ek invoice credit billing hai, isliye pay hone tak naya order nahi. ${order.id} hold pe hai${custPhone.length === 10 ? '; amount aur payment QR customer ko bhej diya' : ''}. Accountant ke confirm karte hi approval ke liye jayega aur order number yahin milega.`,
+                `${heldFor.name} still owes ${payments.money(hold.due)} — with one invoice on credit, no new order until it is paid. ${order.id} is on hold${custPhone.length === 10 ? '; a gentle reminder with the amount and the payment QR went to the customer' : ''}. Once our accountant confirms the payment it goes ahead by itself, and you get the order number here.`,
+                `${heldFor.name} ka ${payments.money(hold.due)} abhi baaki hai — ek invoice credit billing hai, isliye pay hone tak naya order nahi. ${order.id} hold pe hai${custPhone.length === 10 ? '; customer ko amount aur payment QR ke saath ek vinamra reminder bhej diya' : ''}. Accountant ke confirm karte hi order apne aap aage jayega aur order number yahin milega.`,
               ),
             );
           }
@@ -1935,6 +1956,29 @@ Baaki ${payments.money(hold.due)} pay hone tak ${order.id} hold pe hai${custPhon
           // No customer on the order: the portal would bill nobody.
           if (result.noCustomer) {
             return reply(t('Which customer is this order for? Send their name first.', 'Ye order kis customer ka hai? Pehle customer ka naam bhejiye.'));
+          }
+
+          // LOSS BILLING (founder, 30 Sep): below our cost, so it waits for
+          // Prateek Sir's OK. The customer never hears about cost or loss.
+          if (result.loss) {
+            const forCustomerL = salesOrder.activeCustomer(m.chatId);
+            const sentL = await this.requestOrderApproval(order, { ...(forCustomerL ? { by: customerCreate.agentName(m.from) || m.from } : {}), loss: result.loss });
+            if (forCustomerL) {
+              return reply(
+                sentL
+                  ? t(
+                      `${forCustomerL.name}'s order (${order.id}) sells below our cost on ${result.loss.lines.length} line(s) (loss ${lossBilling.money(result.loss.total)}), so it has gone to ${lossBilling.approverNames()} for loss billing approval. It is punched on the portal only once approved — you get the order number here.`,
+                      `${forCustomerL.name} ka order (${order.id}) ${result.loss.lines.length} line pe cost se kam pe hai (loss ${lossBilling.money(result.loss.total)}), isliye loss billing approval ke liye ${lossBilling.approverNames()} ko bhej diya. Approve hone pe hi portal pe punch hoga — order number yahin milega.`,
+                    )
+                  : t(`${order.id} sells below our cost and could not be sent for approval — nothing was punched.`, `${order.id} cost se kam pe hai aur approval ke liye nahi ja paya — kuch punch nahi hua.`),
+              );
+            }
+            return reply(
+              t(
+                'Thank you, your order is received. It goes through one final check with our team, and I will send you the order number as soon as it is placed.',
+                'Shukriya, aapka order mil gaya hai. Hamari team ek final check kar rahi hai — place hote hi order number bhej dunga.',
+              ),
+            );
           }
 
           // Testing mode: the draft is kept exactly as it is, so the same YES
@@ -3191,7 +3235,10 @@ Baaki ${payments.money(hold.due)} pay hone tak ${order.id} hold pe hai${custPhon
         (config.inquiryOnlyNumbers || []).includes(p) ||
         salesOrder.isSalesPerson(p) ||
         customerCreate.isApprover(p) ||
-        this.discountApproverNumbers().includes(p) ||
+        Object.keys((config.creation && config.creation.discountApprovers) || {})
+          .map((x) => store.normPhone(x))
+          .includes(p) ||
+        lossBilling.isApprover(p) ||
         payments.isAccountant(p) ||
         customerCreate.agentName(p),
     );
@@ -3465,6 +3512,19 @@ Baaki ${payments.money(hold.due)} pay hone tak ${order.id} hold pe hai${custPhon
     return t(`New-customer approvals are with ${names} now — nothing was changed.`, `Naye customer ka approval ab ${names} karte hain — kuch change nahi hua.`);
   }
 
+  // Whether this number decides this request - so a bare "ok" is taken for
+  // the one request that is theirs, not somebody else's.
+  mayDecide(id, phone) {
+    const rid = String(id || '').toUpperCase();
+    if (/^WA-/.test(rid)) return customerCreate.isAccountApprover(phone);
+    if (/^DSC-/.test(rid)) return this.discountApproverNumbers().includes(store.normPhone(phone));
+    if (/^ORD-/.test(rid)) {
+      const o = store.orders().find((x) => String(x.id).toUpperCase() === rid);
+      return o && o.approvalKind === 'loss' ? lossBilling.isApprover(phone) : customerCreate.isApprover(phone);
+    }
+    return customerCreate.isApprover(phone);
+  }
+
   openApprovals(now = Date.now()) {
     const fresh = (at) => {
       const ms = typeof at === 'number' ? at : Date.parse(at || '');
@@ -3486,9 +3546,9 @@ Baaki ${payments.money(hold.due)} pay hone tak ${order.id} hold pe hai${custPhon
 
   // track = { ref, requesterChat }: an approval request, watched for delivery
   // (core/deliveryWatch) - the one who asked hears if a Sales Head never got it.
-  async toApprovers(text, track = null) {
+  async toApprovers(text, track = null, to = null) {
     let sent = 0;
-    for (const phone of Object.keys(config.creation.approvers)) {
+    for (const phone of to || Object.keys(config.creation.approvers)) {
       try {
         // Outside the 24h window a plain text is silently dropped (escalation.ensureWindow).
         await escalation.ensureWindow(this.transport, phone, 'Discount approval coming — details follow');
@@ -4616,8 +4676,8 @@ ${payments.breakdown(due, ct)}
 Baaki ${payments.money(due.due)} pay hone tak naya order${opts.agent ? ' (' + opts.agent + ' ne lagaya)' : ''} ruka hua hai. Neeche QR se pay karke "payment kar diya" likhiye — confirm hote hi order aage badh jayega.`,
           )
         : ct(
-            `Hello ${customer.name}. Your previous balance of ${payments.money(due.due)} is unpaid, so the new order${opts.agent ? ' placed by ' + opts.agent : ''} is on hold. Please pay it with the QR below and reply "payment done" — the order goes ahead as soon as it is confirmed.`,
-            `Namaste ${customer.name}. Aapka pichla ${payments.money(due.due)} baaki hai, isliye naya order${opts.agent ? ' (' + opts.agent + ' ne lagaya)' : ''} ruka hua hai. Neeche QR se pay karke "payment kar diya" likhiye — confirm hote hi order aage badh jayega.`,
+            `Dear ${customer.name}, thank you for your new order${opts.agent ? ' (placed by ' + opts.agent + ')' : ''}. A gentle reminder: ${payments.money(due.due)} from earlier is still pending on your account. We are keeping the order ready, and it goes ahead the moment the payment is received. You can pay with the QR below and reply "payment done". Thank you!`,
+            `${customer.name} ji, naye order${opts.agent ? ' (' + opts.agent + ' ne lagaya)' : ''} ke liye shukriya. Ek vinamra yaad-dihani: aapke account mein pichla ${payments.money(due.due)} abhi baaki hai. Aapka order hum taiyaar rakh rahe hain — payment milte hi turant aage badha denge. Neeche diye QR se pay karke "payment kar diya" likh dijiye. Dhanyawaad!`,
           );
       try {
         await escalation.ensureWindow(this.transport, store.normPhone(opts.customerPhone), 'Payment due — details follow', customer.name);
@@ -4642,6 +4702,29 @@ Baaki ${payments.money(due.due)} pay hone tak naya order${opts.agent ? ' (' + op
     approvalLog.record({ kind: 'payment', id: req.id, event: 'requested', by: 'bot (order ' + order.id + ')', customer: customer.name, phone: req.phone, detail: 'due ' + payments.money(due.due) + ' before ' + order.id, amount: due.due });
     const qrSent = await this.sendPaymentQr(req, due.due);
     return { req, due: due.due, owed: due.owed, chequeAmount: due.chequeAmount || 0, cheques: due.cheques || [], detail: due, qrSent };
+  }
+
+  // A customer's own order held for an earlier balance: said gently.
+  gentleDueText(customer, hold, t) {
+    const name = customer && customer.name ? customer.name : '';
+    if (hold.chequeAmount > 0) {
+      return t(
+        `Thank you for your order${name ? ', ' + name : ''}. Your cheque has been received and counted.
+
+${payments.breakdown(hold.detail, t)}
+
+We are keeping the order ready — it goes ahead the moment the remaining ${payments.money(hold.due)} is received. ${hold.qrSent ? 'The payment QR is above; ' : ''}reply "payment done" once paid.`,
+        `Order ke liye shukriya${name ? ' ' + name + ' ji' : ''}. Aapka cheque mil gaya hai aur gin liya gaya hai.
+
+${payments.breakdown(hold.detail, t)}
+
+Order hum taiyaar rakh rahe hain — baaki ${payments.money(hold.due)} milte hi turant aage badha denge. ${hold.qrSent ? 'Payment QR upar hai; ' : ''}pay karke "payment kar diya" likh dijiye.`,
+      );
+    }
+    return t(
+      `Thank you for your order${name ? ', ' + name : ''}. A gentle reminder: ${payments.money(hold.due)} from earlier is still pending on your account. We are keeping the order ready, and it goes ahead the moment the payment is received. ${hold.qrSent ? 'The payment QR is above; ' : ''}reply "payment done" once paid.`,
+      `Order ke liye shukriya${name ? ' ' + name + ' ji' : ''}. Ek vinamra yaad-dihani: aapke account mein pichla ${payments.money(hold.due)} abhi baaki hai. Order hum taiyaar rakh rahe hain — payment milte hi turant aage badha denge. ${hold.qrSent ? 'Payment QR upar hai; ' : ''}pay karke "payment kar diya" likh dijiye.`,
+    );
   }
 
   // The QR for the amount, into the customer's chat. -> true when one went.
@@ -4803,6 +4886,49 @@ Baaki ${payments.money(due.due)} pay hone tak naya order${opts.agent ? ' (' + op
     return reply(t(`Settled — ${req.customer}.${order ? ' Their order ' + order.id + ' has gone on.' : ''}`, `Settle ho gaya — ${req.customer}.${order ? ' Unka order ' + order.id + ' aage bhej diya.' : ''}`));
   }
 
+  // HELD ORDERS, RE-CHECKED (founder, 30 Sep: "hold the order until payment
+  // received"). The balance is read again for every order waiting on a
+  // payment; once the portal shows it settled the order goes on, exactly as
+  // after the accountant's OK. -> how many were released.
+  async checkHeldOrders(now = Date.now()) {
+    let released = 0;
+    const held = store.orders().filter((o) => o.status === 'awaitingPayment' && o.paymentId && o.portalCustomer && o.portalCustomer.buyerId && now - Date.parse(o.createdAt || o.quotedAt || 0) < 30 * 86400000);
+    for (const order of held) {
+      const req = payments.find(order.paymentId);
+      if (req && req.status === 'settled') continue;
+      const due = await payments.dueOf(order.portalCustomer).catch(() => null);
+      if (!due || !payments.settled(due.due)) continue;
+      store.log(this.key, `${order.id}: ${order.portalCustomer.name} is settled on the portal (due ${payments.money(due.due)}) — releasing the held order`);
+      if (req) {
+        req.status = 'settled';
+        req.due = due.due;
+        payments.save(req);
+        approvalLog.record({ kind: 'payment', id: req.id, event: 'settled', by: 'portal balance', customer: req.customer, detail: 'balance settled — seen on the portal' });
+      }
+      const went = await this.releaseHeldOrder(order);
+      released++;
+      const custChat = req ? req.chatId : this.customerChatOf(order) || order.chatId;
+      const sendTo = async (chat, text) => {
+        try {
+          const id = await this.transport.sendToChat(chat, text);
+          this.recordOutgoing(chat, id, text);
+        } catch (e) {
+          store.log(this.key, `${order.id}: could not tell ${chat} it was released: ${String((e && e.message) || e).slice(0, 80)}`);
+        }
+      };
+      if (custChat) {
+        const ct = lang.for(custChat);
+        await sendTo(custChat, ct(`✅ Your payment is received and your balance is settled — thank you!${went ? ' ' + went.en : ''}`, `✅ Aapka payment mil gaya, balance settle ho gaya — shukriya!${went ? ' ' + went.hi : ''}`));
+      }
+      if (order.chatId && order.chatId !== custChat) {
+        const at = lang.for(order.chatId);
+        const name = order.portalCustomer.name;
+        await sendTo(order.chatId, at(`✅ ${name} has paid — balance settled. ${order.id} ${went ? 'has gone on (' + went.en + ')' : 'can go ahead now'}.`, `✅ ${name} ne pay kar diya — balance settle ho gaya. ${order.id} ${went ? 'aage badh gaya (' + went.hi + ')' : 'ab aage ja sakta hai'}.`));
+      }
+    }
+    return released;
+  }
+
   // The order that waited on the payment: placed, or — while placing is off —
   // sent to the Sales Heads for approval. -> the words for the customer.
   async releaseHeldOrder(order) {
@@ -4814,14 +4940,16 @@ Baaki ${payments.money(due.due)} pay hone tak naya order${opts.agent ? ' (' + op
     store.save();
     let res = null;
     try {
-      res = await orders.confirm(order);
+      res = await orders.confirm(order, { released: true });
     } catch (e) {
       store.log(this.key, `${order.id}: placing after the payment failed: ${String((e && e.message) || e).slice(0, 100)}`);
       const sent = await this.requestOrderApproval(order, byAgent);
       return sent ? { en: `Your order ${order.id} has gone for approval.`, hi: `Aapka order ${order.id} approval ke liye bhej diya hai.` } : null;
     }
-    if (res && res.blocked) {
-      const sent = await this.requestOrderApproval(order, byAgent);
+    if (res && (res.blocked || res.loss)) {
+      const sent = await this.requestOrderApproval(order, { ...byAgent, ...(res.loss ? { loss: res.loss } : {}) });
+      // Cost and loss are ours: the customer hears of a final check only.
+      if (sent && res.loss) return { en: `Your order ${order.id} goes through one final check now — you get the order number as soon as it is placed.`, hi: `Aapka order ${order.id} ab ek final check se guzar raha hai — place hote hi order number mil jayega.` };
       return sent ? { en: `Your order ${order.id} has gone for approval.`, hi: `Aapka order ${order.id} approval ke liye bhej diya hai.` } : null;
     }
     if (res && res.soNumber) return { en: `Your order is placed — order no. ${res.soNumber}.`, hi: `Aapka order place ho gaya — order no. ${res.soNumber}.` };
@@ -4866,7 +4994,30 @@ Baaki ${payments.money(due.due)} pay hone tak naya order${opts.agent ? ' (' + op
     });
     if (left) rows.push('', `(${left} other item(s) not in stock — not included)`);
     const total = punchable.reduce((s, l) => s + (Number(l.rate) || Number(l.mrp) || 0) * Math.min(Number(l.qty) || 0, Number(l.available) || 0), 0);
-    const text = [
+    // LOSS BILLING (founder, 30 Sep): the lines below our cost, to Prateek Sir
+    // only; his OK is what punches it (decideOrder -> lossApprovedBy).
+    const loss = opts.loss || null;
+    if (loss) order.approvalKind = 'loss';
+    else delete order.approvalKind;
+    const lossText = loss
+      ? [
+          `🔻 *Loss billing approval* — ${order.id}`,
+          `Customer: ${custName}${phone ? ` (+${phone})` : ''}`,
+          opts.by ? `Requested by: ${opts.by} (sales team)` : null,
+          due ? (payments.settled(due.due) ? 'Due balance: nil' : `⚠️ Due balance: ${payments.money(due.due)} unpaid`) : null,
+          '',
+          `*Below our cost (${loss.lines.length}):*`,
+          ...lossBilling.lossRows(loss),
+          punchable.length > loss.lines.length ? `(${punchable.length - loss.lines.length} other line(s) at or above cost)` : null,
+          left ? `(${left} item(s) not in stock — not included)` : null,
+          '',
+          `Order ₹${Math.round(total).toLocaleString('en-IN')} incl. GST · total loss *${lossBilling.money(loss.total)}*`,
+          `Reply *OK ${order.id}* to punch it on the Dealer Portal, or *NO ${order.id}* to reject.`,
+        ]
+          .filter((l) => l !== null)
+          .join('\n')
+      : null;
+    const text = lossText || [
       `*Order approval* — ${order.id}`,
       `Customer: ${custName}${phone ? ` (+${phone})` : ''}`,
       opts.by ? `Requested by: ${opts.by} (sales team)` : null,
@@ -4885,13 +5036,13 @@ Baaki ${payments.money(due.due)} pay hone tak naya order${opts.agent ? ' (' + op
     order.status = 'approval';
     order.approvalAskedAt = new Date().toISOString();
     store.save();
-    const sent = await this.toApprovers(text, { ref: order.id, requesterChat: opts.by ? order.chatId : null });
+    const sent = await this.toApprovers(text, { ref: order.id, requesterChat: opts.by ? order.chatId : null }, loss ? Object.keys(lossBilling.approvers()) : null);
     if (!sent) {
       order.status = was;
       store.save();
     }
-    store.log(this.key, `${order.id} sent to ${sent} approver(s) for approval`);
-    if (sent) approvalLog.record({ kind: 'order', id: order.id, event: 'requested', by: opts.by ? opts.by + ' (sales team)' : 'customer (' + phone + ')', customer: custName, phone, detail: `${order.lines.length} line(s)`, amount: Math.round(total) });
+    store.log(this.key, `${order.id} sent to ${sent} approver(s) for ${loss ? 'LOSS BILLING ' : ''}approval`);
+    if (sent) approvalLog.record({ kind: 'order', id: order.id, event: 'requested', by: opts.by ? opts.by + ' (sales team)' : 'customer (' + phone + ')', customer: custName, phone, detail: loss ? `loss billing ${lossBilling.money(loss.total)} on ${loss.lines.length} line(s)` : `${order.lines.length} line(s)`, amount: Math.round(total) });
     return sent;
   }
 
@@ -4901,7 +5052,14 @@ Baaki ${payments.money(due.due)} pay hone tak naya order${opts.agent ? ' (' + op
     if (!order) return reply(t(`${decision.requestId} not found.`, `${decision.requestId} nahi mila.`));
     if (order.status === 'confirmed') return reply(t(`${order.id} is already placed — portal order ${order.soNumber}.`, `${order.id} pehle hi place ho chuka hai — portal order ${order.soNumber}.`));
     if (order.status !== 'approval') return reply(t(`${order.id} is not waiting for approval (${order.status}).`, `${order.id} approval ke liye nahi ruka hai (${order.status}).`));
-    const who = customerCreate.approverName(m.from);
+    const isLoss = order.approvalKind === 'loss';
+    if (isLoss && !lossBilling.isApprover(m.from)) {
+      store.log(this.key, `${m.from} tried to decide loss-billing order ${order.id} but is not a loss approver`);
+      return reply(t(`${order.id} is a loss billing order — only ${lossBilling.approverNames()} can approve or reject it.`, `${order.id} loss billing order hai — ise sirf ${lossBilling.approverNames()} approve ya reject kar sakte hain.`));
+    }
+    if (!isLoss && !customerCreate.isApprover(m.from)) return reply(t('Only the Sales Head can approve that.', 'Ye sirf Sales Head approve kar sakte hain.'));
+    const who = isLoss ? lossBilling.approverName(m.from) : customerCreate.approverName(m.from);
+    const byWhom = isLoss ? who : 'the Sales Head';
     const ct = lang.for(order.chatId);
     const tell = async (text) => {
       try {
@@ -4923,7 +5081,7 @@ Baaki ${payments.money(due.due)} pay hone tak naya order${opts.agent ? ' (' + op
       // it get approved or decline send msg to both"): the agent's chat, AND
       // the customer on their own number.
       if (order.requestedBy) {
-        await tell(ct(`${pcR.name ? pcR.name + "'s o" : 'O'}rder ${order.id} was not approved by the Sales Head. The customer has been told.`, `${pcR.name ? pcR.name + ' ka o' : 'O'}rder ${order.id} Sales Head ne approve nahi kiya. Customer ko bata diya hai.`));
+        await tell(ct(`${pcR.name ? pcR.name + "'s o" : 'O'}rder ${order.id} was not approved by ${byWhom}${isLoss ? ' (loss billing)' : ''}. The customer has been told.`, `${pcR.name ? pcR.name + ' ka o' : 'O'}rder ${order.id} ${isLoss ? who : 'Sales Head'} ne approve nahi kiya${isLoss ? ' (loss billing)' : ''}. Customer ko bata diya hai.`));
         const custChatR = this.customerChatOf(order);
         if (custChatR) {
           const cr = lang.for(custChatR);
@@ -4947,7 +5105,7 @@ Baaki ${payments.money(due.due)} pay hone tak naya order${opts.agent ? ' (' + op
 
     let res;
     try {
-      res = await orders.confirm(order, { approvedBy: who });
+      res = await orders.confirm(order, { approvedBy: who, ...(isLoss ? { lossApprovedBy: who } : {}) });
     } catch (e) {
       const full = String((e && e.message) || e);
       // Recorded once, by core/orders.confirm, for every punch the portal refuses.
@@ -4969,6 +5127,16 @@ Baaki ${payments.money(due.due)} pay hone tak naya order${opts.agent ? ' (' + op
       return reply(t(`The portal did not take it: ${why}\nNothing was placed — send *OK ${order.id}* again to retry.`, `Portal ne nahi liya: ${why}\nKuch place nahi hua — dobara *OK ${order.id}* bhejiye.`));
     }
     if (res && res.busy) return reply(t(`${order.id} is being placed right now.`, `${order.id} abhi place ho raha hai.`));
+    // A Sales Head's OK on an order that turns out to sell below cost: it goes
+    // on to the loss approver, and is not punched yet.
+    if (res && res.loss) {
+      const sentL = await this.requestOrderApproval(order, { by: order.requestedBy || undefined, loss: res.loss });
+      return reply(
+        sentL
+          ? t(`${order.id} sells below our cost (loss ${lossBilling.money(res.loss.total)}), so it has gone to ${lossBilling.approverNames()} for loss billing approval. Nothing is punched yet.`, `${order.id} cost se kam pe bik raha hai (loss ${lossBilling.money(res.loss.total)}), isliye loss billing approval ke liye ${lossBilling.approverNames()} ko bhej diya. Abhi punch nahi hua.`)
+          : t(`${order.id} sells below our cost, and ${lossBilling.approverNames()} could not be reached. Nothing was punched.`, `${order.id} cost se kam pe hai, aur ${lossBilling.approverNames()} tak nahi pahuncha. Kuch punch nahi hua.`),
+      );
+    }
     if (res && res.noCustomer) return reply(t(`${order.id} has no customer account attached, so the portal cannot bill it. Nothing was placed.`, `${order.id} pe customer account nahi hai, portal bill nahi kar sakta. Kuch place nahi hua.`));
     if (res && res.nothingInStock) {
       store.log(this.key, `${order.id} approved by ${who} — nothing in stock, nothing placed`);

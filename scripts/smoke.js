@@ -6401,11 +6401,13 @@ async function main() {
         check('"ok\'" with one request open approves it', punched73 === 1 && /SO-73/.test(said73), said73);
         check('...and is never answered "no order pending"', !/pending nahi|no order/i.test(said73), said73);
 
-        customer.openApprovals = () => ['DSC-AAAA', 'ORD-9999'];
+        // A discount is Arun Sir's alone (30 Sep), so it is not among Shad's.
+        customer.openApprovals = () => ['DSC-AAAA', 'ORD-9998', 'ORD-9999'];
         customer.transport.outbox.length = 0;
         await customer.transport.injectIncoming({ id: 'wamid.s73b', from: '916388059016', chatId: '916388059016@cloud', isGroup: false, body: 'ok', hasMedia: false, mediaType: 'chat' });
         const ask73 = customer.transport.outbox.filter((o) => /6388059016/.test(o.to || '')).map((o) => o.text).join('\n');
-        check('with two open, a bare "ok" decides nothing and asks which', punched73 === 1 && /OK DSC-AAAA/.test(ask73) && /OK ORD-9999/.test(ask73), ask73);
+        check('with two open, a bare "ok" decides nothing and asks which', punched73 === 1 && /OK ORD-9998/.test(ask73) && /OK ORD-9999/.test(ask73), ask73);
+        check('...and a discount, not his to decide, is not offered to him', !/DSC-AAAA/.test(ask73), ask73);
       } finally {
         customer.openApprovals = openWas73;
         customer.isOperator = opWas73;
@@ -6573,6 +6575,113 @@ async function main() {
         check("a bot rule REJECTED on the portal gives no discount", rej75.length === 0, JSON.stringify(rej75));
         portal._resetDealerCache();
         portal._setMockDiscountRules([]);
+      }
+
+      // 30 Sep, founder: "order punch direct when customer has no due balance
+      // ... due balance ... gentle remainder ... hold the order until payment
+      // received ... loss billing ... approval to prateek sir ... only then punch".
+      console.log('\n[76] no due: punched directly; loss billing waits for Prateek Sir; held orders go on once paid');
+      {
+        const loss = require('../src/core/lossBilling');
+        const payments = require('../src/core/payments');
+        const cfgLB = config.lossBilling;
+        const lbWas = { approvers: cfgLB.approvers, inc: cfgLB.costIncludesGst };
+        const apprWas76 = config.creation.approvers;
+        const onWas76 = config.dealerPortal.confirmEnabled;
+        const PRATEEK76 = '919800000761';
+        const SHAD76 = '919800000762';
+        cfgLB.approvers = { [PRATEEK76]: 'Prateek Sir' };
+        cfgLB.costIncludesGst = false;
+        config.creation.approvers = { [SHAD76]: 'Shad', [PRATEEK76]: 'Prateek Sir' };
+        config.dealerPortal.confirmEnabled = true;
+        const toNum76 = (n) => customer.transport.outbox.filter((o) => String(o.to || '').indexOf(n) >= 0).map((o) => o.text || o.caption || '').join('\n---\n');
+        try {
+          // The rule itself: ex-GST selling price against our cost.
+          const l1 = { partNo: 'X1', qty: 2, rate: 118, taxPercent: 18, _raw: { price: 118, allocations: [{ qty: 2, base_price: 120 }] } };
+          const l2 = { partNo: 'X2', qty: 1, rate: 236, taxPercent: 18, _raw: { price: 236, allocations: [{ qty: 1, base_price: 150 }] } };
+          const c76 = loss.check([l1, l2]);
+          check('a line selling at ₹100 ex-GST against a ₹120 cost is a loss of ₹20 a piece; one above cost is not', c76 && c76.lines.length === 1 && c76.lines[0].partNo === 'X1' && c76.lines[0].lossUnit === 20 && c76.total === 40, JSON.stringify(c76));
+          check('a line with no cost from the portal is never called a loss', loss.check([{ partNo: 'X3', qty: 1, rate: 10, _raw: { price: 10 } }]) === null);
+          cfgLB.costIncludesGst = true;
+          check('LOSS_COST_INCLUDES_GST compares incl. GST (₹118 vs ₹120 is still a loss)', loss.check([l1]) && loss.check([l1]).lines[0].lossUnit === 2);
+          cfgLB.costIncludesGst = false;
+
+          // A stock row whose cost is above what this customer pays.
+          portal.setMockStock([
+            { part_no: 'LOSS-76', name: 'Loss Part', quantity: 10, price: 900, mrp: 1000, cost: 900, vendor: 'Northend' },
+            { part_no: 'GAIN-76', name: 'Gain Part', quantity: 10, price: 300, mrp: 1000, cost: 300, vendor: 'Northend' },
+          ]);
+          portal.setMockCustomers([{ id: 7601, name: 'Loss Motors', phone: '9000007601', balance: 0 }, { id: 7602, name: 'Due Motors', phone: '9000007602', balance: 5000 }]);
+          const mkOrder = (id, part, pc, chat) => {
+            const o = { id, chatId: chat, status: 'draft', lines: [{ item: part, partNo: part, requested: part, qty: 2, available: 2, source: 'stock' }], portalCustomer: pc, createdAt: new Date().toISOString(), quotedAt: new Date().toISOString() };
+            store.orders().push(o);
+            store.save();
+            return o;
+          };
+          const LM = { buyerId: 7601, name: 'Loss Motors', phone: '9000007601' };
+
+          const gain = mkOrder('ORD-7601', 'GAIN-76', LM, '919000007601@cloud');
+          const rg = await orders.confirm(gain);
+          check('no due and no loss: the order is punched straight away, no approval asked', !!rg.soNumber && gain.status === 'confirmed' && !toNum76(PRATEEK76) && !toNum76(SHAD76), JSON.stringify(rg));
+
+          customer.transport.outbox.length = 0;
+          const lo = mkOrder('ORD-7602', 'LOSS-76', LM, '919000007601@cloud');
+          const rl = await orders.confirm(lo);
+          check('a line sold below our cost is NOT punched: confirm answers loss', !!rl.loss && !rl.soNumber && lo.status === 'draft' && rl.loss.lines[0].partNo === 'LOSS-76', JSON.stringify(rl));
+          const sentL = await customer.requestOrderApproval(lo, { loss: rl.loss });
+          const pr76 = toNum76(PRATEEK76);
+          check('...it goes to Prateek Sir only, as a loss billing approval with the loss spelt out', sentL === 1 && /Loss billing approval\* — ORD-7602/.test(pr76) && /LOSS-76 × 2/.test(pr76) && /vs cost ₹900/.test(pr76) && /total loss/.test(pr76) && /OK ORD-7602/.test(pr76) && !toNum76(SHAD76), pr76);
+
+          const say76 = async (from, body) => {
+            customer.transport.outbox.length = 0;
+            await customer.transport.injectIncoming({ from, chatId: from + '@cloud', isGroup: false, body, hasMedia: false, mediaType: 'text' });
+            return toNum76(from);
+          };
+          const shad76 = await say76(SHAD76, 'OK ORD-7602');
+          check('a Sales Head who is not the loss approver cannot pass it', /only Prateek Sir|sirf Prateek Sir/.test(shad76) && lo.status === 'approval', shad76);
+          const ok76 = await say76(PRATEEK76, 'OK ORD-7602');
+          check("Prateek Sir's OK punches it on the portal", lo.status === 'confirmed' && !!lo.soNumber && /Placed|Place ho gaya/.test(ok76), ok76);
+
+          const lo2 = mkOrder('ORD-7603', 'LOSS-76', LM, '919000007601@cloud');
+          const rl2 = await orders.confirm(lo2);
+          await customer.requestOrderApproval(lo2, { loss: rl2.loss });
+          customer.transport.outbox.length = 0;
+          await customer.transport.injectIncoming({ from: PRATEEK76, chatId: PRATEEK76 + '@cloud', isGroup: false, body: 'NO ORD-7603', hasMedia: false, mediaType: 'text' });
+          const toCust76 = toNum76('919000007601');
+          check('his NO: nothing is punched, and the customer is told', lo2.status === 'rejected' && !lo2.soNumber && /not approved|approve nahi/.test(toCust76), toCust76);
+          check('...and never hears about cost or loss', !/cost|loss|margin/i.test(toCust76), toCust76);
+
+          // A DUE: held, a gentle reminder, released once the portal shows it paid.
+          const DM = { buyerId: 7602, name: 'Due Motors', phone: '9000007602' };
+          const due76 = mkOrder('ORD-7604', 'GAIN-76', DM, '919000007602@cloud');
+          const hold76 = await customer.holdForPayment(due76, DM);
+          check('a customer who owes Rs.5,000 has the order held, not punched', !!hold76 && due76.status === 'awaitingPayment' && !due76.soNumber);
+          const gentle76 = customer.gentleDueText(DM, hold76, (en) => en);
+          check('...with a gentle reminder: thanks first, the amount, and that the order goes ahead once paid', /Thank you for your order/.test(gentle76) && /gentle reminder/.test(gentle76) && /Rs\.5,000/.test(gentle76) && /goes ahead the moment the payment is received/.test(gentle76), gentle76);
+          const agentHold76 = mkOrder('ORD-7605', 'GAIN-76', DM, '919000000999@cloud');
+          customer.transport.outbox.length = 0;
+          await customer.holdForPayment(agentHold76, DM, { customerPhone: '919000007602', agent: 'Rohit' });
+          const toDue76 = toNum76('919000007602');
+          check("on an agent's order the customer gets the gentle reminder too", /gentle reminder|vinamra yaad-dihani/.test(toDue76) && /Rohit/.test(toDue76), toDue76);
+          check('the payment request lives a month, not the day other chat state gets', payments.find(due76.paymentId) && require('../src/core/chatState').MAX_AGE_MS < 30 * 86400000);
+
+          check('still owing: the watcher keeps it held', (await customer.checkHeldOrders()) === 0 && due76.status === 'awaitingPayment');
+          portal.setMockCustomers([{ id: 7601, name: 'Loss Motors', phone: '9000007601', balance: 0 }, { id: 7602, name: 'Due Motors', phone: '9000007602', balance: 0 }]);
+          // Held for two days: paid late, it still goes on (not "quote expired").
+          due76.quotedAt = new Date(Date.now() - 2 * 86400000).toISOString();
+          agentHold76.status = 'cancelled';
+          customer.transport.outbox.length = 0;
+          const rel76 = await customer.checkHeldOrders();
+          const relMsg76 = toNum76('919000007602');
+          check('paid on the portal: the held order is punched by itself, even two days later', rel76 === 1 && due76.status === 'confirmed' && !!due76.soNumber, JSON.stringify({ rel76, status: due76.status }));
+          check('...and the customer is thanked and given the order number', /payment is received|payment mil gaya/.test(relMsg76) && /order no\./.test(relMsg76), relMsg76);
+          check('...and the payment request is marked settled', payments.find(due76.paymentId).status === 'settled');
+        } finally {
+          cfgLB.approvers = lbWas.approvers;
+          cfgLB.costIncludesGst = lbWas.inc;
+          config.creation.approvers = apprWas76;
+          config.dealerPortal.confirmEnabled = onWas76;
+        }
       }
     } finally {
       config.salesTeamNumbers.splice(config.salesTeamNumbers.indexOf(S71), 1);

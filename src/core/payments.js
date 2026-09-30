@@ -21,7 +21,10 @@ const config = require('../config');
 const store = require('../store');
 const chatState = require('./chatState');
 
-const requests = chatState.slot('payments.requests');
+// Kept 30 days, not the day every chat slot gets: an order held on a payment
+// waits until the customer pays (30 Sep: after 24 h "OK PAY-…" was "not found"
+// and the held order was never released).
+const requests = chatState.slot('payments.requests', { maxAgeMs: 30 * 24 * 60 * 60 * 1000 });
 
 const isAccountant = (phone) => Boolean((config.payments.accountants || {})[store.normPhone(phone)]);
 const accountantName = (phone) => (config.payments.accountants || {})[store.normPhone(phone)] || store.normPhone(phone);

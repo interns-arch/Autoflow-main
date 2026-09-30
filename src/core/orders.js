@@ -322,7 +322,9 @@ async function punch(order, opts = {}) {
   const ageMin = (Date.now() - quotedAt) / 60000;
 
   // Too old to be worth refreshing — the intent is gone, not just the numbers.
-  if (!opts.approvedBy && ageMin > config.dealerPortal.quoteMaxAgeHours * 60) {
+  // `opts.released`: an order held on a payment, going on now it is paid -
+  // the customer said yes long ago and has paid; it is not asked again.
+  if (!opts.approvedBy && !opts.released && ageMin > config.dealerPortal.quoteMaxAgeHours * 60) {
     order.status = 'expired';
     store.save();
     return { stale: true, expired: true };
@@ -348,7 +350,7 @@ async function punch(order, opts = {}) {
 
   // Only interrupt when the change actually matters to the customer, or when
   // the quote had gone stale on time anyway.
-  if (!opts.approvedBy && moved.length && ageMin > config.dealerPortal.quoteTtlMinutes) {
+  if (!opts.approvedBy && !opts.released && moved.length && ageMin > config.dealerPortal.quoteTtlMinutes) {
     store.log('orders', `${order.id} confirm: stock moved since the quote — asking again`);
     return { stale: true, moved, ageMin: Math.round(ageMin) };
   }
@@ -374,6 +376,20 @@ async function punch(order, opts = {}) {
   if (!toPunch.length) {
     store.log('orders', `${order.id} confirm: nothing in stock - no SO punched`);
     return { nothingInStock: true, skipped };
+  }
+
+  // LOSS BILLING (founder, 30 Sep): a line sold below our cost is not punched
+  // until the loss approver (Prateek Sir) says OK - checked here, the one door
+  // to the portal, so no path can punch a loss by going round it.
+  if (!opts.lossApprovedBy) {
+    const loss = await require('./lossBilling')
+      .checkOrder(order, toPunch)
+      .catch(() => null);
+    if (loss) {
+      order.loss = { ...loss, at: new Date().toISOString() };
+      store.save();
+      return { loss: order.loss, skipped, short };
+    }
   }
 
   const groups = new Map();
