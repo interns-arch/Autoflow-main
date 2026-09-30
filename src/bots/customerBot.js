@@ -4311,10 +4311,19 @@ Baaki ${payments.money(hold.due)} pay hone tak ${order.id} hold pe hai${custPhon
       : sent.live || sent.waitsForAccount
         ? 'For your information.'
         : `Please approve or reject rule #${sent.ruleId} on the Dealer Portal (Super Admin) — customers get the discount once it is approved there.`;
+    // Who the customer is, in a few lines, so he can judge the discount from
+    // this message alone (founder, 30 Sep). A new account has no portal row
+    // yet: its number is all there is.
+    const brief = req.accountId
+      ? await salesOrder.customerBrief({ id: req.accountId, name: req.customer }).catch(() => null)
+      : req.phone || req.customerPhone
+        ? 'Phone ' + (req.phone || req.customerPhone)
+        : null;
     const text = [
       verdict,
       `🏷️ *Discount ${req.type === 'change' ? 'change' : 'setup'}* by ${by || 'an agent'}`,
-      `Customer: ${req.customer}`,
+      `Customer: *${req.customer}*`,
+      brief,
       `${on} — ${req.type === 'change' ? `${req.oldValue}% → *${r.value}%*` : `*${r.value}%*`}${limits.length ? ' (' + limits.join(', ') + ')' : ''}`,
       r.mrp ? `MRP ₹${r.mrp} → ₹${discountSetup.priceAt(r.mrp, r.value)}` : null,
       where,

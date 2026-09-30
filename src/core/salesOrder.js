@@ -455,6 +455,38 @@ async function customerCard(row, t) {
   return lines.filter(Boolean).join('\n');
 }
 
+// THE SAME CUSTOMER IN A FEW LINES, for whoever approves something for them
+// without having picked them (founder, 30 Sep: Prateek Sir, told of Arun Sir's
+// decision on a discount, "give him short brief about the customer"). In
+// English; whatever the portal cannot say is left out, never guessed.
+async function customerBrief(row) {
+  const portal = require('../integrations/dealerPortal');
+  if (!row || !row.id) return null;
+  let full = row;
+  if (row.credit_limit === undefined && row.name) {
+    const rows = await portal.searchAccounts(row.name).catch(() => []);
+    full = { ...row, ...(rows.find((r) => Number(r.id) === Number(row.id)) || {}) };
+  }
+  const money = (v) => '₹' + Number(v).toLocaleString('en-IN', { maximumFractionDigits: 0 });
+  const discounts = await portal.activeDiscounts(full.id).catch(() => []);
+  const pos = await require('./cheques')
+    .positionOf(full.id)
+    .catch(() => null);
+  const left = pos && pos.cheques.length ? pos.afterCheques : full.balance;
+  const lines = [
+    [full.phone || full.mobile ? 'Phone ' + (full.phone || full.mobile) : null, full.gst_no ? 'GSTIN ' + full.gst_no : null].filter(Boolean).join(' · ') || null,
+    [place(full), agentOf(full) ? 'agent ' + agentOf(full) : null].filter(Boolean).join(' · ') || null,
+    [
+      full.credit_limit != null && full.credit_limit !== '' ? `Credit ${money(full.credit_limit)}${full.credit_days != null ? ' / ' + full.credit_days + ' days' : ''}` : null,
+      left != null && left !== '' ? (Number(left) >= 1 ? 'Due ' + money(left) : 'No dues') : null,
+    ]
+      .filter(Boolean)
+      .join(' · ') || null,
+    'Discounts now: ' + (discounts.length ? discounts.map((d) => `${d.on} ${d.percent}%`).join('; ') : 'none'),
+  ];
+  return lines.filter(Boolean).join('\n');
+}
+
 // The same shape customers.resolve() returns, so the order and confirm paths
 // cannot tell a picked customer from one found by phone.
 function ctxFor(row) {
@@ -2331,6 +2363,7 @@ function askToOpen(m, what, key, t) {
 module.exports = {
   orderAsked,
   customerCard,
+  customerBrief,
   findKeyIn,
   lastLookedUp,
   rememberLookedUp,

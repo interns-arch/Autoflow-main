@@ -2795,6 +2795,7 @@ async function main() {
       const ok22d = await say20(ARUN20, 'OK ' + id22);
       const note22 = toPrateek20(ok22d);
       check('Arun Sir\'s OK: Prateek Sir is told and asked to approve rule #501 on Super Admin', /Approved by Arun Sir/.test(note22) && /Discount change\* by Shubham/.test(note22) && /12% → \*15%\*/.test(note22) && /approve or reject rule #501 on the Dealer Portal \(Super Admin\)/.test(note22), note22);
+      check('...with a short brief about the customer (what the portal knows, and discounts now)', /Customer: \*Mock Customer\*\n/.test(note22) && /Discounts now: /.test(note22), note22);
       const rule22 = (await portal.listDiscountRules())[0];
       check('...and the change is on the portal now, only the discount changed', rule22.discount_value === 15 && rule22.brand === 'CARTRENDS' && rule22.rule_name === 'Mock Customer CARTRENDS 15%', JSON.stringify(rule22));
       check('...and the agent is told it waits for the Super Admin', ok22d.some((o) => String(o.to).indexOf(AGENT20) >= 0 && /Dealer Portal pe approval ke liye bhej diya/.test(o.text || '') && /rule #501/.test(o.text || '')), text20(ok22d));
