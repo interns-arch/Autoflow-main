@@ -129,6 +129,13 @@ function words(s) {
 // Every word typed must START a word of the name. Tried on the live list of
 // 7,492 customers (11 Sep): "Anuj" -> anuj, Anuj, ANUJ GOSAIN, Anuj Kumar
 // Ph-3 and not Tanuj; "Kalra" -> Kalra Motors, Kalra Car Decor.
+// A typed word that STARTS a word of the name - or, 6 letters or more, is the
+// name's words run together: "autospare" is "Auto Spare" (30 Sep, live,
+// Shubham Maurya: "Lucky autospare" found nobody for Lucky Auto Spare Parts).
+function wordHit(w, n) {
+  if (n.some((x) => x.startsWith(w))) return true;
+  return w.length >= 6 && n.join('').includes(w);
+}
 function match(query, rows) {
   const q = words(query);
   if (!q.length) return [];
@@ -136,7 +143,7 @@ function match(query, rows) {
   for (const r of rows) {
     const n = words(r.name);
     if (!n.length) continue;
-    if (!q.every((w) => n.some((x) => x.startsWith(w)))) continue;
+    if (!q.every((w) => wordHit(w, n))) continue;
     const exact = q.every((w) => n.includes(w));
     const whole = n.join(' ') === q.join(' ');
     out.push({ r, score: (whole ? 1000 : 0) + (exact ? 100 : 0) - (n.length - q.length) });
@@ -308,6 +315,9 @@ function nameAsked(text) {
   if (!name || isGenericName(name) || findKeyIn(name) || PART_LIKE.test(name) || name.length < 3) return null;
   // "show cart", "check stock", "search order status" are not names.
   if (/\b(order|orders|cart|stock|rate|price|mrp|list|report|ledger|discount|bill|bills|invoice|status|part|parts|payment|dispatch|challan)\b/i.test(name)) return null;
+  // ...nor "check balance", "check due" (30 Sep, live, Shubham Maurya: "No
+  // customer or shop called balance").
+  if (/^(?:balance|bal|due|dues|baaki|baki|bakaya|outstanding|pending|credit|limit|credit\s+limit|khata|khaata|hisab|hisaab)$/i.test(name) || LEDGER_RE.test(name)) return null;
   return name;
 }
 
@@ -354,7 +364,11 @@ async function bareName(text) {
   if (!looksLikeName(tt) || tt.split(/\s+/).length < 2) return null;
   const found = await findCustomers(tt).catch(() => ({ top: [] }));
   const q = words(tt);
-  const exact = (found.top || []).filter((r) => q.every((w) => words(r.name).includes(w)));
+  // Every word the name's own, or - 4 letters or more - the start of one, or
+  // its words run together: "Kalra motor" is Kalra Motors (30 Sep, live,
+  // Shubham Maurya: "Sorry, didn't get that" three times).
+  const hit = (w, n) => n.includes(w) || (w.length >= 4 && wordHit(w, n));
+  const exact = (found.top || []).filter((r) => q.every((w) => hit(w, words(r.name))));
   return exact.length ? tt : null;
 }
 
@@ -561,11 +575,11 @@ const ANALYSIS_WORD = /\b(analy[sz]e|analy[sz]is|analyses|details?|detailed)\b/i
 
 const ABOUT_INTENT = [
   ['credit', /\b(credit\s*notes?|cn)\b/i],
-  ['ledger', /\b(pending|dues?|balance|outstanding|ledger|khata|hisaab|hisab|baki|baaki|bakaya|payment)\b/i],
+  ['ledger', /\b(pending|dues?|balance|outstanding|ledger|ledgar|ladger|ladgar|leger|legar|lejer|lezer|legder|ledgr|khata|khaata|hisaab|hisab|baki|baaki|bakaya|payment)\b/i],
   ['discount', /\b(discount|disc)\b/i],
   ['status', /\b(status|kab\s*aayega|kahan\s*hai|where\s*is)\b/i],
 ];
-const ABOUT_FILLER = /^(give|me|my|the|a|an|for|of|to|please|pls|sir|ji|detailed|detail|details|analysis|analyze|analyse|check|send|bhejo|batao|bata|do|dena|kya|hai|ka|ki|ke|ko|pcs|pc|pieces|piece|nos|no|pise|qty|x|and|aur|stock|mrp|rate|price|discount|disc|pending|dues|due|balance|outstanding|ledger|khata|hisaab|hisab|baki|baaki|bakaya|payment|credit|notes|note|cn|order|orders|status|where|is|kahan|kab|aayega|this|that|tell|show|what|how|much|about|customer|party|wala|wale|as|well|also|all|full|complete|everything|part|parts|item|items|iska|iske|iski|isko|same|bhi|sab|saari|sari|poori|puri|info|information|breakdown|i|need|needs|want|required|require|chahiye|chaiye|karo|kro|krdo|kardo|dijiye|plz|asap|urgent|jaldi)$/i;
+const ABOUT_FILLER = /^(give|me|my|the|a|an|for|of|to|please|pls|sir|ji|detailed|detail|details|analysis|analyze|analyse|check|send|bhejo|batao|bata|do|dena|kya|hai|ka|ki|ke|ko|pcs|pc|pieces|piece|nos|no|pise|qty|x|and|aur|stock|mrp|rate|price|discount|disc|pending|dues|due|balance|outstanding|ledger|ledgar|ladger|ladgar|leger|legar|lejer|lezer|legder|ledgr|khaata|khata|hisaab|hisab|baki|baaki|bakaya|payment|credit|notes|note|cn|order|orders|status|where|is|kahan|kab|aayega|this|that|tell|show|what|how|much|about|customer|party|wala|wale|as|well|also|all|full|complete|everything|part|parts|item|items|iska|iske|iski|isko|same|bhi|sab|saari|sari|poori|puri|info|information|breakdown|i|need|needs|want|required|require|chahiye|chaiye|karo|kro|krdo|kardo|dijiye|plz|asap|urgent|jaldi)$/i;
 
 function parseAbout(text) {
   const line = String(text || '').trim();
@@ -901,7 +915,10 @@ async function sendLedgerPdf(bot, m, row, t) {
     return false;
   }
 }
-const LEDGER_RE = /\b(ledger|khata|statement|hisab|hisaab|account\s*statement)\b/i;
+// With the ways it is typed on a phone (30 Sep, live, Shubham Maurya: "Ladger
+// of M/S Kumar Moters" was answered "Sorry, didn't get that").
+const LEDGER_WORDS = 'ledger|ledgar|ladger|ladgar|leger|legar|lejer|lezer|legder|ledgr|khata|khaata|statement|hisab|hisaab';
+const LEDGER_RE = new RegExp('\\b(' + LEDGER_WORDS + '|account\\s*statement)\\b', 'i');
 
 // THE CUSTOMER'S INVOICES AS PDFs (founder, 25 Sep). Odoo lists them; each is
 // sent as the portal's own bill PDF — the file the desk downloads — found
@@ -910,9 +927,9 @@ const LEDGER_RE = /\b(ledger|khata|statement|hisab|hisaab|account\s*statement)\b
 // newer invoices IS the portal order id.
 const INVOICE_RE = /\b(invoice|invoices|bill|bills)\b/i;
 const INVOICE_OF = /^(.+?)\s+(?:ka|ki|ke)\s+(?:(?:latest|last|pichla|pichhla|sab|saare|all)\s+)?(?:invoice|invoices|bill|bills)\b/i;
-const LEDGER_OF = /^(.+?)\s+(?:ka|ki|ke)\s+(?:(?:latest|last|pichla|pichhla|poora|pura|full)\s+)?(?:ledger|khata|statement|hisab|hisaab)\b/i;
+const LEDGER_OF = new RegExp('^(.+?)\\s+(?:ka|ki|ke)\\s+(?:(?:latest|last|pichla|pichhla|poora|pura|full)\\s+)?(?:' + LEDGER_WORDS + ')\\b', 'i');
 // "ledger of Arjun motors", "invoice for Kalra Motors", "Arjun ka ledger".
-const DOC_FOR = /\b(?:ledger|khata|statement|hisab|hisaab|invoice|invoices|bill|bills)\s+(?:of|for)\s+(.+?)\s*[.?!]*$/i;
+const DOC_FOR = new RegExp('\\b(?:' + LEDGER_WORDS + '|invoice|invoices|bill|bills)\\s+(?:of|for)\\s+(.+?)\\s*[.?!]*$', 'i');
 const DOC_FILLER = /^(?:(?:please|pls|plz|sir|ji|bhai|mujhe|muje|give\s+me|send\s+me|send|share|bhejo|bhej\s+do|de\s+do|dedo|i\s+want(?:\s+to)?|i\s+need|chahiye|the)\s+)+/i;
 function docNameIn(text, want) {
   const s = String(text || '').trim();
@@ -1689,7 +1706,9 @@ async function handle(bot, m, text, reply, t) {
   //      customer just shown: "9654078241 ka ledger", "Kalra Motors ka
   //      invoice", "invoice bhejo", "is customer ka khata". ("486 ka bill" —
   //      a portal order number — is answered further down, as before.)
-  const want = LEDGER_RE.test(text) ? 'ledger' : INVOICE_RE.test(text) && !lookup.parseBill(text) ? 'invoice' : null;
+  // "check balance", "due kitna hai": the ledger - its summary is the balance.
+  const balanceOnly = /^\s*(?:check|show|batao|bata|dikhao|what(?:'s|\s+is)?)?\s*(?:the\s+)?(?:balance|bal|due|dues|outstanding|baaki|baki|bakaya)(?:\s+(?:check|batao|bata\s+do|dikhao|kitna\s+hai|kitna|hai|please|pls))*[\s?.!]*$/i.test(text);
+  const want = LEDGER_RE.test(text) || balanceOnly ? 'ledger' : INVOICE_RE.test(text) && !lookup.parseBill(text) ? 'invoice' : null;
   if (want && (findKeyIn(text) || want === 'invoice' || !lookup.parse(text))) {
     const k = findKeyIn(text);
     let rows = k ? await findByKey(k).catch(() => []) : [];

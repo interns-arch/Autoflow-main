@@ -6736,6 +6736,47 @@ async function main() {
               const eng77 = await say77('I want to order');
               check('"I want to order" asks which customer - it is not looked up as a part', /Which customer|Kis customer/i.test(eng77) && !/Stock check/i.test(eng77), eng77);
 
+              // 30 Sep, live, Shubham Maurya (with Gemini down, the desk alone):
+              // "Ladger of M/S Kumar Moters", "Kalra motor", "Lucky autospare".
+              portal.setMockCustomers([
+                { id: 265, name: 'Kalra Motors', home_branch_dealer: 23, address: 'Gurgaon, Haryana (IN)', gst_no: '06AABCK1234L1Z5', phone: '9811122233', balance: 0 },
+                { id: 778, name: 'Lucky Auto Spare Parts', home_branch_dealer: 23, address: 'Delhi (IN)', phone: '9811100078', balance: 0 },
+              ]);
+              await say77('hi');
+              const lad77 = await say77('Ladger of Kalra Motors');
+              check('"Ladger of Kalra Motors" (misspelt) is Kalra\'s ledger, not "didn\'t get that"', /Kalra Motors/.test(lad77) && !/didn't get that|samajh nahi/i.test(lad77), lad77);
+              await say77('hi');
+              const bare77 = await say77('Kalra motor');
+              check('"Kalra motor" on its own finds Kalra Motors', /Kalra Motors/.test(bare77) && !/didn't get that/i.test(bare77), bare77);
+              await say77('hi');
+              const lucky77 = await say77('Lucky autospare');
+              check('"Lucky autospare" finds Lucky Auto Spare Parts', /Lucky Auto Spare Parts/.test(lucky77), lucky77);
+              await say77('hi');
+              const bal77 = await say77('check balance');
+              check('"check balance" with nobody in hand asks whose - not "no customer called balance"', !/called "balance"|naam se koi/i.test(bal77) && /Whose ledger|Kiska ledger/i.test(bal77), bal77);
+              const vo77 = require('../src/core/voiceOrder');
+              check('"Haaaaan", "Hnnn", "Ofcourse", "okkk" are a yes; "nahiii" a no', ['Haaaaan', 'Hnnn', 'Ofcourse', 'okkk'].every((x) => vo77.readAnswer(x) === 'yes') && vo77.readAnswer('nahiii') === 'no');
+              await say77('hi');
+              await say77('customer create karna hai');
+              const form77 = await say77('9811122233 iska discount setup karna hai');
+              check('a discount asked for while the account form waits leaves the form - not "already registered"', !require('../src/core/customerCreate').pending(C77) && !/pehle se hamare paas registered|already registered/i.test(form77), form77);
+
+              // Every ledger PDF showed twice in the chat log (30 Sep, live).
+              {
+                const cl77 = require('../src/core/chatLog');
+                const outWas77 = cl77.outgoing;
+                let logged77 = 0;
+                cl77.outgoing = () => { logged77++; };
+                try {
+                  const bot77 = { transport: require('../src/wa/transport')._watched({ async sendDocument() { return 'wamid.x'; } }, 'customer') };
+                  staff77._tapFiles(bot77);
+                  await bot77.transport.sendDocument('x@cloud', Buffer.from('a'), 'Ledger.pdf', 'application/pdf', 'cap');
+                  check('a file sent through the staff tap is logged once, and still counted as sent', logged77 === 1 && bot77._filesSent.get('x@cloud').length === 1, String(logged77));
+                } finally {
+                  cl77.outgoing = outWas77;
+                }
+              }
+
               const q77 = require('../src/core/askQty');
               check('"2 quantity", "Quantity 2" and "Then 1 quantity" are quantities', JSON.stringify([q77.readAnswer('2 quantity', 1), q77.readAnswer('Quantity 2', 1), q77.readAnswer('Then 1 quantity', 1)]) === '[[2],[2],[1]]');
               const ai77 = require('../src/core/ai');

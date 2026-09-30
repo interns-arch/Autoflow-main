@@ -64,7 +64,7 @@ function tapFiles(bot) {
   const tr = bot && bot.transport;
   if (!tr || tr._staffFileTap || typeof tr.sendDocument !== 'function') return;
   const orig = tr.sendDocument.bind(tr);
-  tr.sendDocument = async (chatId, buffer, filename, ...rest) => {
+  const tap = async (chatId, buffer, filename, ...rest) => {
     const r = await orig(chatId, buffer, filename, ...rest);
     bot._filesSent = bot._filesSent || new Map();
     const list = bot._filesSent.get(chatId) || [];
@@ -73,8 +73,12 @@ function tapFiles(bot) {
     return r;
   };
   // The original (the logging wrapper) already writes this send to the chat
-  // log; the wrapper around this one must not write it a second time.
-  tr.sendDocument._innerLogged = true;
+  // log; the wrapper around this one must not write it a second time. Marked
+  // BEFORE it is put on the transport: read back through the logging proxy,
+  // tr.sendDocument is a fresh wrapper, and the mark landed on that (30 Sep,
+  // live: Shubham Maurya's ledger still logged twice after the first fix).
+  tap._innerLogged = true;
+  tr.sendDocument = tap;
   tr._staffFileTap = true;
 }
 const filesSoFar = (bot, chatId) => ((bot._filesSent && bot._filesSent.get(chatId)) || []).length;
@@ -259,4 +263,4 @@ function inventedFigure(reply, deskSaid, asked) {
   return null;
 }
 
-module.exports = { enabled, takes, handle, fresh, threadOf, STAFF_SYSTEM, _desk: desk, _inventedFigure: inventedFigure, _claimsFileSent: claimsFileSent };
+module.exports = { enabled, takes, handle, fresh, threadOf, _tapFiles: tapFiles, STAFF_SYSTEM, _desk: desk, _inventedFigure: inventedFigure, _claimsFileSent: claimsFileSent };

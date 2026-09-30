@@ -635,6 +635,13 @@ class CustomerBot {
     // answers are not text at all: the shop photograph would otherwise be
     // read as a photo of a part and sent to a person, and a dropped pin
     // carries no text so it would fall out of the handler entirely.
+    // ...unless it is plainly another job: a discount asked for while the form
+    // waits. 29 Sep, live, Shubham Maurya: "9122781913 iska discount setup
+    // karna hai" was taken as the new account's number ("already registered").
+    if (customerCreate.pending(m.chatId) && !m.hasMedia && discountSetup.wantsSetup(String(m.body || ''))) {
+      store.log(this.key, `${m.from}: account form left for a discount request: "${String(m.body || '').slice(0, 60)}"`);
+      customerCreate.cancel(m.chatId);
+    }
     if (customerCreate.pending(m.chatId)) {
       const said = String((m.body || '')).trim();
       const step = await customerCreate.answer(m.chatId, m, said, t);

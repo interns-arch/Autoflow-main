@@ -256,7 +256,7 @@ const OWN = [
   // more often — so it is matched first.
   { re: /\bcredit\s*limit\b/i, intent: 'ledger' },
   { re: /\b(credits?|credit\s*notes?|cn)\b/i, intent: 'credit' },
-  { re: /\b(ledger|statement|khata|hisaab|hisab)\b/i, intent: 'ledger' },
+  { re: /\b(ledger|ledgar|ladger|ladgar|leger|legar|lejer|lezer|legder|ledgr|statement|khata|khaata|hisaab|hisab)\b/i, intent: 'ledger' },
   { re: /\b(balance|baki|baaki|bakaya|baqaya|outstanding|kitna dena|kitne paise|due)\b/i, intent: 'ledger' },
   { re: /\b(billed|bill\s*(hua|ho\s*gaya|kiya|kar\s*diya|banaya)|invoice\s*(hua|ho\s*gaya))\b/i, intent: 'billed' },
   { re: /\b(mera|hamara|humara|meri|hamari)\b[^\n]{0,20}\b(order|maal|saman|samaan)\b/i, intent: 'status' },

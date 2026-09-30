@@ -68,7 +68,7 @@ function clear(chatId) {
 // HEARD right, and a question mark means they are asking, not agreeing —
 // "sahi hai?" is the customer checking with us.
 const YES =
-  /^(?:y|ya|yes|yeah|yep|ok|okay|okey|k|hn|hnn|ha|haan|han|haa|ji|ji haan|haan ji|sahi|sahi hai|shi|shi hai|correct|right|theek|thik|theek hai|thik hai|bilkul|pakka|done|confirm|confirmed)\b[\s.!]*$/i;
+  /^(?:y|ya|yes|yeah|yep|ok|okay|okey|k|hn|hnn|ha|haan|han|haa|ji|ji haan|haan ji|sahi|sahi hai|shi|shi hai|correct|right|theek|thik|theek hai|thik hai|bilkul|pakka|done|confirm|confirmed|sure|ofc|ofcourse|of course|zarur|zaroor|jarur|chalega|kar do|kardo)\b[\s.!]*$/i;
 // "nahi", "galat", "no", "wrong", "aisa nahi".
 const NO = /^(?:n|no|nope|nahi|nhi|na|galat|glt|wrong|not correct|nahi hai|nhi hai)\b[\s.!]*$/i;
 
@@ -76,8 +76,11 @@ function readAnswer(text) {
   const t = String(text || '').trim();
   if (!t || t.length > 40) return null;
   if (/\?\s*$/.test(t)) return null; // a question, not an answer
-  if (YES.test(t)) return 'yes';
-  if (NO.test(t)) return 'no';
+  // "Haaaaan", "Hnnn", "okkk": a run of one letter read as one (30 Sep, live,
+  // Shubham Maurya: "Haaaaan" and "Hnnn" were asked again).
+  const sq = t.toLowerCase().replace(/([a-z])\1+/g, '$1');
+  if (YES.test(t) || YES.test(sq)) return 'yes';
+  if (NO.test(t) || NO.test(sq)) return 'no';
   return null;
 }
 

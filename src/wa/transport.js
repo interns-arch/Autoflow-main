@@ -511,4 +511,4 @@ function createTransport(botKey) {
   return watched(new SimTransport(botKey, bot.label), botKey);
 }
 
-module.exports = { createTransport, SimTransport, LiveTransport };
+module.exports = { createTransport, SimTransport, LiveTransport, _watched: watched };
