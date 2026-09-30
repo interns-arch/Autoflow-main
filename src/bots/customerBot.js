@@ -3556,6 +3556,13 @@ Baaki ${payments.money(hold.due)} pay hone tak ${order.id} hold pe hai${custPhon
       dropped.push('discount setup');
       discountSetup.cancel(chatId);
     }
+    // A draft SO still waiting on "Sahi hai?" stays as punched; the question
+    // is closed, so no later "no" can delete it (30 Sep, live, Ronak: SO 1630).
+    const review = soReview.get(chatId);
+    if (review) {
+      dropped.push(`SO ${review.orderIds.join(', ')} left as punched, not confirmed`);
+      soReview.clear(chatId);
+    }
     const draft = orders.findDraft(chatId);
     if (draft && draft.status === 'draft' && draft.lines.length) {
       dropped.push(`cart of ${draft.lines.length} item(s)`);

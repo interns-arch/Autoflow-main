@@ -215,9 +215,32 @@ async function handle(bot, m, text, reply, t) {
   const orders = require('./orders');
   const fresh = orders.findDraft(m.chatId);
   if (fresh && fresh.lines.length) return false;
+  // ...and so does another customer, picked since: the draft SO is from
+  // before (30 Sep, live, Ronak: SO 1630 for Mehta Auto Store was waiting on
+  // "Sahi hai?"; he moved on to Customer Testing, and his "Nhi" to "aur kuch
+  // chahiye?" deleted 1630 from the portal).
+  const now = require('./salesOrder').activeCustomer(m.chatId);
+  if (now && s.customerName && String(now.name || '').toLowerCase() !== String(s.customerName).toLowerCase()) return false;
   const portal = require('../integrations/dealerPortal');
   const ai = require('./ai');
   const said = require('./voiceOrder').readAnswer(text);
+  const soLabel = 'SO ' + s.orderIds.join(', ') + (s.customerName ? ' (' + s.customerName + ')' : '');
+
+  // ---- deleting it, asked and answered ----
+  // A cancel deletes the order from the portal, so it is always asked once,
+  // naming the SO: a "no" meant for another question can never do it.
+  if (s.confirmCancel) {
+    if (said === 'yes' || CANCEL.test(text)) {
+      clear(m.chatId);
+      const gone = await cancelAll(s.orderIds);
+      store.log('so', 'draft SO ' + s.orderIds.join(', ') + ' cancelled by ' + m.from + ' (confirmed)');
+      if (!gone) return reply(t('I could not cancel it on the portal — our team will do it.', 'Portal pe cancel nahi ho paya — hamari team kar degi.'));
+      return reply(t(`${soLabel} cancelled on the portal.`, `${soLabel} portal se cancel kar diya.`));
+    }
+    delete s.confirmCancel;
+    store.save();
+    if (said === 'no') return reply(t(`OK — ${soLabel} stays as it is. All good to confirm it?`, `Theek hai — ${soLabel} waise hi rahega. Confirm kar dun?`));
+  }
 
   // ---- "pdf mai bhejo" ----
   // The document, asked for by name. It is missing for one reason only:
@@ -276,18 +299,15 @@ async function handle(bot, m, text, reply, t) {
 
   // ---- the whole thing taken back ----
   if ((said === 'no' || CANCEL.test(text)) && !REMOVE.test(text) && !ai.partNumberIn(text)) {
-    clear(m.chatId);
-    const gone = await cancelAll(s.orderIds);
-    store.log('so', 'draft SO ' + s.orderIds.join(', ') + ' cancelled by ' + m.from);
-    if (!gone) {
-      return reply(
-        t(
-          'I could not cancel it on the portal — our team will do it.',
-          'Portal pe cancel nahi ho paya — hamari team kar degi.',
-        ),
-      );
-    }
-    return reply(t('Cancelled. Nothing has been sent.', 'Cancel kar diya. Kuch nahi bheja gaya.'));
+    s.confirmCancel = true;
+    store.save();
+    store.log('so', 'draft SO ' + s.orderIds.join(', ') + ': "' + String(text).slice(0, 30) + '" from ' + m.from + ' - asking before it is deleted');
+    return reply(
+      t(
+        `Cancel ${soLabel}? It will be deleted from the portal. (yes / no)`,
+        `${soLabel} portal se cancel kar dun? Ye order hat jayega. (haan / nahi)`,
+      ),
+    );
   }
 
   // ---- one line out ----

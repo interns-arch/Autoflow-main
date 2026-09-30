@@ -456,8 +456,20 @@ async function main() {
   soReview6.open('sim-' + REV, { orderIds: ['701'], phone: REV });
   customer.transport.outbox.length = 0;
   await dm(customer, REV, 'cancel');
-  check('a cancel takes the order back', /cancel kar diya|cancelled/i.test(sent(customer)));
+  // 30 Sep, live, Ronak: a "Nhi" meant for "aur kuch chahiye?" deleted SO
+  // 1630 from the portal. A cancel is asked once, naming the SO.
+  check('a cancel is asked before the order is deleted, naming the SO', /SO 701 portal se cancel kar dun|Cancel SO 701\?/.test(sent(customer)) && !!soReview6.get('sim-' + REV), sent(customer));
+  customer.transport.outbox.length = 0;
+  await dm(customer, REV, 'haan');
+  check('...and "haan" takes the order back', /cancel kar diya|cancelled/i.test(sent(customer)), sent(customer));
   check('...and closes the draft', !soReview6.get('sim-' + REV));
+  // A bare "nahi", then "nahi" to the cancel question: the SO stays.
+  soReview6.open('sim-' + REV, { orderIds: ['702'], phone: REV, customerName: 'Mehta Auto Store' });
+  customer.transport.outbox.length = 0;
+  await dm(customer, REV, 'Nhi');
+  await dm(customer, REV, 'nahi');
+  check('"Nhi" alone deletes nothing; "nahi" to "cancel kar dun?" keeps SO 702', !!soReview6.get('sim-' + REV) && !/cancel kar diya/i.test(sent(customer)) && /waise hi rahega|stays as it is/.test(sent(customer)), sent(customer));
+  soReview6.clear('sim-' + REV);
   customer.transport.sendDocument = hadDoc6;
   portal.setMockStock([{ part_no: 'BP-1001', name: 'Brake Pad', quantity: 1, price: 450, mrp: 600, vendor: 'Northend' }]);
 
@@ -6724,8 +6736,18 @@ async function main() {
               const cart77 = { id: 'ORD-7701', chatId: C77, status: 'draft', lines: [{ item: 'BP-1001', partNo: 'BP-1001', qty: 1 }], portalCustomer: { buyerId: 777, name: 'Old Motors' }, createdAt: new Date().toISOString() };
               store.orders().push(cart77);
               const thread77 = staff77.threadOf(C77);
+              const rev77 = require('../src/core/soReview');
+              rev77.open(C77, { orderIds: ['1630'], phone: S77, customerName: 'Mehta Auto Store' });
               const hi77 = await say77('Hii');
               check('"Hii" from an agent: greeted, told what was closed, asked which customer now', /Old Motors/.test(hi77) && /cart of 1 item/.test(hi77) && /Naya shuru karte hain|Starting fresh/.test(hi77), hi77);
+              check('...and a draft SO waiting on "Sahi hai?" is left as punched, its question closed', !rev77.get(C77) && /SO 1630 left as punched/.test(hi77), hi77);
+              // Ronak, 30 Sep: SO 1630 waiting, another customer picked, then "Nhi".
+              rev77.open(C77, { orderIds: ['1631'], phone: S77, customerName: 'Mehta Auto Store' });
+              cs77.slot('sales.session').set(C77, { stage: 'active', customer: { buyerId: 8366, name: 'Customer Testing' }, at: Date.now() });
+              const nhi77 = await say77('Nhi');
+              check('with another customer in hand, "Nhi" is not an answer to the old draft SO - nothing is cancelled', !!rev77.get(C77) && !/cancel/i.test(nhi77), nhi77);
+              rev77.clear(C77);
+              cs77.slot('sales.session').delete(C77);
               check('...the customer in hand, the pending quantity ask and the cart are gone', !so77.activeCustomer(C77) && !cs77.slot('askQty.pending').get(C77) && cart77.status === 'cancelled');
               check("...and the staff agent's conversation starts a new thread", staff77.threadOf(C77) !== thread77 && /#\d+$/.test(staff77.threadOf(C77)), staff77.threadOf(C77));
               const led77 = await say77('Ledger');
