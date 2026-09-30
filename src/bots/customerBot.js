@@ -1914,6 +1914,12 @@ class CustomerBot {
         // WHO is punching it. The portal keeps "which agent sold what" in
         // actor_user_id, and it knows the mobile→user mapping itself. A number
         // it does not know simply carries no actor, exactly as before.
+        // And the number itself, kept on the order: an agent with his OWN
+        // portal login punches on it (founder, 30 Sep), and a held or
+        // Sales-Head-approved order is punched hours later, from code that no
+        // longer has the message in hand.
+        order.punchedBy = m.from;
+        store.save();
         try {
           const actor = await portal.userForMobile(m.from);
           if (actor && actor.userId) {

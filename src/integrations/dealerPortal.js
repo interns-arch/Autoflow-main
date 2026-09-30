@@ -135,6 +135,50 @@ const sessions = {
 };
 const hasApprover = () => Boolean(dp.approverUsername || dp.approverToken);
 
+// ---- AND ONE IDENTITY PER AGENT WHO HAS HIS OWN PORTAL LOGIN ----
+//
+// Founder, 30 Sep: "when agent ronak punch order then access his account and
+// punch order only for order request come from his number". Until now every
+// order went in on the bot's one sales account, with the agent named only in
+// `actor_user_id`. An agent listed in DEALER_PORTAL_STAFF_LOGINS gets a
+// session of his own here, built the first time he punches, and his order is
+// created by his own user on the portal.
+//
+// A session per agent, never one shared: the portal allows one session per
+// user, so two agents on one cache would evict each other's token.
+const staffSessions = new Map(); // 'staff:ronak_sales' -> session
+
+// The login configured for the mobile a message came from, or null.
+function staffLoginFor(phone) {
+  const p = String(phone == null ? '' : phone).replace(/\D/g, '').slice(-10);
+  if (p.length !== 10) return null;
+  return (dp.staffLogins || {})[p] || null;
+}
+
+// The identity an order from this number is punched on: that agent's own
+// login when he has one, else 'sales' — the shared account, as before.
+function punchAs(phone) {
+  const login = staffLoginFor(phone);
+  if (!login) return 'sales';
+  const as = 'staff:' + login.username;
+  if (!staffSessions.has(as)) {
+    staffSessions.set(as, {
+      token: null,
+      refresh: null,
+      expiresAt: 0,
+      refreshTimer: null,
+      renewing: null,
+      // No fixed token for an agent: his password is what we were given.
+      creds: () => ({ user: login.username, pass: login.password, fixed: '' }),
+    });
+  }
+  return as;
+}
+
+// Every function below reads its session through this, so an agent identity
+// works everywhere the three fixed ones do.
+const sessionFor = (as) => sessions[as] || staffSessions.get(as) || sessions.sales;
+
 // Login and refresh answer in the same shape, and the portal sends it both at
 // the top level and nested under `data`. `expires_at` is authoritative when
 // present; `expires_in` (seconds) is the fallback.
@@ -150,7 +194,7 @@ function readAuth(data) {
 }
 
 async function login(as = 'sales') {
-  const s = sessions[as];
+  const s = sessionFor(as);
   const { user, pass, fixed } = s.creds();
   // A permanent / refresh token skips the interactive login entirely.
   if (fixed) {
@@ -189,7 +233,7 @@ async function login(as = 'sales') {
 
 // Schedule a proactive token refresh REFRESH_BEFORE_MS before expiry.
 function scheduleRefresh(as, lifetimeMs) {
-  const s = sessions[as];
+  const s = sessionFor(as);
   if (s.refreshTimer) clearTimeout(s.refreshTimer);
   const delay = Math.max(0, lifetimeMs - REFRESH_BEFORE_MS);
   s.refreshTimer = setTimeout(() => refreshSession(as), delay);
@@ -212,7 +256,7 @@ function scheduleRefresh(as, lifetimeMs) {
 // refresh that cannot be done falls back to a full login, which is exactly
 // what this code did before refreshing existed.
 async function renewWithRefreshToken(as) {
-  const s = sessions[as];
+  const s = sessionFor(as);
   if (!s.refresh) return false;
   try {
     const res = await fetch(dp.baseUrl + dp.refreshPath, {
@@ -243,7 +287,7 @@ async function renewWithRefreshToken(as) {
 // ever sees an expired one. The refresh token is tried first; only if that
 // fails does the password come out.
 async function refreshSession(as) {
-  const s = sessions[as];
+  const s = sessionFor(as);
   const { fixed } = s.creds();
   if (fixed) return; // permanent tokens don't refresh
   try {
@@ -265,7 +309,7 @@ async function refreshSession(as) {
 // evict each other. With a rotating refresh token it is worse still: the
 // second renewal would be spending one the first had already used.
 function ensureToken(as) {
-  const s = sessions[as];
+  const s = sessionFor(as);
   const { fixed } = s.creds();
   if (fixed) {
     s.token = fixed;
@@ -287,7 +331,7 @@ function ensureToken(as) {
 }
 
 async function api(method, urlPath, body, retry = true, as = 'sales', timeoutMs = 0) {
-  const s = sessions[as];
+  const s = sessionFor(as);
 
   // ---- Safety-net expiry check ----
   // If the timer was missed (laptop sleep, event-loop stall), this catches it
@@ -350,7 +394,7 @@ async function api(method, urlPath, body, retry = true, as = 'sales', timeoutMs 
 // The same door for a PDF: bytes, not JSON. Anything that is not a PDF (an
 // error page, a JSON "detail") is an error, never a file sent to someone.
 async function apiPdf(urlPath, retry = true, as = 'sales') {
-  const s = sessions[as];
+  const s = sessionFor(as);
   // Safety-net expiry check (same as api()).
   await ensureToken(as);
   const res = await fetch(dp.baseUrl + urlPath, {
@@ -814,12 +858,47 @@ async function discountForPunch(order) {
   return { ...order, lines };
 }
 
+// WHOSE LOGIN THIS ORDER GOES IN ON.
+//
+// `order.punchedBy` is the mobile the order came from (set where the actor is
+// looked up, so a held or approved order still carries it hours later). An
+// agent configured in DEALER_PORTAL_STAFF_LOGINS is punched as himself; anyone
+// else — every customer, every agent without a login of his own — goes in on
+// the shared sales account exactly as before.
+//
+// The portal wants the user id too, and checks it against the token: his
+// login with the bot's user_id is refused. The id comes from his config entry,
+// else from the mobile→user map the portal keeps. With no id to be had we fall
+// back to the sales account: an order that goes in under the wrong name is a
+// bookkeeping fix, an order that does not go in at all is a lost sale.
+async function punchIdentity(order) {
+  const phone = order.punchedBy || null;
+  const login = staffLoginFor(phone);
+  if (!login) return { as: 'sales', userId: null };
+  let userId = login.userId || null;
+  if (!userId) {
+    try {
+      const u = await module.exports.userForMobile(phone);
+      userId = (u && u.userId) || null;
+    } catch (_) {
+      /* handled below, as no id at all */
+    }
+  }
+  if (!userId) {
+    store.log('portal', `${order.id}: ${login.username} has a login here but no portal user id (add it to DEALER_PORTAL_STAFF_LOGINS) — punching on the sales account`);
+    return { as: 'sales', userId: null };
+  }
+  return { as: punchAs(phone), userId };
+}
+
 function buildConfirmRequest(order) {
   const sellable = order.lines.filter((l) => l.source !== 'unidentified' && l.source !== 'unknown');
   const ctx = order.portalCustomer || null;
   const body = {
-    // the acting account (the bot's portal user)
-    user_id: dp.userId,
+    // The acting account: the bot's portal user, or — when this order is being
+    // punched on the agent's own login (confirm() below) — HIS user, because
+    // the portal reads user_id against the token it came with.
+    user_id: order.punchUserId || dp.userId,
     // WHO the order is for — the customer resolved from their WhatsApp number
     ...(ctx && ctx.buyerId ? { selected_buyer_id: ctx.buyerId } : {}),
     // The customer's OWN order number when their file carried one, so their
@@ -1087,6 +1166,13 @@ module.exports = {
   get isMock() {
     return isMock();
   },
+  // Whose portal login an order from this number is punched on:
+  // { username } for an agent who has his own, null for everyone else.
+  loginFor: (phone) => {
+    const l = staffLoginFor(phone);
+    return l ? { username: l.username, userId: l.userId || null } : null;
+  },
+  _punchIdentity: (order) => punchIdentity(order),
   setMockStock,
   setMockCustomers,
   setMockPdc,
@@ -2198,10 +2284,13 @@ module.exports = {
     // priced by the plain analyze, or quoted before the rule was approved,
     // used to go out at 0%.
     const priced = await discountForPunch(order);
-    const body = buildConfirmRequest(priced);
-    const data = await api('POST', dp.confirmPath, body, true, 'sales');
+    // HIS ORDER ON HIS OWN LOGIN (founder, 30 Sep). The order came from an
+    // agent whose portal login we hold -> it is punched as him, by his user.
+    const on = await punchIdentity(order);
+    const body = buildConfirmRequest({ ...priced, punchUserId: on.userId });
+    const data = await api('POST', dp.confirmPath, body, true, on.as);
     const result = readConfirmResponse(data);
-    store.log('portal', `sales order punched: ${result.soNumber}`);
+    store.log('portal', `sales order punched: ${result.soNumber}${on.as === 'sales' ? '' : ' on ' + on.as.replace('staff:', '') + "'s own login"}`);
     // A discount sent and not kept: said once, per part, so it is not found
     // weeks later on a bill.
     const dropped = [];
@@ -2222,7 +2311,7 @@ module.exports = {
   // portal's UNALLOCATED order: each line "Not Available" with its whole
   // quantity as the shortfall and no dealer allocation - the shape
   // commercial-analyze itself returns for such a part.
-  //   adv = { id, ctx: portalCustomer, lines: [{ partNo, item, qty, price }], etaDate, actorUserId }
+  //   adv = { id, ctx: portalCustomer, lines: [{ partNo, item, qty, price }], etaDate, actorUserId, punchedBy }
   async advanceOrder(adv) {
     const body = advanceBody(adv);
     if (isMock()) {
@@ -2231,7 +2320,10 @@ module.exports = {
       store.log('portal', `MOCK advance order: ${soNumber} (${body.lines.length} lines)`);
       return { soNumber, body };
     }
-    const data = await api('POST', dp.confirmPath, body);
+    // On the agent's own login too, when the booking came from his number.
+    const on = await punchIdentity(adv);
+    if (on.userId) body.user_id = on.userId;
+    const data = await api('POST', dp.confirmPath, body, true, on.as);
     const result = readConfirmResponse(data);
     store.log('portal', `advance order placed: ${result.soNumber} (unallocated ${result.unallocatedOrderId || '-'})`);
     return result;

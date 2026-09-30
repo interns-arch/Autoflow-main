@@ -197,6 +197,13 @@ const confirmOrder = tool(
       }
     }
 
+    // The number this order came from, kept on it: an agent with his own
+    // portal login is punched on that login (dealerPortal.punchIdentity).
+    if (ctxNow.phone && order.punchedBy !== ctxNow.phone) {
+      order.punchedBy = ctxNow.phone;
+      store.save();
+    }
+
     let res;
     try {
       res = await orders.confirm(order);

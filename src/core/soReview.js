@@ -334,6 +334,9 @@ async function handle(bot, m, text, reply, t) {
 
     const draft = orders.getOrCreateDraft(m.chatId, s.phone || m.from);
     if (s.portalCustomer) draft.portalCustomer = s.portalCustomer;
+    // Re-punched on the same login the first punch used: the number it came
+    // from (dealerPortal.punchIdentity).
+    draft.punchedBy = m.from;
     orders.addLines(draft, keep, { replace: true });
     let result = null;
     try {

@@ -6869,6 +6869,36 @@ async function main() {
   }
 
 
+  // 30 Sep, founder: "when agent ronak punch order then access his account and
+  // punch order only for order request come from his number". An order from a
+  // number with its own portal login goes in on THAT login, by that user;
+  // everyone else's still goes in on the bot's shared sales account.
+  console.log('\n[79] an agent with his own portal login punches on it, and nobody else does');
+  {
+    const logins79 = config.dealerPortal.staffLogins;
+    const was79 = { ...logins79 };
+    try {
+      for (const k of Object.keys(logins79)) delete logins79[k];
+      logins79['9217030415'] = { username: 'ronak_sales', password: 'x', userId: 1512 };
+      check('the login is found however the number is written', Boolean(portal.loginFor('+91 92170 30415')) && portal.loginFor('919217030415@c.us').username === 'ronak_sales');
+      check('a number without one has no login of its own', portal.loginFor('919810238966') === null);
+      const his = await portal._punchIdentity({ id: 'ORD-79', punchedBy: '919217030415@c.us' });
+      check("Ronak's order is punched as Ronak, by his portal user", his.as === 'staff:ronak_sales' && his.userId === 1512, JSON.stringify(his));
+      check('and the confirm body carries HIS user id, not the bot\'s', portal._confirmBody({ id: 'ORD-79', punchUserId: his.userId, lines: [{ partNo: '43401M68P01', qty: 2 }], portalCustomer: { buyerId: 8510 } }).user_id === 1512);
+      const other = await portal._punchIdentity({ id: 'ORD-79b', punchedBy: '919810238966' });
+      check('everyone else still goes in on the shared sales account', other.as === 'sales' && other.userId === null, JSON.stringify(other));
+      // No portal user id to be had: the order still goes in, on the shared
+      // account. An order under the wrong name is a bookkeeping fix; an order
+      // that never reaches the portal is a lost sale.
+      logins79['9217030415'] = { username: 'ronak_sales', password: 'x', userId: null };
+      const noId = await portal._punchIdentity({ id: 'ORD-79c', punchedBy: '919217030415' });
+      check('with no user id for him, the punch falls back to the sales account rather than failing', noId.as === 'sales', JSON.stringify(noId));
+    } finally {
+      for (const k of Object.keys(logins79)) delete logins79[k];
+      Object.assign(logins79, was79);
+    }
+  }
+
   console.log(
     failures === 0
       ? '\n✅ ALL CHECKS PASSED\n'

@@ -29,6 +29,30 @@ function nameMap(v) {
   return out;
 }
 
+// EACH AGENT'S OWN PORTAL LOGIN, by the mobile he writes from (founder,
+// 30 Sep: "when agent ronak punch order then access his account and punch
+// order only for order request come from his number").
+//   919217030415|ronak_sales|ronak@123
+// One entry per agent, separated by a newline or a comma; the fields by "|",
+// because a portal password may itself hold a ":". An optional fourth field
+// is that agent's portal USER id, for the account whose mobile the portal
+// does not hold (GET /PUSH_ORDER/order-for-user answers 404):
+//   919217030415|ronak_sales|ronak@123|1512
+// -> { '9217030415': { username, password, userId } }, keyed by the LAST TEN
+// digits so "+91 92170 30415", "0921703..." and "919217030415" are one number.
+function staffLogins(v) {
+  const out = {};
+  for (const row of String(v || '').split(/[\n,]+/)) {
+    const entry = row.trim();
+    if (!entry || entry.startsWith('#')) continue;
+    const [phoneRaw, user, pass, userIdRaw] = entry.split('|').map((s) => (s == null ? '' : s.trim()));
+    const phone = digits(phoneRaw).slice(-10);
+    if (phone.length !== 10 || !user || !pass) continue;
+    out[phone] = { username: user, password: pass, userId: parseInt(digits(userIdRaw), 10) || null };
+  }
+  return out;
+}
+
 function bool(v, dflt = false) {
   const s = String(v == null ? '' : v).trim().toLowerCase();
   if (!s) return dflt;
@@ -158,6 +182,14 @@ const config = {
     approverUsername: (process.env.DEALER_PORTAL_APPROVER_USERNAME || '').trim(),
     approverPassword: (process.env.DEALER_PORTAL_APPROVER_PASSWORD || '').trim(),
     approverToken: (process.env.DEALER_PORTAL_APPROVER_TOKEN || '').trim(),
+
+    // ONE AGENT, HIS OWN LOGIN. An order that comes from a number listed here
+    // is punched on THAT agent's portal account, not on the bot's shared sales
+    // account — so the portal's own records show Ronak's orders as Ronak's
+    // work, under his user, with nothing else about his messages changed.
+    // Stock and rates are still read on the bot's login: only the punch moves.
+    // A number not listed here punches exactly as before.
+    staffLogins: staffLogins(process.env.DEALER_PORTAL_STAFF_LOGINS),
 
     // Token lifecycle: the portal's access_token expires; these control
     // proactive refresh so no customer request ever hits an expired token.

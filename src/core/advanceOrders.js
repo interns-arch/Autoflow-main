@@ -122,6 +122,9 @@ async function offer(bot, { order, res, soNumber, to, customerName, agentChat = 
     soNumber: soNumber || null,
     ctx: order.portalCustomer || null,
     actorUserId: order.actorUserId || null,
+    // The mobile it came from, so the booking is punched on that agent's own
+    // portal login too (dealerPortal.punchIdentity).
+    punchedBy: order.punchedBy || null,
     customerName: customerName || (order.portalCustomer && order.portalCustomer.name) || null,
     lines: eta,
     etaDate,
@@ -169,7 +172,7 @@ async function accept(bot, chatId) {
   const o = pending(chatId);
   if (!o) return null;
   const portal = require('../integrations/dealerPortal');
-  const res = await portal.advanceOrder({ id: o.orderId, ctx: o.ctx, lines: o.lines, etaDate: o.etaDate, actorUserId: o.actorUserId });
+  const res = await portal.advanceOrder({ id: o.orderId, ctx: o.ctx, lines: o.lines, etaDate: o.etaDate, actorUserId: o.actorUserId, punchedBy: o.punchedBy || null });
   offers.delete(chatId);
   const approvalLog = require('./approvalLog');
   approvalLog.record({ kind: 'advance', id: o.orderId, event: 'booked', by: o.customerName || chatId, customer: o.customerName || null, detail: `advance order ${res.soNumber}, ETA ${o.etaDate}, ${o.lines.length} part(s)` });
