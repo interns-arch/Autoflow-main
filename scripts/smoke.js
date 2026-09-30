@@ -62,6 +62,9 @@ config.creation.accountApprovers = {};
 config.creation.accountDecisionNotify = {};
 config.creation.discountSetupNotify = {};
 config.dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'autoflow-smoke-'));
+// The local photo reader (core/ocr) is not started by these tests: it would
+// fetch its language data. Its reading is tested on text it produced ([78]).
+process.env.OCR_FALLBACK = 'false';
 config.customerDms = ['919899555001'];
 config.adminNumbers = ['919800000009'];
 config.escalationNumber = '917004130460';
@@ -6787,6 +6790,36 @@ async function main() {
               config.customerSearchBy = searchWas77;
               cs77.slot('sales.session').delete(C77);
             }
+          }
+          // 30 Sep, founder: "bot unable to take parts from photo" - Gemini at
+          // 402 (credit used up), and nothing behind it. The text the local
+          // reader got from Shubham Maurya's two photos, as it came out.
+          console.log('\n[78] with Gemini down, a photo is read on this machine: a stock sheet and a Maruti label');
+          {
+            const ocr78 = require('../src/core/ocr');
+            const sheet78 = [
+              'PART NO Name ~ [stock |~',
+              '13780M72R00 Air Filter| | Maruti 144',
+              '13780M68P01 Air Filter| | Maruti 125',
+              '13780M82PS0 Air Filter| | Maruti 16',
+              '13780M68PAD Air Filter | | Marut 1',
+              '13780M50R00 Air Filter| | Maruti 10°',
+            ].join('\n');
+            const s78 = ocr78.linesFrom(sheet78);
+            check('a stock sheet: every part number, and the STOCK column is not taken as a quantity', s78.length === 5 && s78.every((l) => l.qty === 1 && l.qtyMissing) && s78[0].item === '13780M72R00' && s78[4].item === '13780M50R00', JSON.stringify(s78));
+            const label78 = [
+              '§ S$ maruT Suzy | I\'S', 'GENUINE PARTS & ACCESSO ]', 'Cd 13700 m 7280p = N\\', '| G.FLOOR CLEANER ASSY, AIR =', '| 4 ary 4 Unit MED. on 09 2925 [of',
+              'MRP : 7 445 gg (Incl. of aj Taxes)', 'es BATCH: AE', '. 2 : 2509M0620001549p3pp', 'ry NELSON spel Li rr KUN, NEW DELHI410070', 'Customer Care: Name and address as above Te. 18001021800', '13700M72R00', 'OTY 1 Numha',
+            ].join('\n');
+            const l78 = ocr78.linesFrom(label78);
+            check('a Maruti label: only the part number (not the batch code, pincode or a half-read line), with its QTY', l78.length === 1 && l78[0].item === '13700M72R00' && l78[0].qty === 1 && !l78[0].qtyMissing, JSON.stringify(l78));
+            check('a typed-looking list keeps its quantities', JSON.stringify(ocr78.linesFrom('16510M65L10 2\n57300M55R03').map((l) => [l.item, l.qty])) === JSON.stringify([['16510M65L10', 2], ['57300M55R03', 1]]));
+            portal.setMockStock([
+              { part_no: '13780M82P50', name: 'Air Filter', quantity: 16, price: 300, mrp: 400, vendor: 'Northend' },
+              { part_no: '13780M72R00', name: 'Air Filter', quantity: 144, price: 300, mrp: 400, vendor: 'Northend' },
+            ]);
+            const fx78 = await ocr78.fixMisreads([{ item: '13780M82PS0', qty: 1 }, { item: '13780M72R00', qty: 1 }]);
+            check('a one-character misread ("PS0") is corrected to the number the portal knows (P50); a known one is left alone', fx78[0].item === '13780M82P50' && fx78[1].item === '13780M72R00', JSON.stringify(fx78));
           }
         } finally {
           cfgLB.approvers = lbWas.approvers;

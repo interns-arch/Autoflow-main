@@ -41,6 +41,7 @@
     "pdfkit": "^0.15.2",
     "pg": "^8.23.0",
     "qrcode": "^1.5.4",
+    "tesseract.js": "^6.0.1",
     "whatsapp-web.js": "^1.34.7",
     "xlsx": "^0.18.5"
   }

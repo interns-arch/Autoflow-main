@@ -818,6 +818,16 @@ async function parseOrderImage(base64, mediaType) {
   // finished answer, not a failure: it returns an empty list.
   const primary = await geminiOrderImage(base64, mediaType);
   if (!primary) {
+    // GEMINI COULD NOT ANSWER (no key, out of credit, down): the words on the
+    // photo are read on this machine instead (core/ocr). 30 Sep, live: Gemini
+    // answered 402 and every photo came back "part number nahi padh paya".
+    const why = modelAvailable() ? lastImageNote : 'there is no AI key on this machine';
+    const local = modelStub ? null : await require('./ocr').orderLines(base64).catch(() => null);
+    if (local && local.length) {
+      lastImageNote = null;
+      store.log('ai', `photo read by the local text reader (${why}): ${local.length} line(s)`);
+      return local;
+    }
     if (!modelAvailable()) {
       lastImageNote = 'there is no AI key on this machine, so photos cannot be read';
       store.log('ai', 'no vision key on this machine — the photo cannot be read');
