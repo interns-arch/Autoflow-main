@@ -652,6 +652,15 @@ class CustomerBot {
       const payDecision = payments.readDecision(text);
       if (payDecision && payments.isAccountant(m.from)) return this.decidePayment(m, payDecision, reply, t);
       const decision = customerCreate.readDecision(text);
+      // A DISCOUNT is decided by its own approvers (30 Sep: Arun Sir), who
+      // need not be Sales Heads otherwise; decideDiscount checks who.
+      const discountApprover = this.discountApproverNumbers().includes(store.normPhone(m.from));
+      if (decision && /^DSC-/.test(decision.requestId) && (discountApprover || customerCreate.isApprover(m.from))) return this.decideDiscount(m, decision, reply, t);
+      if (!decision && discountApprover && !customerCreate.isApprover(m.from)) {
+        const bareD = customerCreate.readBareDecision(text);
+        const openD = bareD ? this.openApprovals().filter((id) => /^DSC-/.test(id)) : [];
+        if (bareD && openD.length === 1) return this.decideDiscount(m, { yes: bareD.yes, requestId: openD[0] }, reply, t);
+      }
       if (decision && customerCreate.isApprover(m.from)) {
         if (/^DSC-/.test(decision.requestId)) return this.decideDiscount(m, decision, reply, t);
         if (/^ORD-/.test(decision.requestId)) return this.decideOrder(m, decision, reply, t);
@@ -3182,6 +3191,7 @@ Baaki ${payments.money(hold.due)} pay hone tak ${order.id} hold pe hai${custPhon
         (config.inquiryOnlyNumbers || []).includes(p) ||
         salesOrder.isSalesPerson(p) ||
         customerCreate.isApprover(p) ||
+        this.discountApproverNumbers().includes(p) ||
         payments.isAccountant(p) ||
         customerCreate.agentName(p),
     );
@@ -3734,8 +3744,9 @@ Baaki ${payments.money(hold.due)} pay hone tak ${order.id} hold pe hai${custPhon
     // (Only when Gemini did not read it: it tells a question from an answer.)
     if (!read && !m.buttonId && /\b(kitne|kitna|rate|stock|hai kya)\b|\?\s*$/i.test(said) && !['confirm', 'confirmChange'].includes(st.step)) return null;
 
-    // The request, filed and written straight to the Dealer Portal for the
-    // Super Admin (founder, 28 Sep: not to the Sales Head any more).
+    // The request, filed and sent to ARUN SIR for approval on WhatsApp
+    // (founder, 30 Sep). On his OK it goes to the Dealer Portal and Prateek
+    // Sir is asked to approve it there as Super Admin (decideDiscount).
     // -> { req, sent }
     const submit = async (type, extra) => {
       const req = discountSetup.file({
@@ -3755,9 +3766,8 @@ Baaki ${payments.money(hold.due)} pay hone tak ${order.id} hold pe hai${custPhon
         ...extra,
       });
       approvalLog.record({ kind: 'discount', id: req.id, event: 'requested', by: st.setBy || null, customer: st.customer, detail: `${type === 'change' ? 'change ' + (extra && extra.oldValue) + '% → ' : ''}${d.kind || ''} ${d.target || ''} ${d.value}%`.trim() });
-      const sent = await this.discountToPortal(req, st.setBy || null);
-      store.log(this.key, `${req.id}: discount ${type} for ${st.customer} (${d.target || ''} ${d.value}%) ${sent.ok ? 'on the portal for approval' : 'NOT written: ' + sent.why}`);
-      if (sent.ok) await this.tellDiscountSetup(req, sent, st.setBy || m.from).catch(() => {});
+      const sent = await this.discountToApprover(req, m.chatId);
+      store.log(this.key, `${req.id}: discount ${type} for ${st.customer} (${d.target || ''} ${d.value}%) ${sent.ok ? 'sent to ' + sent.approvers + ' for approval' : 'NOT sent: ' + sent.why}`);
       return { req, sent };
     };
 
@@ -4061,8 +4071,8 @@ Baaki ${payments.money(hold.due)} pay hone tak ${order.id} hold pe hai${custPhon
         if (ans !== 'no') return null;
         return reply(
           t(
-            `Done — ${st.count} discount rule(s) ${st.accountRequestId ? 'go to the Dealer Portal once the account is open' : 'are on the Dealer Portal'}, waiting for a Super Admin's approval. I will tell you as each is approved.`,
-            `Ho gaya — ${st.count} discount rule ${st.accountRequestId ? 'account khulte hi Dealer Portal pe jayenge' : 'Dealer Portal pe hain'}, Super Admin ke approval ka wait. Har ek approve hote hi bata dunga.`,
+            `Done — ${st.count} discount rule(s) sent to Arun Sir for approval; once he approves, each goes to the Dealer Portal${st.accountRequestId ? ' (after the account is open)' : ''} for the Super Admin. I will tell you at every step.`,
+            `Ho gaya — ${st.count} discount rule Arun Sir ko approval ke liye bhej diye; unke approve karte hi Dealer Portal pe${st.accountRequestId ? ' (account khulne ke baad)' : ''} Super Admin ke paas jayenge. Har step pe bata dunga.`,
           ),
         );
       }
@@ -4114,16 +4124,60 @@ Baaki ${payments.money(hold.due)} pay hone tak ${order.id} hold pe hai${custPhon
     }
   }
 
-  // "OK DSC-7F3K" / "NO DSC-7F3K" from the Sales Head.
+  // WHO DECIDES A DISCOUNT ON WHATSAPP (config.creation.discountApprovers -
+  // Arun Sir). Empty: the Sales Heads, as before.
+  discountApproverNumbers() {
+    const own = Object.keys((config.creation && config.creation.discountApprovers) || {}).map((p) => store.normPhone(p));
+    return own.length ? own : Object.keys(config.creation.approvers || {}).map((p) => store.normPhone(p));
+  }
+
+  // THE REQUEST TO ARUN SIR (founder, 30 Sep). Nothing goes to the portal
+  // until he says OK. A request that does not reach him (no 24-hour window)
+  // is kept and sent when he writes (resendUndelivered).
+  //   -> { ok, approvers, waitingApprover: true } | { ok: false, why }
+  async discountToApprover(req, requesterChat) {
+    const to = this.discountApproverNumbers();
+    if (!to.length) return { ok: false, why: 'no discount approver is set (DISCOUNT_APPROVER_NUMBERS)' };
+    const names = { ...(config.creation.approvers || {}), ...(config.creation.discountApprovers || {}) };
+    const text = discountSetup.approvalText(req);
+    let reached = 0;
+    for (const phone of to) {
+      try {
+        await escalation.ensureWindow(this.transport, phone, 'Discount approval coming — details follow').catch(() => {});
+        const id = await this.transport.sendText(phone, text);
+        deliveryWatch.track(id, { ref: req.id, to: phone, requesterChat: requesterChat || null });
+        reached++;
+      } catch (e) {
+        deliveryWatch.markUndelivered(req.id, phone, String((e && e.message) || e).slice(0, 120));
+        store.log(this.key, `${req.id}: could not send to ${phone}: ` + String((e && e.message) || e).slice(0, 80));
+      }
+    }
+    return { ok: true, waitingApprover: true, approvers: to.map((p) => names[p] || '+' + p).join(', '), reached };
+  }
+
+  // "OK DSC-7F3K" / "NO DSC-7F3K" from ARUN SIR (config.creation.
+  // discountApprovers). His decision goes to Prateek Sir (discountSetupNotify):
+  // approved - the rule is on the Dealer Portal and Prateek Sir is asked to
+  // approve or reject it there as Super Admin; rejected - nothing is written.
+  // The agent is told either way, and the customer too when it is rejected.
   async decideDiscount(m, decision, reply, t) {
     const req = discountSetup.find(decision.requestId);
     if (!req) return reply(t(`${decision.requestId} not found — it may already be done.`, `${decision.requestId} nahi mila — shayad pehle hi ho chuka hai.`));
-    const who = customerCreate.approverName(m.from);
+    const me = store.normPhone(m.from);
+    const approvers = this.discountApproverNumbers();
+    const names = { ...(config.creation.approvers || {}), ...(config.creation.discountApprovers || {}) };
+    if (!approvers.includes(me)) {
+      const whoCan = approvers.map((p) => names[p] || '+' + p).join(', ');
+      return reply(t(`Only ${whoCan} can approve or reject discount ${req.id}.`, `Discount ${req.id} sirf ${whoCan} approve ya reject kar sakte hain.`));
+    }
+    const who = names[me] || customerCreate.approverName(m.from);
+    deliveryWatch.delivered(req.id, me);
     const what = req.type === 'change' ? `${req.customer}: ${req.oldValue}% → ${req.rule.value}%` : `${req.rule.ruleName || req.customer}`;
     const tell = async (text) => {
       if (!req.chatId) return;
       try {
-        await this.transport.sendToChat(req.chatId, text);
+        const id = await this.transport.sendToChat(req.chatId, text);
+        this.recordOutgoing(req.chatId, id, text);
       } catch (e) {
         /* the decision stands either way */
       }
@@ -4133,17 +4187,37 @@ Baaki ${payments.money(hold.due)} pay hone tak ${order.id} hold pe hai${custPhon
       discountSetup.drop(req.id);
       store.log(this.key, `${req.id} (discount) rejected by ${who}`);
       approvalLog.record({ kind: 'discount', id: req.id, event: 'rejected', by: who, customer: req.customer, detail: what });
-      await tell(t(`Discount request ${req.id} (${what}) was not approved.`, `Discount request ${req.id} (${what}) approve nahi hua.`));
-      return reply(t(`Rejected ${req.id}. ${req.by || 'They'} was told.`, `${req.id} reject kar diya. ${req.by || 'Unko'} bata diya.`));
+      await tell(t(`❌ Discount request ${req.id} (${what}) was not approved by ${who}. Nothing was set on the portal.`, `❌ Discount request ${req.id} (${what}) ${who} ne approve nahi kiya. Portal pe kuch set nahi hua.`));
+      // The customer, on their own number (29 Sep: an agent's decision goes to both).
+      const custPhone = await this.discountCustomerPhone(req, req.accountId).catch(() => null);
+      if (custPhone) {
+        const cc = custPhone + '@cloud';
+        const ct = lang.for(cc);
+        const text = ct(`Dear ${req.customer || 'customer'} ji, the discount requested for your account could not be approved this time. Your sales representative will be happy to talk it over with you.`, `${req.customer || ''} ji, aapke account ke liye jo discount maanga gaya tha, woh is baar approve nahi ho paya. Aapke sales representative aapse is baare mein baat kar lenge.`);
+        try {
+          await escalation.ensureWindow(this.transport, custPhone, 'Your discount — details follow').catch(() => {});
+          const id = await this.transport.sendToChat(cc, text);
+          this.recordOutgoing(cc, id, text);
+        } catch (e) {
+          /* the agent was told */
+        }
+      }
+      await this.tellDiscountSetup(req, { rejectedBy: who }, req.by).catch(() => {});
+      return reply(t(`Rejected ${req.id}. ${req.by || 'The agent'} and Prateek Sir were told.`, `${req.id} reject kar diya. ${req.by || 'Agent'} aur Prateek Sir ko bata diya.`));
     }
 
-    // A request filed before 28 Sep, when the Sales Head still approved on
-    // WhatsApp: it goes to the portal now, for the Super Admin like any other.
+    // APPROVED BY ARUN SIR: on the portal now, for the Super Admin.
     const sent = await this.discountToPortal(req, who);
     if (!sent.ok) return reply(t(`Could not put it on the portal: ${sent.why}\nTry *OK ${req.id}* again.`, `Portal pe nahi daal paya: ${sent.why}\nDobara *OK ${req.id}* bhejiye.`));
-    const text = this.discountSentText(sent, t);
-    await tell(text);
-    return reply(text);
+    approvalLog.record({ kind: 'discount', id: req.id, event: 'approved', by: who, customer: req.customer, detail: `${what} — approved on WhatsApp; ${sent.waitsForAccount ? 'goes to the portal with the account' : 'rule #' + sent.ruleId + ' on the portal for the Super Admin'}` });
+    await tell(t(`✅ ${who} approved ${req.id} (${what}).`, `✅ ${who} ne ${req.id} (${what}) approve kar diya.`) + '\n' + this.discountSentText(sent, t));
+    await this.tellDiscountSetup(req, { ...sent, approvedBy: who }, req.by).catch(() => {});
+    return reply(
+      t(
+        `Approved ${req.id}. ${sent.waitsForAccount ? 'It goes to the Dealer Portal when the account is open.' : `It is on the Dealer Portal as rule #${sent.ruleId}; Prateek Sir has been asked to approve it there as Super Admin.`}`,
+        `${req.id} approve ho gaya. ${sent.waitsForAccount ? 'Account khulte hi Dealer Portal pe jayega.' : `Dealer Portal pe rule #${sent.ruleId} ban gaya; Prateek Sir ko Super Admin pe approve karne ke liye bol diya hai.`}`,
+      ),
+    );
   }
 
   // ONE DISCOUNT REQUEST, WRITTEN TO THE DEALER PORTAL (founder, 28 Sep): a
@@ -4221,24 +4295,41 @@ Baaki ${payments.money(hold.due)} pay hone tak ${order.id} hold pe hai${custPhon
     const r = req.rule || {};
     const on = r.kind === 'brand' ? `Brand ${r.target}` : r.kind === 'part' ? `Part ${r.target}` : 'All parts';
     const limits = [r.minQty > 1 ? `min qty ${r.minQty}` : null, r.maxQty ? `max qty ${r.maxQty}` : null, r.minAmount ? `min ₹${r.minAmount}` : null, r.maxAmount ? `max ₹${r.maxAmount}` : null, req.type === 'change' ? null : r.durationLabel ? `valid ${r.durationLabel}` : null].filter(Boolean);
-    const where = sent.waitsForAccount
-      ? `Goes to the Dealer Portal when the new account ${sent.waitsForAccount} is approved.`
-      : `On the Dealer Portal as rule #${sent.ruleId}${sent.live ? ' — already APPROVED there.' : ' — waiting for a Super Admin.'}`;
+    // Arun Sir's decision on WhatsApp (founder, 30 Sep), said first.
+    const verdict = sent.rejectedBy
+      ? `❌ *Rejected by ${sent.rejectedBy}* — ${req.id}`
+      : sent.approvedBy
+        ? `✅ *Approved by ${sent.approvedBy}* — ${req.id}`
+        : null;
+    const where = sent.rejectedBy
+      ? 'Nothing was set on the Dealer Portal.'
+      : sent.waitsForAccount
+        ? `Goes to the Dealer Portal when the new account ${sent.waitsForAccount} is approved.`
+        : `On the Dealer Portal as rule #${sent.ruleId}${sent.live ? ' — already APPROVED there.' : ' — waiting for a Super Admin.'}`;
+    const ask = sent.rejectedBy
+      ? 'For your information.'
+      : sent.live || sent.waitsForAccount
+        ? 'For your information.'
+        : `Please approve or reject rule #${sent.ruleId} on the Dealer Portal (Super Admin) — customers get the discount once it is approved there.`;
     const text = [
+      verdict,
       `🏷️ *Discount ${req.type === 'change' ? 'change' : 'setup'}* by ${by || 'an agent'}`,
       `Customer: ${req.customer}`,
       `${on} — ${req.type === 'change' ? `${req.oldValue}% → *${r.value}%*` : `*${r.value}%*`}${limits.length ? ' (' + limits.join(', ') + ')' : ''}`,
       r.mrp ? `MRP ₹${r.mrp} → ₹${discountSetup.priceAt(r.mrp, r.value)}` : null,
       where,
       '',
-      sent.live ? 'For your information.' : 'Please check it and approve or reject it on the Dealer Portal (Super Admin).',
+      ask,
     ]
       .filter((l) => l !== null)
       .join('\n');
     for (const phone of to) {
       try {
         await escalation.ensureWindow(this.transport, phone, 'Discount setup — details follow').catch(() => {});
-        await this.transport.sendText(phone, text);
+        const id = await this.transport.sendText(phone, text);
+        // Refused (no window): kept and sent when he writes (deliverQueuedNotices).
+        noticeTexts.set('notice:' + req.id + '|' + store.normPhone(phone), { text, at: Date.now() });
+        deliveryWatch.track(id, { ref: 'notice:' + req.id, to: phone });
       } catch (e) {
         store.log(this.key, `could not tell ${phone} of discount ${req.id}: ${String((e && e.message) || e).slice(0, 80)}`);
       }
@@ -4306,11 +4397,30 @@ Baaki ${payments.money(hold.due)} pay hone tak ${order.id} hold pe hai${custPhon
   // waited because Arun Sir had not written for a day.
   async resendUndelivered(m) {
     const p = store.normPhone(m.from);
-    if (!p || !customerCreate.isApprover(p)) return 0;
+    if (!p || !(customerCreate.isApprover(p) || this.discountApproverNumbers().includes(p))) return 0;
     const t = lang.for(m.chatId);
     let sent = 0;
     for (const u of deliveryWatch.allUndelivered()) {
-      if (!Object.keys(u.to || {}).includes(p)) continue;
+      if (!Object.keys(u.to || {}).includes(p) || String(u.ref).startsWith('notice:')) continue;
+      // A DISCOUNT REQUEST that never reached him (30 Sep: Arun Sir approves them).
+      if (/^DSC-/i.test(u.ref)) {
+        const dreq = discountSetup.find(u.ref);
+        if (!dreq || dreq.status === 'approved') {
+          deliveryWatch.delivered(u.ref, p);
+          continue;
+        }
+        try {
+          const text = t('Waiting for you (it could not be delivered earlier):\n\n', 'Aapke liye ruka hua tha (pehle pahunch nahi paya tha):\n\n') + discountSetup.approvalText(dreq);
+          const id = await this.transport.sendText(p, text);
+          deliveryWatch.track(id, { ref: u.ref, to: p, requesterChat: dreq.chatId || null });
+          deliveryWatch.delivered(u.ref, p);
+          sent++;
+          store.log(this.key, `${u.ref}: sent again to ${p} — it had not reached them`);
+        } catch (e) {
+          store.log(this.key, `${u.ref}: could not send again to ${p}: ` + String((e && e.message) || e).slice(0, 80));
+        }
+        continue;
+      }
       const form = customerCreate.parked(u.ref);
       if (!form) {
         deliveryWatch.delivered(u.ref, p); // decided or gone: nothing to send
@@ -4422,6 +4532,13 @@ Baaki ${payments.money(hold.due)} pay hone tak ${order.id} hold pe hai${custPhon
 
   // What the agent is told once a request is on the portal.
   discountSentText(sent, t) {
+    // With Arun Sir on WhatsApp first (discountToApprover).
+    if (sent.waitingApprover) {
+      return t(
+        `Sent to ${sent.approvers} for approval. Once approved it goes to the Dealer Portal, and customers get the discount when the Super Admin approves it there — I will tell you at each step.`,
+        `${sent.approvers} ko approval ke liye bhej diya. Approve hote hi Dealer Portal pe jayega, aur Super Admin wahan approve karte hi customer ko discount milega — har step pe bata dunga.`,
+      );
+    }
     if (sent.waitsForAccount) {
       return t(
         `Saved: ${sent.name}. It goes to the Dealer Portal for approval as soon as account ${sent.waitsForAccount} is open.`,

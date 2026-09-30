@@ -344,6 +344,11 @@ const config = {
     // Told when an agent sets up or changes a discount. A notice only: the
     // rule is approved or rejected on the Dealer Portal by a Super Admin.
     discountSetupNotify: nameMap(process.env.DISCOUNT_SETUP_NOTIFY || '919999492550:Prateek Sir'),
+    // WHO APPROVES A DISCOUNT ON WHATSAPP before it goes to the portal
+    // (founder, 30 Sep: Arun Sir). Only these may say OK / NO to a DSC-…;
+    // their decision goes to discountSetupNotify (Prateek Sir), who then
+    // approves or rejects the rule on the Dealer Portal as Super Admin.
+    discountApprovers: nameMap(process.env.DISCOUNT_APPROVER_NUMBERS || '919773900582:Arun Sir'),
     // The commercial terms a CUSTOMER is never asked for. A person being
     // onboarded does not set their own credit limit.
     defaultCreditDays: parseInt(process.env.CREATION_DEFAULT_CREDIT_DAYS || '1', 10),

@@ -2679,6 +2679,11 @@ async function main() {
     cr20.accountApprovers = { 919999492550: 'Arun Sir' };
     cr20.accountDecisionNotify = { [PRATEEK20]: 'Prateek Sir' };
     cr20.discountSetupNotify = { [PRATEEK20]: 'Prateek Sir' };
+    // 30 Sep: Arun Sir approves every discount on WhatsApp first (a stand-in).
+    const ARUN20 = '919800000444';
+    const discApprWas20 = cr20.discountApprovers;
+    cr20.discountApprovers = { [ARUN20]: 'Arun Sir' };
+    const toArun20 = (out) => out.filter((o) => String(o.to).indexOf(ARUN20) >= 0).map((o) => o.text || '').join(String.fromCharCode(10));
     const toPrateek20 = (out) => out.filter((o) => String(o.to).indexOf(PRATEEK20) >= 0).map((o) => o.text || '').join(String.fromCharCode(10));
     const APPR20 = '919999492550';
     const AGENT20 = '919000000301';
@@ -2708,14 +2713,19 @@ async function main() {
       for (let i = 0; i < 4; i++) await say20(AGENT20, 'skip');
       const sum20 = text20(await say20(AGENT20, '3 mahine'));
       check('the rule is named customer + brand + discount', /KALRA MOTORS CARTRENDS 12%/.test(sum20) && /Min qty: 1/.test(sum20) && /3 months/.test(sum20));
-      // 28 Sep, founder: not to the Sales Head - straight to the Dealer
-      // Portal, where the Super Admin approves it.
+      // 30 Sep, founder: ARUN SIR approves a discount on WhatsApp first; his
+      // decision goes to Prateek Sir, who approves the rule as Super Admin.
       const sent20 = await say20(AGENT20, 'Haan', 'DSC_YES');
-      const note20 = toPrateek20(sent20);
-      check('a discount setup is told to Prateek Sir: who, for whom, what, and where it stands', /Discount setup\* by Shubham/.test(note20) && /KALRA MOTORS/.test(note20) && /Brand CARTRENDS — \*12%\*/.test(note20) && /new account WA-DSC20 is approved/.test(note20) && /approve or reject it on the Dealer Portal/.test(note20), note20);
-      check('the rule is NOT sent to the Sales Head', !sent20.some((o) => o.to === APPR20));
-      check('...the agent is told it goes to the Dealer Portal once the account opens', /Account WA-DSC20 khulte hi Dealer Portal pe approval/.test(text20(sent20)), text20(sent20));
+      const id20 = dscIn20(sent20) || ((toArun20(sent20).match(/DSC-[A-Z0-9]{4}/) || [])[0]);
+      check('the discount goes to Arun Sir for approval, with OK / NO', /OK DSC-/.test(toArun20(sent20)) && /KALRA MOTORS/.test(toArun20(sent20)), toArun20(sent20));
+      check('...not to the Sales Head, and nothing to Prateek Sir yet', !sent20.some((o) => o.to === APPR20) && !toPrateek20(sent20));
+      check('...the agent is told it is with Arun Sir', /Arun Sir ko approval ke liye bhej diya/.test(text20(sent20)), text20(sent20));
       await say20(AGENT20, 'Bas itna', 'DSC_MORE_NO');
+      check('someone else cannot decide it', /sirf Arun Sir/.test(text20(await say20(APPR20, 'OK ' + id20))));
+      const ok20d = await say20(ARUN20, 'OK ' + id20);
+      const note20 = toPrateek20(ok20d);
+      check('Arun Sir\'s OK is told to Prateek Sir: approved by Arun Sir, who set it, for whom, what', /Approved by Arun Sir/.test(note20) && /Discount setup\* by Shubham/.test(note20) && /KALRA MOTORS/.test(note20) && /Brand CARTRENDS — \*12%\*/.test(note20) && /new account WA-DSC20 is approved/.test(note20), note20);
+      check('...and the agent is told Arun Sir approved it', customer.transport.outbox.some((o) => String(o.to).indexOf(AGENT20) >= 0 && /Arun Sir ne .* approve kar diya/.test(o.text || '')));
       const before20 = (await portal.listDiscountRules()).length;
       // the account is approved: the rule goes to the portal with it
       // Only the customer approver decides a new customer.
@@ -2779,13 +2789,15 @@ async function main() {
       // The new % sends it: there is no "Send for approval?" any more (25 Sep,
       // live — the next message was read as a no and the change was lost).
       const sent22 = await say20(AGENT20, '15');
-      const note22 = toPrateek20(sent22);
-      check('a discount change is told to Prateek Sir too', /Discount change\* by Shubham/.test(note22) && /12% → \*15%\*/.test(note22) && /rule #501/.test(note22), note22);
       check('...shown the change as it is sent', /12% → 15%/.test(text20(sent22)));
-      check('the change is NOT sent to the Sales Head', !sent22.some((o) => o.to === APPR20));
+      check('the change goes to Arun Sir, and the portal is not touched yet', /DSC-/.test(toArun20(sent22)) && (await portal.listDiscountRules())[0].discount_value === 12, toArun20(sent22));
+      const id22 = (toArun20(sent22).match(/DSC-[A-Z0-9]{4}/) || [])[0];
+      const ok22d = await say20(ARUN20, 'OK ' + id22);
+      const note22 = toPrateek20(ok22d);
+      check('Arun Sir\'s OK: Prateek Sir is told and asked to approve rule #501 on Super Admin', /Approved by Arun Sir/.test(note22) && /Discount change\* by Shubham/.test(note22) && /12% → \*15%\*/.test(note22) && /approve or reject rule #501 on the Dealer Portal \(Super Admin\)/.test(note22), note22);
       const rule22 = (await portal.listDiscountRules())[0];
-      check('the change goes straight to the portal, only the discount changed', rule22.discount_value === 15 && rule22.brand === 'CARTRENDS' && rule22.rule_name === 'Mock Customer CARTRENDS 15%', JSON.stringify(rule22));
-      check('...and the agent is told it waits for the Super Admin', /Dealer Portal pe approval ke liye bhej diya/.test(text20(sent22)) && /rule #501/.test(text20(sent22)), text20(sent22));
+      check('...and the change is on the portal now, only the discount changed', rule22.discount_value === 15 && rule22.brand === 'CARTRENDS' && rule22.rule_name === 'Mock Customer CARTRENDS 15%', JSON.stringify(rule22));
+      check('...and the agent is told it waits for the Super Admin', ok22d.some((o) => String(o.to).indexOf(AGENT20) >= 0 && /Dealer Portal pe approval ke liye bhej diya/.test(o.text || '') && /rule #501/.test(o.text || '')), text20(ok22d));
       // The Super Admin approves it on the portal: the agent hears it.
       rule22.approval_status = 'APPROVED';
       customer.transport.outbox.length = 0;
@@ -2796,6 +2808,18 @@ async function main() {
       check('...and the CUSTOMER is told too, on their own number, with the discount', /discount set ho gaya|discount is now set/i.test(toCust22) && /15%/.test(toCust22), toCust22 || JSON.stringify(customer.transport.outbox.map((o) => o.to)));
       check('...and the agent hears that the customer was told', customer.transport.outbox.some((o) => String(o.to).indexOf(AGENT20) >= 0 && /Customer ko bhi bata diya/.test(o.text || '')));
       check('...and is told only once', (await require('../src/core/discountWatch').checkOnce(customer)).length === 0);
+      // ARUN SIR REJECTS: nothing on the portal; Prateek Sir, the agent and
+      // the customer are told.
+      await say20(AGENT20, 'discount change karna hai');
+      await say20(AGENT20, '9000000304');
+      await say20(AGENT20, 'haan');
+      await say20(AGENT20, '1');
+      const sent23 = await say20(AGENT20, '20');
+      const id23 = (toArun20(sent23).match(/DSC-[A-Z0-9]{4}/) || [])[0];
+      const no23 = await say20(ARUN20, 'NO ' + id23);
+      check('Arun Sir\'s NO: nothing changes on the portal', (await portal.listDiscountRules())[0].discount_value === 15);
+      check('...Prateek Sir is told it was rejected by Arun Sir', /Rejected by Arun Sir/.test(toPrateek20(no23)) && /Nothing was set on the Dealer Portal/.test(toPrateek20(no23)), toPrateek20(no23));
+      check('...and the agent and the customer are told', no23.some((o) => String(o.to).indexOf(AGENT20) >= 0 && /approve nahi kiya/.test(o.text || '')) && no23.some((o) => String(o.to).indexOf(CUST22) >= 0), JSON.stringify(no23.map((o) => o.to)));
       cr20.team = teamWas22;
 
       // ---- a yes typed any way at all (29 Sep, live: a sales agent) ----
@@ -2881,6 +2905,7 @@ async function main() {
       );
     } finally {
       cr20.approvers = apprWas20;
+      cr20.discountApprovers = discApprWas20;
       cr20.accountApprovers = {};
       cr20.accountDecisionNotify = {};
       cr20.discountSetupNotify = {};
